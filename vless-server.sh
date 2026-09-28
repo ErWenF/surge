@@ -379,7 +379,8 @@ db_remove_port() {
                     .[$c][$p]
                 end
             end
-        ) | if .[$c][$p] == [] or .[$c][$p] == null then
+        ) | .port_routing = [(.port_routing // [])[] | select(.core != $c or .protocol != $p or (.port | tostring) != $port)]
+        | if .[$c][$p] == [] or .[$c][$p] == null then
             del(.[$c][$p])
         else
             .
@@ -391,9 +392,10 @@ db_remove_port() {
 # 参数: $1=core, $2=protocol, $3=port, $4=new_config_json
 db_update_port() {
     local core="$1" protocol="$2" port="$3" new_config="$4"
+    local new_port=$(jq -r '.port // empty' <<< "$new_config")
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    _db_apply --arg c "$core" --arg p "$protocol" --arg port "$port" --argjson cfg "$new_config" '
+    _db_apply --arg c "$core" --arg p "$protocol" --arg port "$port" --arg new_port "$new_port" --argjson cfg "$new_config" '
         .[$c][$p] = (
             if (.[$c][$p] | type) == "array" then
                 .[$c][$p] | map(if .port == ($port | tonumber) then $cfg else . end)
@@ -404,7 +406,10 @@ db_update_port() {
                     .[$c][$p]
                 end
             end
-        )
+        ) | if $port == $new_port then . else
+            .port_routing = [(.port_routing // [])[] |
+                select(.core != $c or .protocol != $p or (.port | tostring) != $port)]
+          end
     '
 }
 
@@ -417,7 +422,28 @@ db_del() { # db_del core proto
         done < <(db_list_users xray "$2")
         _db_apply --arg p "$2" 'del(.meta.snell_users[$p])' || return 1
     fi
-    _db_apply --arg p "$2" "del(.${1}[\$p])"
+    _db_apply --arg c "$1" --arg p "$2" \
+        '.port_routing = [(.port_routing // [])[] | select(.core != $c or .protocol != $p)] | del(.[$c][$p])'
+}
+
+# 端口出口：缺少记录表示沿用原规则。
+db_set_port_routing() {
+    local core="$1" protocol="$2" port="$3" outbound="$4"
+    [[ "$core" == xray || "$core" == singbox ]] || return 1
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    [[ -n "$(db_get_port_config "$core" "$protocol" "$port")" ]] || return 1
+    case "$outbound" in
+        default|direct) ;;
+        chain:*) db_chain_node_exists "${outbound#chain:}" || return 1 ;;
+        *) return 1 ;;
+    esac
+    _db_apply --arg c "$core" --arg p "$protocol" --argjson port "$port" --arg out "$outbound" '
+        .port_routing = [(.port_routing // [])[] |
+            select(.core != $c or .protocol != $p or .port != $port)]
+        | if $out == "default" then . else
+            .port_routing += [{core:$c, protocol:$p, port:$port, outbound:$out}]
+          end
+    '
 }
 
 
@@ -4161,8 +4187,85 @@ gen_xray_user_routing_outbounds() {
     done | sort -u
 }
 
+# 在最终入站列表上匹配真实 tag，规则覆盖 TCP/UDP 和 IPv4/IPv6。
+_apply_port_routing_config() {
+    local core="$1" file="$2" entry protocol port target tag base tags outbound tmp
+    [[ -f "$DB_FILE" ]] || return 1
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        protocol=$(jq -r '.protocol' <<< "$entry")
+        port=$(jq -r '.port' <<< "$entry")
+        target=$(jq -r '.outbound' <<< "$entry")
+        [[ -n "$(db_get_port_config "$core" "$protocol" "$port")" ]] || {
+            _err "端口出口引用了不存在的入站: $core/$protocol/$port"
+            return 1
+        }
+        tag="port-route-${core}-${protocol}-${port}"
+        if [[ "$core" == xray ]]; then
+            base="${protocol}-${port}"
+            if jq -e --argjson port "$port" '
+                [.inbounds[] | select(.port == $port and .tag != "api" and
+                    (.tag | startswith("ip-in-") | not))] | length > 1
+            ' "$file" >/dev/null; then
+                _err "同一 Xray 端口有多个协议入站，无法安全区分多 IP 副本: $port"
+                return 1
+            fi
+            tags=$(jq -c --arg base "$base" --argjson port "$port" '
+                [.inbounds[] | select(.port == $port and
+                    (.tag == $base or (.tag | startswith("ip-in-")))) | .tag] | unique
+            ' "$file") || return 1
+            jq -e --arg base "$base" 'index($base) != null' <<< "$tags" >/dev/null || return 1
+        else
+            base="${protocol}-in-${port}"
+            tags=$(jq -c --arg base "$base" --argjson port "$port" '
+                [.inbounds[] | select(.listen_port == $port and .tag == $base) | .tag]
+            ' "$file") || return 1
+            [[ "$tags" != '[]' ]] || return 1
+        fi
+        if [[ "$target" == direct ]]; then
+            outbound=''
+            tag=direct
+        elif [[ "$target" == chain:* ]]; then
+            db_chain_node_exists "${target#chain:}" || {
+                _err "端口出口节点不存在: ${target#chain:}"
+                return 1
+            }
+            if [[ "$core" == xray ]]; then
+                outbound=$(gen_xray_chain_outbound "${target#chain:}" "$tag" "as_is") || return 1
+            else
+                outbound=$(gen_singbox_chain_outbound "${target#chain:}" "$tag" "prefer_ipv4") || return 1
+                outbound=$(jq 'del(.domain_strategy)' <<< "$outbound") || return 1
+            fi
+            [[ -n "$outbound" && "$outbound" != null ]] || return 1
+            jq -e --arg tag "$tag" '.tag == $tag and (.protocol != null or .type != null)' <<< "$outbound" >/dev/null || return 1
+        else
+            return 1
+        fi
+        tmp=$(mktemp "${file}.port-route.XXXXXX") || return 1
+        if [[ "$core" == xray ]]; then
+            if ! jq --arg tag "$tag" --argjson tags "$tags" --argjson out "${outbound:-null}" '
+                if $out != null then .outbounds += [$out] else . end
+                | .routing.rules = (
+                    [(.routing.rules // [])[] | select(.inboundTag == ["api"])] +
+                    [{type:"field", inboundTag:$tags, outboundTag:$tag}] +
+                    [(.routing.rules // [])[] | select(.inboundTag != ["api"])]
+                  )
+            ' "$file" > "$tmp"; then rm -f "$tmp"; return 1; fi
+        else
+            if ! jq --arg tag "$tag" --argjson tags "$tags" --argjson out "${outbound:-null}" '
+                if $out != null then .outbounds += [$out] else . end
+                | .route = (.route // {rules:[], final:"direct"})
+                | .route.rules = ([{inbound:$tags, outbound:$tag}] + (.route.rules // []))
+            ' "$file" > "$tmp"; then rm -f "$tmp"; return 1; fi
+        fi
+        mv "$tmp" "$file" || return 1
+    done < <(jq -c --arg core "$core" '.port_routing[]? | select(.core == $core)' "$DB_FILE")
+    return 0
+}
+
 # 生成 Xray 多 inbounds 配置
 generate_xray_config() {
+    local xray_output_file="${XRAY_CONFIG_OUTPUT:-$CFG/config.json}"
     local xray_protocols=$(get_xray_protocols)
     [[ -z "$xray_protocols" ]] && return 1
     
@@ -4493,18 +4596,18 @@ generate_xray_config() {
             inbounds: [{listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, tag: "api"}],
             outbounds: $outbounds,
             routing: {domainStrategy: "IPIfNonMatch", rules: [], balancers: $balancers}
-        }' > "$CFG/config.json"
+        }' > "$xray_output_file"
 
         # 添加路由规则（API 规则放最前面）
         if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
             local api_rule='{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}'
             local all_rules=$(echo "$routing_rules" | jq --argjson api "$api_rule" '[$api] + .')
             local tmp=$(mktemp)
-            jq --argjson rules "$all_rules" '.routing.rules = $rules' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+            jq --argjson rules "$all_rules" '.routing.rules = $rules' "$xray_output_file" > "$tmp" && mv "$tmp" "$xray_output_file"
         else
             # 即使没有其他规则，也要添加 API 规则
             local tmp=$(mktemp)
-            jq '.routing.rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+            jq '.routing.rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]' "$xray_output_file" > "$tmp" && mv "$tmp" "$xray_output_file"
         fi
 
         # 检查是否使用了leastPing或leastLoad策略,添加burstObservatory配置
@@ -4552,7 +4655,7 @@ generate_xray_config() {
                         timeout: "5s"
                     }
                 }
-            ' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+            ' "$xray_output_file" > "$tmp" && mv "$tmp" "$xray_output_file"
         fi
     else
         # 无全局分流规则时，仍然需要检查用户级路由规则和负载均衡器
@@ -4628,13 +4731,13 @@ generate_xray_config() {
                 inbounds: [{listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, tag: "api"}],
                 outbounds: $outbounds,
                 routing: {domainStrategy: "IPIfNonMatch", rules: $rules, balancers: $balancers}
-            }' > "$CFG/config.json"
+            }' > "$xray_output_file"
             
             # 添加多IP路由 outbound 支持（routing 规则将在 inbound 添加完成后统一添加）
             local ip_routing_outbounds=$(gen_xray_ip_routing_outbounds)
             if [[ -n "$ip_routing_outbounds" && "$ip_routing_outbounds" != "[]" ]]; then
                 local tmp=$(mktemp)
-                jq --argjson ip_outs "$ip_routing_outbounds" '.outbounds += $ip_outs' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+                jq --argjson ip_outs "$ip_routing_outbounds" '.outbounds += $ip_outs' "$xray_output_file" > "$tmp" && mv "$tmp" "$xray_output_file"
             fi
         else
             # 无任何用户路由规则时
@@ -4654,7 +4757,7 @@ generate_xray_config() {
                     inbounds: [{listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, tag: "api"}],
                     outbounds: $outbounds,
                     routing: {domainStrategy: "IPIfNonMatch", rules: [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]}
-                }' > "$CFG/config.json"
+                }' > "$xray_output_file"
             else
                 # 无任何路由规则，使用简单直连配置（仍需要 API 规则）
                 jq -n --argjson direct "$direct_outbound" '{
@@ -4665,7 +4768,7 @@ generate_xray_config() {
                     inbounds: [{listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, tag: "api"}],
                     outbounds: [$direct, {protocol: "blackhole", tag: "api"}],
                     routing: {domainStrategy: "IPIfNonMatch", rules: [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]}
-                }' > "$CFG/config.json"
+                }' > "$xray_output_file"
             fi
         fi
     fi
@@ -4728,7 +4831,7 @@ generate_xray_config() {
     fi
 
     # 最终净化 Xray 不支持的 tracker/geosite 规则（仅影响 Xray；Sing-box 保留对应限制）
-    if [[ -f "$CFG/config.json" ]]; then
+    if [[ -f "$xray_output_file" ]]; then
         local tmp=$(mktemp)
         if jq '
             if .routing and .routing.rules then
@@ -4745,21 +4848,21 @@ generate_xray_config() {
                     )
                 ]
             else . end
-        ' "$CFG/config.json" > "$tmp" 2>/dev/null; then
-            mv "$tmp" "$CFG/config.json"
+        ' "$xray_output_file" > "$tmp" 2>/dev/null; then
+            mv "$tmp" "$xray_output_file"
         else
             rm -f "$tmp"
         fi
     fi
     
     # 验证最终配置文件的 JSON 格式
-    if ! jq empty "$CFG/config.json" 2>/dev/null; then
+    if ! jq empty "$xray_output_file" 2>/dev/null; then
         _err "生成的 Xray 配置文件 JSON 格式错误"
         return 1
     fi
     
     # 检查 inbounds 数组是否为空
-    local inbound_count=$(jq '.inbounds | length' "$CFG/config.json" 2>/dev/null)
+    local inbound_count=$(jq '.inbounds | length' "$xray_output_file" 2>/dev/null)
     if [[ "$inbound_count" == "0" || -z "$inbound_count" ]]; then
         _err "Xray 配置中没有有效的 inbound"
         return 1
@@ -4768,7 +4871,7 @@ generate_xray_config() {
     # 多IP路由：在所有 inbound 添加完成后，更新 routing 规则
     # 因为 routing 规则需要知道实际生成的 inbound tag
     if db_ip_routing_enabled; then
-        local inbounds_json=$(jq '.inbounds' "$CFG/config.json" 2>/dev/null || echo "[]")
+        local inbounds_json=$(jq '.inbounds' "$xray_output_file" 2>/dev/null || echo "[]")
         local ip_routing_rules=$(gen_xray_ip_routing_rules "$inbounds_json")
         
         if [[ -n "$ip_routing_rules" && "$ip_routing_rules" != "[]" ]]; then
@@ -4778,9 +4881,11 @@ generate_xray_config() {
                 .routing.rules = (
                     [.routing.rules[0]] + $ip_rules + .routing.rules[1:]
                 )
-            ' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+            ' "$xray_output_file" > "$tmp" && mv "$tmp" "$xray_output_file"
         fi
     fi
+
+    _apply_port_routing_config xray "$xray_output_file" || return 1
     
     if [[ -n "$failed_protocols" ]]; then
         _warn "以下协议配置失败: $failed_protocols"
@@ -4807,6 +4912,7 @@ _add_single_xray_inbound() {
 
 # 使用 jq 动态构建 inbound (重构版 - 只从数据库读取)
 add_xray_inbound_v2() {
+    local xray_output_file="${xray_output_file:-$CFG/config.json}"
     local protocol=$1
     
     # 从数据库读取配置
@@ -5399,8 +5505,8 @@ add_xray_inbound_v2() {
     
     # 合并到主配置
     local tmp_config=$(mktemp)
-    if jq '.inbounds += [input]' "$CFG/config.json" "$tmp_inbound" > "$tmp_config" 2>/dev/null; then
-        mv "$tmp_config" "$CFG/config.json"
+    if jq '.inbounds += [input]' "$xray_output_file" "$tmp_inbound" > "$tmp_config" 2>/dev/null; then
+        mv "$tmp_config" "$xray_output_file"
     else
         _err "合并 $protocol 配置失败"
         rm -f "$tmp_inbound" "$tmp_config"
@@ -5428,8 +5534,8 @@ add_xray_inbound_v2() {
                 
                 if jq empty "$ip_inbound_file" 2>/dev/null; then
                     local tmp2=$(mktemp)
-                    if jq '.inbounds += [input]' "$CFG/config.json" "$ip_inbound_file" > "$tmp2" 2>/dev/null; then
-                        mv "$tmp2" "$CFG/config.json"
+                    if jq '.inbounds += [input]' "$xray_output_file" "$ip_inbound_file" > "$tmp2" 2>/dev/null; then
+                        mv "$tmp2" "$xray_output_file"
                     fi
                     rm -f "$tmp2"
                 fi
@@ -10739,6 +10845,8 @@ switch_protocol_core() {
     _info "迁移数据库记录: $source_core → $target_core"
     if ! _db_apply --arg from "$source_core" --arg to "$target_core" --arg p "$protocol" '
         .[$to][$p] = .[$from][$p] | del(.[$from][$p])
+        | .port_routing = [(.port_routing // [])[] |
+            if .core == $from and .protocol == $p then .core = $to else . end]
     '; then
         _err "数据库迁移失败"
         return 1
@@ -11112,6 +11220,7 @@ _build_singbox_ruleset_defs() {
 
 # 生成 Sing-box 统一配置（所有选用 Sing-box 的协议共用一个进程）
 generate_singbox_config() {
+    local singbox_output_file="${SINGBOX_CONFIG_OUTPUT:-$CFG/singbox.json}"
     _ensure_singbox_default_users
     local singbox_protocols=$(db_list_protocols "singbox")
     [[ -z "$singbox_protocols" ]] && return 1
@@ -11840,10 +11949,12 @@ generate_singbox_config() {
     # 合并配置并写入文件
     echo "$base_config" | jq \
         --argjson ibs "$inbounds" \
-        '.inbounds = $ibs' > "$CFG/singbox.json"
+        '.inbounds = $ibs' > "$singbox_output_file"
+
+    _apply_port_routing_config singbox "$singbox_output_file" || return 1
     
     # 验证配置
-    if ! jq empty "$CFG/singbox.json" 2>/dev/null; then
+    if ! jq empty "$singbox_output_file" 2>/dev/null; then
         _err "Sing-box 配置 JSON 格式错误"
         return 1
     fi
@@ -17166,6 +17277,138 @@ setup_warp_ipv6_chain() {
     _pause
 }
 
+# 修改端口出口时保留可回滚备份，只重启该端口所属核心。
+apply_port_routing_change() {
+    local core="$1" protocol="$2" port="$3" target="$4"
+    local service config binary generator backup candidate staged=''
+    local was_active=false restart_attempted=false config_installed=false rollback_failed=false failed=''
+    case "$core" in
+        xray) service=vless-reality; config="$CFG/config.json"; binary=/usr/local/bin/xray; generator=generate_xray_config ;;
+        singbox) service=vless-singbox; config="$CFG/singbox.json"; binary=/usr/local/bin/sing-box; generator=generate_singbox_config ;;
+        *) return 1 ;;
+    esac
+    [[ -x "$binary" && -f "$config" && -f "$DB_FILE" ]] || return 1
+    svc status "$service" >/dev/null 2>&1 && was_active=true
+    mkdir -p "$CFG/backups/port-routing" || return 1
+    backup=$(mktemp -d "$CFG/backups/port-routing/${core}-${protocol}-${port}.XXXXXX") || return 1
+    chmod 700 "$backup"
+    cp -p "$DB_FILE" "$backup/db.json" && cp -p "$config" "$backup/active.json" || return 1
+    candidate="$backup/candidate.json"
+
+    db_set_port_routing "$core" "$protocol" "$port" "$target" || failed='数据库更新失败'
+    if [[ -z "$failed" ]]; then
+        if [[ "$core" == xray ]]; then
+            XRAY_CONFIG_OUTPUT="$candidate" "$generator" || failed='候选配置生成失败'
+        else
+            SINGBOX_CONFIG_OUTPUT="$candidate" "$generator" || failed='候选配置生成失败'
+        fi
+    fi
+    if [[ -z "$failed" ]]; then
+        if [[ "$core" == xray ]]; then
+            "$binary" run -test -c "$candidate" >/dev/null 2>&1 || failed='Xray 原生校验失败'
+        else
+            "$binary" check -c "$candidate" >/dev/null 2>&1 || failed='Sing-box 原生校验失败'
+        fi
+    fi
+    if [[ -z "$failed" ]]; then
+        staged=$(mktemp "${config}.new.XXXXXX") || failed='运行配置暂存失败'
+    fi
+    if [[ -z "$failed" ]]; then
+        if cp -p "$candidate" "$staged" && mv "$staged" "$config"; then
+            config_installed=true
+        else
+            failed='运行配置写入失败'
+            rm -f "$staged"
+        fi
+    fi
+    if [[ -z "$failed" ]]; then
+        restart_attempted=true
+        svc restart "$service" >/dev/null 2>&1 || failed='核心重启失败'
+    fi
+    if [[ -z "$failed" ]]; then
+        sleep 1
+        svc status "$service" >/dev/null 2>&1 || failed='服务健康检查失败'
+        if [[ -z "$failed" ]] && command -v ss >/dev/null 2>&1; then
+            ss -H -lntu "( sport = :$port )" 2>/dev/null | grep -q . || failed='入站端口未监听'
+        fi
+    fi
+    if [[ -n "$failed" ]]; then
+        cp -p "$backup/db.json" "$DB_FILE" || rollback_failed=true
+        if [[ "$config_installed" == true ]]; then
+            staged=$(mktemp "${config}.restore.XXXXXX") || rollback_failed=true
+            if [[ -n "$staged" ]]; then
+                cp -p "$backup/active.json" "$staged" && mv "$staged" "$config" || rollback_failed=true
+            fi
+            [[ -f "$staged" ]] && rm -f "$staged"
+        fi
+        if [[ "$restart_attempted" == true ]]; then
+            if [[ "$was_active" == true ]]; then
+                svc restart "$service" >/dev/null 2>&1 && svc status "$service" >/dev/null 2>&1 || rollback_failed=true
+            else
+                svc stop "$service" >/dev/null 2>&1 || rollback_failed=true
+            fi
+        fi
+        if [[ "$rollback_failed" == true ]]; then
+            _err "$failed，自动回滚未完成，请从 $backup 恢复"
+        else
+            _err "$failed，已恢复数据库和运行配置；备份: $backup"
+        fi
+        return 1
+    fi
+    _ok "端口出口已生效；备份: $backup"
+}
+
+manage_port_routing() {
+    local rows count choice row core protocol port current target nodes node_count
+    while true; do
+        _header
+        echo -e "  ${W}按入站端口指定出口${NC}"
+        rows=$(jq -c '["xray", "singbox"][] as $core |
+            (.[$core] // {} | to_entries[]) as $proto |
+            ($proto.value | if type == "array" then .[] else . end) |
+            select(.port != null) | {core:$core, protocol:$proto.key, port:.port}' "$DB_FILE" 2>/dev/null)
+        count=0
+        while IFS= read -r row; do
+            [[ -z "$row" ]] && continue
+            count=$((count + 1))
+            core=$(jq -r '.core' <<< "$row")
+            protocol=$(jq -r '.protocol' <<< "$row")
+            port=$(jq -r '.port' <<< "$row")
+            current=$(jq -r --arg c "$core" --arg p "$protocol" --argjson port "$port" '
+                [.port_routing[]? | select(.core == $c and .protocol == $p and .port == $port) | .outbound][0] // "default"
+            ' "$DB_FILE")
+            [[ "$current" == default ]] && current='沿用原规则'
+            [[ "$current" == direct ]] && current='直连'
+            echo -e "  ${G}$count)${NC} $core / $protocol / $port  ${D}→ $current${NC}"
+        done <<< "$rows"
+        _item "0" "返回"
+        read -rp "  选择入站编号: " choice
+        [[ "$choice" == 0 ]] && return
+        [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )) || { _err '无效编号'; _pause; continue; }
+        row=$(sed -n "${choice}p" <<< "$rows")
+        core=$(jq -r '.core' <<< "$row")
+        protocol=$(jq -r '.protocol' <<< "$row")
+        port=$(jq -r '.port' <<< "$row")
+        nodes=$(db_get_chain_nodes)
+        echo -e "  ${G}1)${NC} 沿用原规则"
+        echo -e "  ${G}2)${NC} 直连"
+        jq -r 'to_entries[] | "  \(.key + 3)) \(.value.name) [\(.value.type)]"' <<< "$nodes"
+        read -rp "  选择出口: " choice
+        case "$choice" in
+            1) target=default ;;
+            2) target=direct ;;
+            *)
+                [[ "$choice" =~ ^[0-9]+$ ]] || { _err '无效编号'; _pause; continue; }
+                node_count=$(jq 'length' <<< "$nodes")
+                (( choice >= 3 && choice < node_count + 3 )) || { _err '无效编号'; _pause; continue; }
+                target="chain:$(jq -r --argjson i "$((choice - 3))" '.[$i].name' <<< "$nodes")"
+                ;;
+        esac
+        apply_port_routing_change "$core" "$protocol" "$port" "$target"
+        _pause
+    done
+}
+
 # 分流管理主菜单
 manage_routing() {
     while true; do
@@ -17181,6 +17424,7 @@ manage_routing() {
         _item "6" "访问限制"
         _item "7" "测试分流效果"
         _item "8" "查看当前配置"
+        _item "9" "按入站端口指定出口"
         _item "0" "返回"
         _line
         
@@ -17212,6 +17456,7 @@ manage_routing() {
                 _line
                 read -rp "  按回车返回..." _
                 ;;
+            9) manage_port_routing ;;
             0) return ;;
             *) _err "无效选择"; _pause ;;
         esac
@@ -17508,6 +17753,7 @@ db_del_chain_node() {
     _db_apply --arg name "$name" '
         .chain_proxy.nodes = [(.chain_proxy.nodes // [])[] | select(.name != $name)]
         | if .chain_proxy.active == $name then del(.chain_proxy.active) else . end
+        | .port_routing = [(.port_routing // [])[] | select(.outbound != ("chain:" + $name))]
     '
 }
 
@@ -17534,6 +17780,8 @@ db_rename_chain_node() {
         | if .routing_rules then
             .routing_rules = [.routing_rules[] | if .outbound == ("chain:" + $old) then .outbound = ("chain:" + $new) else . end]
           else . end
+        | .port_routing = [(.port_routing // [])[] |
+            if .outbound == ("chain:" + $old) then .outbound = ("chain:" + $new) else . end]
         | if .balancer_groups then
             .balancer_groups = [.balancer_groups[] | if .nodes then .nodes = [.nodes[] | if . == $old then $new else . end] else . end]
           else . end
@@ -17961,6 +18209,9 @@ gen_xray_chain_outbound() {
     # 根据 ip_mode 设置 Xray 的 domainStrategy
     local domain_strategy=""
     case "$ip_mode" in
+        as_is)
+            domain_strategy=""
+            ;;
         ipv6_only|prefer_ipv6)
             domain_strategy="UseIPv6"
             ;;
@@ -19216,6 +19467,7 @@ manage_chain_proxy() {
                     _db_apply '
                         del(.chain_proxy)
                         | .routing_rules = [.routing_rules[]? | select(.outbound | startswith("chain:") | not)]
+                        | .port_routing = [(.port_routing // [])[] | select(.outbound | startswith("chain:") | not)]
                     '
                     _ok "已删除所有节点"
                     _ok "已清理相关分流规则"

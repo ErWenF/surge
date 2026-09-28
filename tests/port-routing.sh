@@ -12,7 +12,7 @@ load_function() {
 }
 for fn in db_get_port_config db_set_port_routing db_update_port db_remove_port db_del db_chain_node_exists db_get_chain_node \
     db_del_chain_node db_rename_chain_node gen_xray_chain_outbound gen_singbox_chain_outbound \
-    _apply_port_routing_config; do
+    _apply_port_routing_config apply_port_routing_change; do
     load_function "$fn"
 done
 _db_apply() { jq "$@" "$DB_FILE" > "$fixture/new.json" && mv "$fixture/new.json" "$DB_FILE"; }
@@ -76,4 +76,20 @@ db_remove_port xray socks 21003
 jq -e '[.port_routing[] | select(.core == "xray")] | length == 0' "$DB_FILE" >/dev/null
 db_del singbox vless
 jq -e '.port_routing == []' "$DB_FILE" >/dev/null
+
+printf 'original config\n' > "$CFG/config.json"
+cp "$DB_FILE" "$fixture/db-before.json"
+cp "$CFG/config.json" "$fixture/config-before.json"
+cp "$CFG/singbox.json" "$fixture/singbox-before.json"
+svc() {
+    printf '%s %s\n' "$1" "$2" >> "$fixture/service-events"
+    [[ "$1" != status ]]
+}
+if apply_port_routing_change xray socks 21001 direct; then exit 1; fi
+if apply_port_routing_change singbox vless 22001 direct; then exit 1; fi
+cmp "$DB_FILE" "$fixture/db-before.json"
+cmp "$CFG/config.json" "$fixture/config-before.json"
+cmp "$CFG/singbox.json" "$fixture/singbox-before.json"
+[[ ! -d "$CFG/backups" ]]
+[[ $(cat "$fixture/service-events") == $'status vless-reality\nstatus vless-singbox' ]]
 echo 'PASS port routing precedence, inbound tags, both cores, node lifecycle and port cleanup'

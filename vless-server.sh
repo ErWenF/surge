@@ -17281,14 +17281,17 @@ setup_warp_ipv6_chain() {
 apply_port_routing_change() {
     local core="$1" protocol="$2" port="$3" target="$4"
     local service config binary generator backup candidate staged=''
-    local was_active=false restart_attempted=false config_installed=false rollback_failed=false failed=''
+    local restart_attempted=false config_installed=false rollback_failed=false failed=''
     case "$core" in
         xray) service=vless-reality; config="$CFG/config.json"; binary=/usr/local/bin/xray; generator=generate_xray_config ;;
         singbox) service=vless-singbox; config="$CFG/singbox.json"; binary=/usr/local/bin/sing-box; generator=generate_singbox_config ;;
         *) return 1 ;;
     esac
+    if ! svc status "$service" >/dev/null 2>&1; then
+        _err "核心 $service 未运行，未修改端口出口"
+        return 1
+    fi
     [[ -x "$binary" && -f "$config" && -f "$DB_FILE" ]] || return 1
-    svc status "$service" >/dev/null 2>&1 && was_active=true
     mkdir -p "$CFG/backups/port-routing" || return 1
     backup=$(mktemp -d "$CFG/backups/port-routing/${core}-${protocol}-${port}.XXXXXX") || return 1
     chmod 700 "$backup"
@@ -17322,6 +17325,9 @@ apply_port_routing_change() {
         fi
     fi
     if [[ -z "$failed" ]]; then
+        svc status "$service" >/dev/null 2>&1 || failed='核心已停止，未重启'
+    fi
+    if [[ -z "$failed" ]]; then
         restart_attempted=true
         svc restart "$service" >/dev/null 2>&1 || failed='核心重启失败'
     fi
@@ -17342,11 +17348,7 @@ apply_port_routing_change() {
             [[ -f "$staged" ]] && rm -f "$staged"
         fi
         if [[ "$restart_attempted" == true ]]; then
-            if [[ "$was_active" == true ]]; then
-                svc restart "$service" >/dev/null 2>&1 && svc status "$service" >/dev/null 2>&1 || rollback_failed=true
-            else
-                svc stop "$service" >/dev/null 2>&1 || rollback_failed=true
-            fi
+            svc restart "$service" >/dev/null 2>&1 && svc status "$service" >/dev/null 2>&1 || rollback_failed=true
         fi
         if [[ "$rollback_failed" == true ]]; then
             _err "$failed，自动回滚未完成，请从 $backup 恢复"

@@ -1,4 +1,24 @@
-#!/bin/bash
+#!/bin/sh
+# 允许最小系统先用 /bin/sh 启动；进入 Bash 后才解析下方的 Bash 语法。
+if [ -z "${BASH_VERSION:-}" ]; then
+    if ! command -v bash >/dev/null 2>&1; then
+        if command -v apk >/dev/null 2>&1; then
+            apk add --no-cache bash
+        elif command -v apt-get >/dev/null 2>&1; then
+            apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bash
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y bash
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y bash
+        else
+            echo "错误: 未找到 Bash 或受支持的包管理器，请先安装 Bash" >&2
+            exit 1
+        fi || { echo "错误: Bash 安装失败，请使用 root 权限检查软件源" >&2; exit 1; }
+    fi
+    exec bash "$0" "$@"
+else
+    set +o posix
+fi
 #
 # 本脚本会保存代理凭据、API Token 和私钥。统一使用私有文件权限，
 # 避免后续通过重定向或 mv 新建的配置意外变成 0644。

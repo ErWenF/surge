@@ -727,6 +727,7 @@ gen_xray_vless_clients() {
 # 生成 Xray VMess 多用户 clients 数组
 gen_xray_vmess_clients() {
     local proto="$1"
+    local filter_port="${2:-}"
     
     local users=$(db_get_users_stats "xray" "$proto")
     if [[ -z "$users" ]]; then
@@ -734,7 +735,7 @@ gen_xray_vmess_clients() {
         local config=$(db_get "xray" "$proto")
         if [[ -n "$config" && "$config" != "null" ]]; then
             if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                local uuid=$(echo "$config" | jq -r '.[0].uuid // empty')
+                local uuid=$(echo "$config" | jq -r --arg port "$filter_port" '[.[] | select($port == "" or (.port | tostring) == $port) | .uuid // empty][0] // empty')
             else
                 local uuid=$(echo "$config" | jq -r '.uuid // empty')
             fi
@@ -750,6 +751,7 @@ gen_xray_vmess_clients() {
     local clients="[]"
     while IFS='|' read -r name uuid used quota enabled port routing; do
         [[ -z "$name" || -z "$uuid" || "$enabled" != "true" ]] && continue
+        [[ -n "$filter_port" && "$port" != "$filter_port" ]] && continue
         local email="${name}@${proto}"
         clients=$(echo "$clients" | jq --arg id "$uuid" --arg e "$email" '. + [{id: $id, email: $e, alterId: 0}]')
     done <<< "$users"
@@ -760,6 +762,7 @@ gen_xray_vmess_clients() {
 # 生成 Xray Trojan 多用户 clients 数组
 gen_xray_trojan_clients() {
     local proto="$1"
+    local filter_port="${2:-}"
     
     local users=$(db_get_users_stats "xray" "$proto")
     if [[ -z "$users" ]]; then
@@ -767,7 +770,7 @@ gen_xray_trojan_clients() {
         local config=$(db_get "xray" "$proto")
         if [[ -n "$config" && "$config" != "null" ]]; then
             if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                local password=$(echo "$config" | jq -r '.[0].password // empty')
+                local password=$(echo "$config" | jq -r --arg port "$filter_port" '[.[] | select($port == "" or (.port | tostring) == $port) | .password // empty][0] // empty')
             else
                 local password=$(echo "$config" | jq -r '.password // empty')
             fi
@@ -783,6 +786,7 @@ gen_xray_trojan_clients() {
     local clients="[]"
     while IFS='|' read -r name uuid used quota enabled port routing; do
         [[ -z "$name" || -z "$uuid" || "$enabled" != "true" ]] && continue
+        [[ -n "$filter_port" && "$port" != "$filter_port" ]] && continue
         local email="${name}@${proto}"
         # Trojan 使用 password 字段，这里 uuid 实际存储的是 password
         clients=$(echo "$clients" | jq --arg pw "$uuid" --arg e "$email" '. + [{password: $pw, email: $e}]')
@@ -871,11 +875,91 @@ gen_xray_socks_accounts() {
 # enabled: 是否启用
 
 # 添加用户到协议 (支持多端口数组格式)
-# 用法: db_add_user "xray" "vless" "用户名" "uuid" [配额GB] [到期日期YYYY-MM-DD]
-# 多端口时：用户会添加到第一个端口实例的 users 数组（共享凭证）
+# 用法: db_add_user core protocol name credential [quota_gb] [expire_date] [port]
+_user_management_supported() {
+    case "$1:$2" in
+        xray:vless|xray:vless-*|xray:vmess-ws|xray:trojan|xray:trojan-ws|singbox:vless|singbox:trojan|singbox:hy2|singbox:tuic|singbox:anytls) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_user_change_begin() {
+    local core="$1" config service backup
+    case "$core" in
+        xray) config="$CFG/config.json"; service=vless-reality ;;
+        singbox) config="$CFG/singbox.json"; service=vless-singbox ;;
+        *) return 1 ;;
+    esac
+    mkdir -p "$CFG/backups/user-changes" || return 1
+    backup=$(mktemp -d "$CFG/backups/user-changes/${core}.XXXXXX") || return 1
+    chmod 700 "$backup"
+    cp -p "$DB_FILE" "$backup/db.json" || return 1
+    [[ ! -f "$config" ]] || cp -p "$config" "$backup/active.json" || return 1
+    svc status "$service" >/dev/null 2>&1 && touch "$backup/running"
+    printf '%s\n' "$backup"
+}
+
+_user_change_apply() {
+    local core="$1" backup="$2" config service binary candidate staged failed='' restarted=false
+    case "$core" in
+        xray) config="$CFG/config.json"; service=vless-reality; binary="${XRAY_BIN:-/usr/local/bin/xray}" ;;
+        singbox) config="$CFG/singbox.json"; service=vless-singbox; binary="${SINGBOX_BIN:-/usr/local/bin/sing-box}" ;;
+        *) return 1 ;;
+    esac
+    candidate="$backup/candidate.json"
+    if [[ "$core" == xray ]]; then
+        XRAY_CONFIG_OUTPUT="$candidate" generate_xray_config >/dev/null 2>&1 || failed='候选配置生成失败'
+    else
+        SINGBOX_CONFIG_OUTPUT="$candidate" generate_singbox_config >/dev/null 2>&1 || failed='候选配置生成失败'
+    fi
+    if [[ -z "$failed" ]]; then
+        if [[ "$core" == xray ]]; then
+            "$binary" run -test -c "$candidate" >/dev/null 2>&1 || failed='Xray 配置校验失败'
+        else
+            "$binary" check -c "$candidate" >/dev/null 2>&1 || failed='Sing-box 配置校验失败'
+        fi
+    fi
+    if [[ -z "$failed" && -f "$backup/active.json" ]]; then
+        jq -ne --slurpfile before "$backup/active.json" --slurpfile after "$candidate" '
+            (($before[0].inbounds // [] | map(.tag)) - ($after[0].inbounds // [] | map(.tag))) | length == 0
+        ' >/dev/null 2>&1 || failed='候选配置缺少原有入站'
+    fi
+    if [[ -z "$failed" ]]; then
+        staged=$(mktemp "${config}.new.XXXXXX") || failed='配置暂存失败'
+    fi
+    if [[ -z "$failed" ]]; then
+        cp -p "$candidate" "$staged" && mv "$staged" "$config" || failed='配置写入失败'
+        [[ -z "$failed" ]] || rm -f "$staged"
+    fi
+    if [[ -z "$failed" && -f "$backup/running" ]]; then
+        svc status "$service" >/dev/null 2>&1 || failed='原核心已停止'
+        if [[ -z "$failed" ]]; then
+            restarted=true
+            svc restart "$service" >/dev/null 2>&1 || failed='核心重启失败'
+        fi
+        if [[ -z "$failed" ]]; then
+            sleep "${USER_CHANGE_HEALTH_DELAY:-1}"
+            svc status "$service" >/dev/null 2>&1 || failed='核心健康检查失败'
+        fi
+    fi
+    [[ -z "$failed" ]] && return 0
+    cp -p "$backup/db.json" "$DB_FILE" || _err "数据库回滚失败: $backup"
+    if [[ -f "$backup/active.json" ]]; then
+        cp -p "$backup/active.json" "$config" || _err "配置回滚失败: $backup"
+    else
+        rm -f "$config"
+    fi
+    if [[ "$restarted" == true ]]; then
+        svc restart "$service" >/dev/null 2>&1 && svc status "$service" >/dev/null 2>&1 || _err "服务回滚失败: $backup"
+    fi
+    _err "$failed，已尝试恢复；备份: $backup"
+    return 1
+}
+
 db_add_user() {
-    local core="$1" proto="$2" name="$3" uuid="$4" quota_gb="${5:-0}" expire_date="${6:-}"
+    local core="$1" proto="$2" name="$3" uuid="$4" quota_gb="${5:-0}" expire_date="${6:-}" port="${7:-}" routing="${8:-}" backup
     [[ ! -f "$DB_FILE" ]] && return 1
+    [[ "$name" != default && "$name" != default-* ]] || { _err "default 为系统保留用户名"; return 1; }
     
     # 检查协议是否存在
     if ! db_exists "$core" "$proto"; then
@@ -888,6 +972,18 @@ db_add_user() {
         _err "独立协议 $proto 不支持添加用户"
         return 1
     fi
+    if ! _user_management_supported "$core" "$proto"; then
+        _err "$core/$proto 不支持独立用户认证与统计，未添加用户"
+        return 1
+    fi
+    local matches
+    matches=$(jq -r --arg c "$core" --arg p "$proto" --arg port "$port" '
+        .[$c][$p] | if type == "array" then
+            [ .[] | select($port != "" and (.port | tostring) == $port) ] | length
+        else
+            if $port == "" or (.port | tostring) == $port then 1 else 0 end
+        end' "$DB_FILE" 2>/dev/null) || return 1
+    [[ "$matches" == 1 ]] || { _err "必须指定唯一有效的入站端口"; return 1; }
     
 
     
@@ -915,40 +1011,43 @@ db_add_user() {
     local created=$(date '+%Y-%m-%d')
     
     # 添加用户 (支持多端口数组，包含 expire_date)
-    _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg u "$uuid" \
+    backup=$(_user_change_begin "$core") || return 1
+    _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg u "$uuid" --arg port "$port" --arg r "$routing" \
        --argjson q "$quota" --arg cr "$created" --arg exp "$expire_date" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
-            # 多端口: 添加到第一个端口实例
-            .[$c][$p][0].users = ((.[$c][$p][0].users // []) + [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp}])
+            .[$c][$p] |= map(
+                (.port | tostring) as $row_port |
+                .users |= ((. // []) | map(if .name == "default" then .name = ("default-" + $row_port) else . end)) |
+                if (.users | length) == 0 then
+                    .users = [{name:("default-" + $row_port),uuid:(.uuid // .password),quota:0,used:0,enabled:true,created:$cr,expire_date:""}]
+                else . end |
+                if $row_port == $port then
+                    .users += [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp,routing:$r}]
+                else . end)
         else
-            # 单端口: 正常添加
-            .[$c][$p].users = ((.[$c][$p].users // []) + [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp}])
+            .[$c][$p].users = ((if ((.[$c][$p].users // []) | length) == 0 then
+                [{name:"default",uuid:(.[$c][$p].uuid // .[$c][$p].password),quota:0,used:0,enabled:true,created:$cr,expire_date:""}]
+            else .[$c][$p].users end) + [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp,routing:$r}])
         end
     ' || return 1
-    
+    _user_change_apply "$core" "$backup" || return 1
     # 如果设置了到期日期，自动安装过期检查 cron
     [[ -n "$expire_date" ]] && ensure_expire_check_cron 2>/dev/null
-    
-    # 自动重建配置
-    if [[ "$core" == "xray" ]]; then
-        rebuild_and_reload_xray "silent"
-    elif [[ "$core" == "singbox" ]]; then
-        rebuild_and_reload_singbox "silent"
-    fi
+    return 0
 }
 
 
 # 删除用户 (支持多端口数组格式)
 # 用法: db_del_user "xray" "vless" "用户名"
 db_del_user() {
-    local core="$1" proto="$2" name="$3"
+    local core="$1" proto="$2" name="$3" backup
     if _snell_managed "$proto"; then
         _snell_delete_user "$proto" "$name"
         return $?
     fi
     [[ ! -f "$DB_FILE" ]] && return 1
-    
+    backup=$(_user_change_begin "$core") || return 1
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
@@ -960,12 +1059,7 @@ db_del_user() {
         end
     ' || return 1
     
-    # 自动重建配置
-    if [[ "$core" == "xray" ]]; then
-        rebuild_and_reload_xray "silent"
-    elif [[ "$core" == "singbox" ]]; then
-        rebuild_and_reload_singbox "silent"
-    fi
+    _user_change_apply "$core" "$backup"
 }
 
 # 获取用户信息 (支持多端口数组格式)
@@ -1147,7 +1241,7 @@ db_list_users() {
                 if (.users | length) > 0 then
                     .users[].name
                 elif (.uuid != null or .password != null) then
-                    "default"
+                    "default-\(.port)"
                 else
                     empty
                 end
@@ -1267,34 +1361,37 @@ db_set_user_quota() {
 # 启用/禁用用户 (支持多端口数组格式)
 # 用法: db_set_user_enabled "xray" "vless" "用户名" true/false
 db_set_user_enabled() {
-    local core="$1" proto="$2" name="$3" enabled="$4"
+    local core="$1" proto="$2" name="$3" enabled="$4" reason="${5:-manual}" backup=''
     [[ ! -f "$DB_FILE" ]] && return 1
-    if _snell_managed "$proto" && [[ "$enabled" == true ]]; then
-        local snell_user
-        snell_user=$(db_get_user "$core" "$proto" "$name")
+    if [[ "$enabled" == true ]]; then
+        local current_user
+        current_user=$(db_get_user "$core" "$proto" "$name")
         if ! jq -e --arg today "$(date +%F)" '
             ((.quota // 0) == 0 or (.used // 0) < .quota) and
             ((.expire_date // "") == "" or .expire_date >= $today)
-        ' <<< "$snell_user" >/dev/null; then
+        ' <<< "$current_user" >/dev/null; then
             _err "用户仍然超额或已到期，请先调整配额、重置流量或延长到期日期"
             return 1
         fi
     fi
     
-    _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --argjson e "$enabled" '
+    if ! _snell_managed "$proto"; then
+        backup=$(_user_change_begin "$core") || return 1
+    fi
+    _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg reason "$reason" --argjson e "$enabled" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
-            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .enabled = $e else . end])]
+            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] | if .name == $n then .enabled = $e | .disabled_reason = (if $e then "" else $reason end) else . end])]
         else
-            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .enabled = $e else . end]
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .enabled = $e | .disabled_reason = (if $e then "" else $reason end) else . end]
         end
     ' || return 1
     
     # 自动重建配置
     if _snell_managed "$proto"; then
         _snell_apply_users "$proto" "$name"
-    elif [[ "$core" == "xray" ]]; then
-        rebuild_and_reload_xray "silent"
+    else
+        _user_change_apply "$core" "$backup"
     fi
 }
 
@@ -1373,9 +1470,9 @@ db_set_user_alert_state() {
 #   "chain:节点名" - 链式代理指定节点
 #   "balancer:组名" - 负载均衡组
 db_set_user_routing() {
-    local core="$1" proto="$2" name="$3" routing="$4"
+    local core="$1" proto="$2" name="$3" routing="$4" backup
     [[ ! -f "$DB_FILE" ]] && return 1
-    
+    backup=$(_user_change_begin "$core") || return 1
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg r "$routing" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
@@ -1385,12 +1482,7 @@ db_set_user_routing() {
         end
     ' || return 1
     
-    # 自动重建配置
-    if [[ "$core" == "xray" ]]; then
-        rebuild_and_reload_xray "silent"
-    elif [[ "$core" == "singbox" ]]; then
-        rebuild_and_reload_singbox "silent"
-    fi
+    _user_change_apply "$core" "$backup"
 }
 
 # 获取用户路由 (支持多端口数组格式)
@@ -1670,7 +1762,7 @@ check_and_disable_expired_users() {
     
     while IFS='|' read -r core proto name expire_date days_left; do
         [[ -z "$name" ]] && continue
-        db_set_user_enabled "$core" "$proto" "$name" false
+        db_set_user_enabled "$core" "$proto" "$name" false expired
         ((count++))
         [[ "$notify" == "--notify" ]] && send_tg_expired_notice "$name" "$proto" "$expire_date" "$core"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 禁用: $name ($proto)" >> "$CFG/expire.log"
@@ -1764,17 +1856,17 @@ db_get_users_stats() {
             # 多端口数组
             $cfg[] | . as $port_cfg |
             if (.users | length) > 0 then
-                .users[] | "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(.enabled // true)|\($port_cfg.port)|\(.routing // "")|\(.expire_date // "")"
+                .users[] | "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(.enabled == true or .enabled == null)|\($port_cfg.port)|\(.routing // "")|\(.expire_date // "")"
             elif (.uuid != null or .password != null or .username != null) then
                 # 无 users 数组，生成默认用户（与 Xray email 格式一致使用 "default"）
-                "default|\(.uuid // .password // .username)|0|0|true|\(.port)||"
+                "default-\(.port)|\(.uuid // .password // .username)|0|0|true|\(.port)||"
             else
                 empty
             end
         else
             # 单端口对象
             if ($cfg.users | length) > 0 then
-                $cfg.users[] | "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(.enabled // true)|\($cfg.port)|\(.routing // "")|\(.expire_date // "")"
+                $cfg.users[] | "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(.enabled == true or .enabled == null)|\($cfg.port)|\(.routing // "")|\(.expire_date // "")"
             elif ($cfg.uuid != null or $cfg.password != null or $cfg.username != null) then
                 "default|\($cfg.uuid // $cfg.password // $cfg.username)|0|0|true|\($cfg.port)||"
             else
@@ -2748,7 +2840,7 @@ for proto in ('vless', 'trojan', 'hy2', 'tuic', 'anytls'):
             return obj.get('uuid') or ''
         return obj.get('password') or obj.get('username') or obj.get('uuid') or ''
 
-    def normalize_obj(obj):
+    def normalize_obj(obj, default_name='default'):
         if not isinstance(obj, dict):
             return obj
 
@@ -2762,13 +2854,13 @@ for proto in ('vless', 'trojan', 'hy2', 'tuic', 'anytls'):
 
         default_user = None
         for user in users:
-            if isinstance(user, dict) and user.get('name') == 'default':
+            if isinstance(user, dict) and user.get('name') in (default_name, 'default'):
                 default_user = user
                 break
 
         if default_user is None:
             users.insert(0, {
-                'name': 'default',
+                'name': default_name,
                 'uuid': secret,
                 'quota': 0,
                 'used': 0,
@@ -2779,6 +2871,9 @@ for proto in ('vless', 'trojan', 'hy2', 'tuic', 'anytls'):
             obj['users'] = users
             changed[0] = True
         else:
+            if default_user['name'] != default_name:
+                default_user['name'] = default_name
+                changed[0] = True
             if not default_user.get('uuid'):
                 default_user['uuid'] = secret
                 changed[0] = True
@@ -2802,7 +2897,7 @@ for proto in ('vless', 'trojan', 'hy2', 'tuic', 'anytls'):
         return obj
 
     if isinstance(cfg, list):
-        singbox[proto] = [normalize_obj(item) for item in cfg]
+        singbox[proto] = [normalize_obj(item, f"default-{item.get('port')}") if isinstance(item, dict) else item for item in cfg]
     else:
         singbox[proto] = normalize_obj(cfg)
 
@@ -2899,8 +2994,6 @@ _sync_all_user_traffic_unlocked() {
     [[ ! -f "$DB_FILE" ]] && return 1
     _ensure_singbox_default_users
     
-    # 月重置（仅重置数据库累计值，不影响实时计数器）
-    check_monthly_traffic_reset
     _snell_sync_traffic || { mark_traffic_sync_result "snell_error" 0; return 1; }
     
     # 检查是否需要发送每日报告
@@ -2912,6 +3005,7 @@ _sync_all_user_traffic_unlocked() {
     _pgrep sing-box && has_singbox=true
 
     if [[ "$has_xray" == "false" && "$has_singbox" == "false" ]]; then
+        [[ "$reset" != true ]] || check_monthly_traffic_reset || return 1
         if _snell_any_managed; then
             mark_traffic_sync_result "ok" 0
         else
@@ -2929,9 +3023,14 @@ _sync_all_user_traffic_unlocked() {
     local reset_flag=""
     [[ "$reset" == "true" ]] && reset_flag="-reset"
     
+    local xray_failed=false xray_output=''
     if [[ "$has_xray" == "true" ]]; then
-        xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} $reset_flag 2>/dev/null | \
-            jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' >> "$tmp_stats" 2>/dev/null || true
+        if ! xray_output=$(xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} $reset_flag 2>/dev/null) ||
+            ! printf '%s\n' "$xray_output" | jq -e 'type == "object" and ((.stat // .Stat // []) | type == "array")' >/dev/null 2>&1; then
+            xray_failed=true
+        else
+            printf '%s\n' "$xray_output" | jq -r '(.stat // .Stat // [])[] | "\(.name // .Name) \(.value // .Value // 0)"' >> "$tmp_stats" || xray_failed=true
+        fi
     fi
 
     local singbox_failed=false
@@ -2945,12 +3044,13 @@ _sync_all_user_traffic_unlocked() {
     if [[ ! -s "$tmp_stats" ]]; then
         rm -f "$tmp_stats"
         if [[ "$singbox_failed" == true ]]; then mark_traffic_sync_result "singbox_error" 0; return 1; fi
+        if [[ "$xray_failed" == true ]]; then mark_traffic_sync_result "xray_error" 0; return 1; fi
+        [[ "$reset" != true ]] || check_monthly_traffic_reset || return 1
         mark_traffic_sync_result "no_stats" 0
         return 0
     fi
     
     local updated=0
-    local need_reload=false  # 标记是否需要重载 Xray 配置
     local notify_percent=$(tg_get_config "notify_quota_percent")
     notify_percent=${notify_percent:-80}
     
@@ -2983,10 +3083,10 @@ _sync_all_user_traffic_unlocked() {
                     if [[ "$used" -ge "$quota" ]]; then
                         local exceeded_notified=$(db_get_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified")
                         if [[ "$exceeded_notified" != "true" ]]; then
-                            db_set_user_enabled "xray" "$proto" "$user" "false"
+                            if [[ "$(db_get_user_field xray "$proto" "$user" enabled)" != true ]]; then continue; fi
+                            db_set_user_enabled "xray" "$proto" "$user" "false" quota || { rm -f "$tmp_stats"; mark_traffic_sync_result "quota_apply_error" "$updated"; return 1; }
                             db_set_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified" "true"
                             tg_send_over_quota "$user" "$proto" "$used" "$quota" "xray"
-                            need_reload=true
                         fi
                     elif [[ "$percent" -ge "$notify_percent" ]]; then
                         local last_alert=$(db_get_user_alert_state "xray" "$proto" "$user" "last_alert_percent")
@@ -3038,7 +3138,8 @@ _sync_all_user_traffic_unlocked() {
                         if [[ "$used" -ge "$quota" ]]; then
                             local exceeded_notified=$(db_get_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified")
                             if [[ "$exceeded_notified" != "true" ]]; then
-                                db_set_user_enabled "singbox" "$proto" "$user" "false"
+                                if [[ "$(db_get_user_field singbox "$proto" "$user" enabled)" != true ]]; then continue; fi
+                                db_set_user_enabled "singbox" "$proto" "$user" "false" quota || { rm -f "$tmp_stats"; mark_traffic_sync_result "quota_apply_error" "$updated"; return 1; }
                                 db_set_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified" "true"
                                 tg_send_over_quota "$user" "$proto" "$used" "$quota" "singbox"
                             fi
@@ -3066,16 +3167,15 @@ _sync_all_user_traffic_unlocked() {
     
     rm -f "$tmp_stats"
     
-    # 批量处理完成后统一重载配置（避免循环内多次重启）
-    if [[ "$need_reload" == "true" ]]; then
-        generate_xray_config 2>/dev/null
-        svc restart vless-reality 2>/dev/null
-    fi
-
-    if [[ "$singbox_failed" == true ]]; then
-        mark_traffic_sync_result "partial_singbox_error" "$updated"
+    if [[ "$singbox_failed" == true || "$xray_failed" == true ]]; then
+        if [[ "$singbox_failed" == true ]]; then
+            mark_traffic_sync_result "partial_singbox_error" "$updated"
+        else
+            mark_traffic_sync_result "partial_xray_error" "$updated"
+        fi
         return 1
     fi
+    [[ "$reset" != true ]] || check_monthly_traffic_reset || { mark_traffic_sync_result "monthly_reset_error" "$updated"; return 1; }
     mark_traffic_sync_result "ok" "$updated"
     
     return 0
@@ -3234,13 +3334,27 @@ cron_service_is_active() {
         rc-service cronie status >/dev/null 2>&1 && return 0
         rc-service crond status >/dev/null 2>&1 && return 0
     fi
-    _pgrep crond && return 0
-    _pgrep cron && return 0
+    local proc_dir comm
+    for proc_dir in /proc/[0-9]*; do
+        [[ -r "$proc_dir/comm" ]] || continue
+        IFS= read -r comm < "$proc_dir/comm" 2>/dev/null || continue
+        [[ "$comm" == cron || "$comm" == crond ]] && return 0
+    done
     return 1
 }
 
 ensure_cron_service_running() {
     cron_service_is_active && return 0
+
+    # crontab 可能由 BusyBox 提供，但系统没有运行 cron 守护进程。
+    if ! command -v cron >/dev/null 2>&1 && ! command -v crond >/dev/null 2>&1 && [[ ! -x /usr/sbin/cron ]]; then
+        case "$DISTRO" in
+            alpine) apk add --no-cache dcron >/dev/null 2>&1 || return 1 ;;
+            debian|ubuntu) DEBIAN_FRONTEND=noninteractive apt-get install -y cron >/dev/null 2>&1 || return 1 ;;
+            centos|rhel|fedora|rocky|almalinux) { dnf install -y cronie || yum install -y cronie; } >/dev/null 2>&1 || return 1 ;;
+            *) return 1 ;;
+        esac
+    fi
 
     if command -v rc-service >/dev/null 2>&1; then
         rc-update add cronie default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || true
@@ -3254,6 +3368,13 @@ ensure_cron_service_running() {
     fi
     if ! cron_service_is_active && command -v crond >/dev/null 2>&1; then
         crond >/dev/null 2>&1 || true
+    fi
+    if ! cron_service_is_active; then
+        if command -v cron >/dev/null 2>&1; then
+            cron >/dev/null 2>&1 || true
+        elif [[ -x /usr/sbin/cron ]]; then
+            /usr/sbin/cron >/dev/null 2>&1 || true
+        fi
     fi
 
     cron_service_is_active
@@ -3294,12 +3415,12 @@ setup_traffic_cron() {
     log_file="$CFG/traffic-sync.log"
     cron_cmd="$(build_cron_command "*/$interval * * * *" "$script_path" "--sync-traffic" "$log_file") # sync-traffic"
 
+    if ! ensure_cron_service_running; then
+        [[ "$silent" == "true" ]] || _err "cron 服务未运行，流量同步规则未更改"
+        return 1
+    fi
     if install_cron_entry "sync-traffic" "$cron_cmd"; then
         set_traffic_interval "$interval"
-        if ! ensure_cron_service_running; then
-            [[ "$silent" == "true" ]] || _err "定时规则已写入，但 cron 服务未运行"
-            return 1
-        fi
         if [[ "$silent" != "true" ]]; then
             _ok "已添加流量统计定时任务 (每${interval}分钟)"
             echo -e "  ${D}日志: $log_file${NC}"
@@ -3329,11 +3450,11 @@ setup_tg_user_bot_cron() {
     log_file="$CFG/tg-user-bot.log"
     cron_cmd="$(build_cron_command "* * * * *" "$script_path" "--tg-bot-poll" "$log_file") # tg-user-bot"
 
+    if ! ensure_cron_service_running; then
+        [[ "$silent" == "true" ]] || _err "cron 服务未运行，机器人规则未更改"
+        return 1
+    fi
     if install_cron_entry "tg-user-bot" "$cron_cmd"; then
-        if ! ensure_cron_service_running; then
-            [[ "$silent" == "true" ]] || _err "机器人规则已写入，但 cron 服务未运行"
-            return 1
-        fi
         if [[ "$silent" != "true" ]]; then
             _ok "用户机器人轮询已启用（最长约 1 分钟响应）"
             echo -e "  ${D}日志: $log_file${NC}"
@@ -3378,24 +3499,75 @@ set_traffic_monthly_reset_day() {
 
 reset_monthly_user_traffic() {
     [[ ! -f "$DB_FILE" ]] && return 0
-    local month_key
+    local month_key today restore_xray restore_singbox snell_restore monthly_backup
+    local xray_backup='' singbox_backup='' xray_applied=false singbox_applied=false snell_applied=false failed=''
+    local proto name
     month_key=$(date +%Y-%m)
-    echo "$month_key" > "$TRAFFIC_MONTHLY_RESET_LAST_FILE"
-
-    _db_apply '
-      if .xray then
-        .xray |= with_entries(
-          .value |= (
-            if type == "array" then
-              map(if .users then .users |= map(.used = 0 | .enabled = true | del(.alert.last_alert_percent, .alert.quota_exceeded_notified)) else . end)
-            else
-              if .users then .users |= map(.used = 0 | .enabled = true | del(.alert.last_alert_percent, .alert.quota_exceeded_notified)) else . end
-            end
-          )
-        )
-      else . end
-    '
-    _ok "已按月重置 Xray 用户流量"
+    today=$(date +%F)
+    restore_xray=$(jq --arg today "$today" '[.xray // {} | to_entries[] | select(.key | startswith("snell") | not) | select(.key != "ss2022" and .key != "ss-legacy") | .value | (if type == "array" then .[] else . end) | .users[]? | select(.enabled == false and .disabled_reason == "quota" and ((.expire_date // "") == "" or .expire_date >= $today))] | length' "$DB_FILE") || return 1
+    restore_singbox=$(jq --arg today "$today" '[.singbox // {} | to_entries[] | select(.key != "ss2022" and .key != "ss-legacy") | .value | (if type == "array" then .[] else . end) | .users[]? | select(.enabled == false and .disabled_reason == "quota" and ((.expire_date // "") == "" or .expire_date >= $today))] | length' "$DB_FILE") || return 1
+    snell_restore=$(jq -r --arg today "$today" '
+        .xray // {} | to_entries[] | select(.key | startswith("snell")) |
+        .key as $proto | .value | (if type == "array" then .[] else empty end) |
+        select(.snell_id != null) | .users[]? |
+        select(.enabled == false and .disabled_reason == "quota" and ((.expire_date // "") == "" or .expire_date >= $today)) |
+        [$proto, .name] | @tsv' "$DB_FILE") || return 1
+    mkdir -p "$CFG/backups/user-changes" || return 1
+    monthly_backup=$(mktemp "$CFG/backups/user-changes/monthly.XXXXXX") || return 1
+    cp -p "$DB_FILE" "$monthly_backup" && chmod 600 "$monthly_backup" || return 1
+    if (( restore_xray > 0 )); then xray_backup=$(_user_change_begin xray) || return 1; fi
+    if (( restore_singbox > 0 )); then singbox_backup=$(_user_change_begin singbox) || return 1; fi
+    _db_apply --arg today "$today" '
+        def reset_users($resume):
+            if .users then .users |= map(
+                .used = 0 |
+                (if $resume and .enabled == false and .disabled_reason == "quota" and
+                    ((.expire_date // "") == "" or .expire_date >= $today)
+                then .enabled = true | .disabled_reason = "" else . end) |
+                del(.last_alert_percent, .quota_exceeded_notified)
+            ) else . end;
+        .xray = ((.xray // {}) | with_entries(.key as $p | .value |=
+            (if type == "array" then map(reset_users(((($p | startswith("snell") | not) and $p != "ss2022" and $p != "ss-legacy") or .snell_id != null)))
+             else reset_users((($p | startswith("snell") | not) and $p != "ss2022" and $p != "ss-legacy")) end))) |
+        .singbox = ((.singbox // {}) | with_entries(.key as $p | .value |=
+            (if type == "array" then map(reset_users($p != "ss2022" and $p != "ss-legacy"))
+             else reset_users($p != "ss2022" and $p != "ss-legacy") end)))
+    ' || return 1
+    if [[ -n "$xray_backup" ]]; then
+        if _user_change_apply xray "$xray_backup"; then xray_applied=true; else failed='Xray 恢复失败'; fi
+    fi
+    if [[ -z "$failed" && -n "$singbox_backup" ]]; then
+        if _user_change_apply singbox "$singbox_backup"; then singbox_applied=true; else failed='Sing-box 恢复失败'; fi
+    fi
+    if [[ -z "$failed" ]]; then
+        while IFS=$'\t' read -r proto name; do
+            [[ -n "$proto" ]] || continue
+            snell_applied=true
+            _snell_apply_users "$proto" "$name" || { failed='Snell 恢复失败'; break; }
+        done <<< "$snell_restore"
+    fi
+    if [[ -z "$failed" ]]; then
+        printf '%s\n' "$month_key" > "$TRAFFIC_MONTHLY_RESET_LAST_FILE" || failed='月重置状态写入失败'
+    fi
+    if [[ -n "$failed" ]]; then
+        cp -p "$monthly_backup" "$DB_FILE" || _err "月重置数据库回滚失败: $monthly_backup"
+        if [[ "$xray_applied" == true ]]; then
+            if [[ -f "$xray_backup/active.json" ]]; then cp -p "$xray_backup/active.json" "$CFG/config.json" || _err "Xray 月重置配置回滚失败: $xray_backup"; else rm -f "$CFG/config.json"; fi
+            [[ ! -f "$xray_backup/running" ]] || svc restart vless-reality >/dev/null 2>&1 || _err "Xray 月重置服务回滚失败: $xray_backup"
+        fi
+        if [[ "$singbox_applied" == true ]]; then
+            if [[ -f "$singbox_backup/active.json" ]]; then cp -p "$singbox_backup/active.json" "$CFG/singbox.json" || _err "Sing-box 月重置配置回滚失败: $singbox_backup"; else rm -f "$CFG/singbox.json"; fi
+            [[ ! -f "$singbox_backup/running" ]] || svc restart vless-singbox >/dev/null 2>&1 || _err "Sing-box 月重置服务回滚失败: $singbox_backup"
+        fi
+        if [[ "$snell_applied" == true ]]; then
+            while IFS=$'\t' read -r proto name; do
+                [[ -n "$proto" ]] && _snell_apply_users "$proto" "$name" || true
+            done <<< "$snell_restore"
+        fi
+        _err "$failed，已尝试恢复；数据库备份: $monthly_backup"
+        return 1
+    fi
+    _ok "已按月重置用户流量，人工停用及到期用户保持停用"
 }
 
 check_monthly_traffic_reset() {
@@ -5017,7 +5189,6 @@ add_xray_inbound_v2() {
             if [[ "$security_mode" == "encryption" ]]; then
                 local decryption=$(echo "$cfg" | jq -r '.decryption // "none"')
                 local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-                [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
 
                 jq -n \
                     --argjson port "$port" \
@@ -5044,7 +5215,6 @@ add_xray_inbound_v2() {
                 # VLESS+Reality - 使用 jq 安全构建 (支持 WS 回落)
                 # 获取完整的用户列表（包含子用户和 email，用于流量统计）
                 local clients=$(gen_xray_vless_clients "$base_protocol" "xtls-rprx-vision" "$port")
-                [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\",\"flow\":\"xtls-rprx-vision\"}]"
                 
                 jq -n \
                     --argjson port "$port" \
@@ -5086,7 +5256,6 @@ add_xray_inbound_v2() {
             # VLESS-Vision - 使用 jq 安全构建
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
             local clients=$(gen_xray_vless_clients "$base_protocol" "xtls-rprx-vision" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\",\"flow\":\"xtls-rprx-vision\"}]"
             
             jq -n \
                 --argjson port "$port" \
@@ -5122,7 +5291,6 @@ add_xray_inbound_v2() {
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
             # vless-ws 不需要 flow
             local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
             
             if [[ "$has_master" == "true" ]]; then
                 # 回落模式：监听本地
@@ -5182,7 +5350,6 @@ add_xray_inbound_v2() {
         vless-ws-notls)
             # VLESS-WS 无 TLS - 专为 CF Tunnel 设计
             local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
             
             # 从数据库获取 host 配置
             local host=$(db_get_field "xray" "$base_protocol" "host")
@@ -5212,7 +5379,6 @@ add_xray_inbound_v2() {
         vless-xhttp)
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
             local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
             
             jq -n \
                 --argjson port "$port" \
@@ -5253,7 +5419,6 @@ add_xray_inbound_v2() {
             
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
             local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
             
             jq -n \
                 --argjson port "$internal_port" \
@@ -5276,8 +5441,7 @@ add_xray_inbound_v2() {
             ;;
         vmess-ws)
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-            local clients=$(gen_xray_vmess_clients "$base_protocol")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\",\"alterId\":0}]"
+            local clients=$(gen_xray_vmess_clients "$base_protocol" "$port")
             
             if [[ "$has_master" == "true" ]]; then
                 jq -n \
@@ -5328,8 +5492,7 @@ add_xray_inbound_v2() {
             ;;
         trojan)
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-            local clients=$(gen_xray_trojan_clients "$base_protocol")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"password\":\"$password\",\"email\":\"default@${base_protocol}\"}]"
+            local clients=$(gen_xray_trojan_clients "$base_protocol" "$port")
             
             jq -n \
                 --argjson port "$port" \
@@ -5360,8 +5523,7 @@ add_xray_inbound_v2() {
             local sni=$(echo "$cfg" | jq -r '.sni // "bing.com"')
             
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-            local clients=$(gen_xray_trojan_clients "$base_protocol")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"password\":\"$password\",\"email\":\"default@${base_protocol}\"}]"
+            local clients=$(gen_xray_trojan_clients "$base_protocol" "$port")
             
             # Trojan-WS 作为回落协议或独立运行
             if _has_master_protocol; then
@@ -11706,9 +11868,10 @@ generate_singbox_config() {
                 local sni=$(echo "$cfg" | jq -r '.sni // "www.microsoft.com"')
                 local users_json
                 users_json=$(echo "$cfg" | jq --arg uuid "$uuid" '
-                    [(.users // [])[] | select(.enabled // true) |
+                    (.users // []) as $users |
+                    [$users[] | select(.enabled == true or .enabled == null) |
                         {name:("vless-" + .name), uuid:.uuid, flow:"xtls-rprx-vision"}] |
-                    if length == 0 then [{name:"vless-default", uuid:$uuid, flow:"xtls-rprx-vision"}] else . end')
+                    if ($users | length) == 0 then [{name:"vless-default", uuid:$uuid, flow:"xtls-rprx-vision"}] else . end')
                 inbound=$(jq -n \
                     --argjson port "$port" --argjson users "$users_json" \
                     --arg private_key "$private_key" --arg short_id "$short_id" \
@@ -11729,9 +11892,10 @@ generate_singbox_config() {
                 local sni=$(echo "$cfg" | jq -r '.sni // "bing.com"')
                 local users_json
                 users_json=$(echo "$cfg" | jq --arg password "$password" '
-                    [(.users // [])[] | select(.enabled // true) |
+                    (.users // []) as $users |
+                    [$users[] | select(.enabled == true or .enabled == null) |
                         {name:("trojan-" + .name), password:.uuid}] |
-                    if length == 0 then [{name:"trojan-default", password:$password}] else . end')
+                    if ($users | length) == 0 then [{name:"trojan-default", password:$password}] else . end')
                 inbound=$(jq -n \
                     --argjson port "$port" --argjson users "$users_json" \
                     --arg cert "$CFG/certs/server.crt" --arg key "$CFG/certs/server.key" \
@@ -11771,21 +11935,12 @@ generate_singbox_config() {
                 
                 # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
                 local users_json="[]"
-                local db_users=$(jq -r --arg p "$proto" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | unique_by(.name)
-                    else
-                        $cfg.users // []
-                    end
-                ' "$DB_FILE" 2>/dev/null)
+                local db_users=$(echo "$cfg" | jq '.users // []')
                 
                 if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
                     # 有自定义用户，为每个用户生成 {name, password}
                     # hy2 用户的 uuid 字段存储的是密码；name 使用协议隔离后的内部统计键
-                    local default_user_json=$(jq -n --arg name "hy2-default" --arg pw "$password" '{name: $name, password: $pw}')
-                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '([$chk_def] + ($db_users | map({name: ("hy2-" + .name), password: .uuid}))) | unique_by(.name)')
+                    users_json=$(jq -n --argjson db_users "$db_users" '$db_users | map(select(.enabled == true or .enabled == null) | {name: ("hy2-" + .name), password: .uuid})')
                 else
                     # 没有自定义用户，使用默认密码
                     users_json=$(jq -n --arg name "hy2-default" --arg pw "$password" '[{name: $name, password: $pw}]')
@@ -11825,20 +11980,11 @@ generate_singbox_config() {
                 
                 # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
                 local users_json="[]"
-                local db_users=$(jq -r --arg p "$proto" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | unique_by(.name)
-                    else
-                        $cfg.users // []
-                    end
-                ' "$DB_FILE" 2>/dev/null)
+                local db_users=$(echo "$cfg" | jq '.users // []')
                 
                 if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
                     # TUIC 用户的 uuid 字段存储的是真正用户 UUID；name 使用协议隔离后的内部统计键
-                    local default_user_json=$(jq -n --arg name "tuic-default" --arg id "$uuid" --arg pw "$password" '{name: $name, uuid: $id, password: $pw}')
-                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" --arg pw "$password" '([$chk_def] + ($db_users | map({name: ("tuic-" + .name), uuid: .uuid, password: $pw}))) | unique_by(.name)')
+                    users_json=$(jq -n --argjson db_users "$db_users" --arg pw "$password" '$db_users | map(select(.enabled == true or .enabled == null) | {name: ("tuic-" + .name), uuid: .uuid, password: $pw})')
                 else
                     users_json=$(jq -n --arg name "tuic-default" --arg id "$uuid" --arg pw "$password" '[{name: $name, uuid: $id, password: $pw}]')
                 fi
@@ -11874,20 +12020,11 @@ generate_singbox_config() {
 
                 # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
                 local users_json="[]"
-                local db_users=$(jq -r --arg p "$proto" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | unique_by(.name)
-                    else
-                        $cfg.users // []
-                    end
-                ' "$DB_FILE" 2>/dev/null)
+                local db_users=$(echo "$cfg" | jq '.users // []')
 
                 if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
                     # AnyTLS 用户的 uuid 字段存储的是真正用户密码；name 使用协议隔离后的内部统计键
-                    local default_user_json=$(jq -n --arg name "anytls-default" --arg pw "$password" '{name: $name, password: $pw}')
-                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '([$chk_def] + ($db_users | map({name: ("anytls-" + .name), password: .uuid}))) | unique_by(.name)')
+                    users_json=$(jq -n --argjson db_users "$db_users" '$db_users | map(select(.enabled == true or .enabled == null) | {name: ("anytls-" + .name), password: .uuid})')
                 else
                     users_json=$(jq -n --arg name "anytls-default" --arg pw "$password" '[{name: $name, password: $pw}]')
                 fi
@@ -27524,9 +27661,9 @@ show_service_logs() {
 # 选择协议 (用于用户管理)
 _select_protocol_for_users() {
     local filter="${1:-all}"
-    local protocols=$(db_get_all_protocols)
+    local protocols=$(jq -r '. as $db | ["xray", "singbox"][] as $core | ($db[$core] // {} | keys[]) | "\($core)|\(.)"' "$DB_FILE" 2>/dev/null)
     if [[ "$filter" == snell ]]; then
-        protocols=$(printf '%s\n' "$protocols" | grep -E '^(snell|snell-v5|snell-v6)$')
+        protocols=$(printf '%s\n' "$protocols" | grep -E '^xray\|(snell|snell-v5|snell-v6)$')
         [[ -n "$protocols" ]] || { _err "没有已安装的 Snell 协议"; return 1; }
     fi
     [[ -z "$protocols" ]] && { _err "没有已安装的协议"; return 1; }
@@ -27538,13 +27675,11 @@ _select_protocol_for_users() {
     
     local i=1
     local proto_array=()
-    while IFS= read -r proto; do
+    while IFS='|' read -r core proto; do
         [[ -z "$proto" ]] && continue
-        local core="xray"
-        db_exists "singbox" "$proto" && core="singbox"
         local user_count=$(db_count_users "$core" "$proto")
         local proto_name=$(get_protocol_name "$proto")
-        _item "$i" "$proto_name ${D}($user_count 用户)${NC}"
+        _item "$i" "$core / $proto_name ${D}($user_count 用户)${NC}"
         proto_array+=("$core:$proto")
         ((i++))
     done <<< "$protocols"
@@ -27639,6 +27774,10 @@ _show_users_list() {
 # 多端口配置不会错误地套用第一个实例的 SNI、密钥或端口。
 _gen_user_share_link() {
     local core="$1" proto="$2" credential="$3" user_name="$4" user_port="${5:-}"
+    # 旧 SS 端口仍使用固定密钥；数据库中遗留的伪用户不能生成可连接的独立链接。
+    if [[ "$proto" == ss2022 || "$proto" == ss-legacy ]]; then
+        [[ "$user_name" == default || "$user_name" == default-* ]] || return 1
+    fi
     if _is_snell_users_protocol "$proto"; then
         _snell_user_share "$proto" "$user_name" "$user_port"
         return $?
@@ -27652,7 +27791,7 @@ _gen_user_share_link() {
             cfg=$(echo "$all_cfg" | jq -c --arg port "$user_port" \
                 '[.[] | select((.port | tostring) == $port)][0] // empty')
         fi
-        [[ -z "$cfg" || "$cfg" == "null" ]] && cfg=$(echo "$all_cfg" | jq -c '.[0] // empty')
+        [[ -z "$cfg" || "$cfg" == "null" ]] && [[ -z "$user_port" ]] && cfg=$(echo "$all_cfg" | jq -c '.[0] // empty')
     else
         cfg="$all_cfg"
     fi
@@ -28064,6 +28203,29 @@ _add_user() {
         _info "该协议使用配置文件中的固定密钥，无需添加用户"
         return 1
     fi
+    if ! _user_management_supported "$core" "$proto"; then
+        _err "$core/$proto 暂不支持按用户独立认证及统计，无法添加"
+        return 1
+    fi
+    local selected_port="" choice i=1
+    local port_options=()
+    while IFS= read -r port; do
+        [[ -n "$port" ]] && port_options+=("$port")
+    done < <(db_get "$core" "$proto" | jq -r 'if type == "array" then .[].port else .port end | select(. != null)')
+    [[ ${#port_options[@]} -gt 0 ]] || { _err "协议没有有效端口"; return 1; }
+    if [[ ${#port_options[@]} -eq 1 ]]; then
+        selected_port="${port_options[0]}"
+    else
+        _line
+        echo "  选择用户所属入站端口"
+        for port in "${port_options[@]}"; do
+            _item "$i" "$core / $proto / $port"
+            ((i++))
+        done
+        read -rp "  选择 [1-${#port_options[@]}，0 返回]: " choice
+        [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#port_options[@]} )) || return 1
+        selected_port="${port_options[$((choice-1))]}"
+    fi
     
     echo ""
     _line
@@ -28075,6 +28237,7 @@ _add_user() {
     while true; do
         read -rp "  用户名: " name
         [[ -z "$name" ]] && { _err "用户名不能为空"; continue; }
+        [[ "$name" == default || "$name" == default-* ]] && { _err "default 为系统保留用户名"; continue; }
         [[ "$name" =~ [^a-zA-Z0-9_-] ]] && { _err "用户名只能包含字母、数字、下划线和横线"; continue; }
         
         # 检查是否已存在（精确匹配）
@@ -28169,6 +28332,7 @@ _add_user() {
     echo ""
     _line
     echo -e "  用户名: ${G}$name${NC}"
+    echo -e "  入站: ${G}$core / $proto / $selected_port${NC}"
     echo -e "  凭证: ${G}${uuid:0:16}...${NC}"
     echo -e "  配额: ${G}${quota_gb:-无限制} GB${NC}"
     echo -e "  到期: ${G}$expire_display${NC}"
@@ -28179,19 +28343,8 @@ _add_user() {
     [[ "$confirm" =~ ^[nN]$ ]] && return
     
     # 添加到数据库 (包含 expire_date)
-    if db_add_user "$core" "$proto" "$name" "$uuid" "$quota_gb" "$expire_date"; then
+    if db_add_user "$core" "$proto" "$name" "$uuid" "$quota_gb" "$expire_date" "$selected_port" "$user_routing"; then
         _ok "用户 $name 添加成功"
-        
-        # 如果有自定义路由，设置路由
-        if [[ -n "$user_routing" ]]; then
-            db_set_user_routing "$core" "$proto" "$name" "$user_routing"
-            _ok "路由配置: $routing_display"
-        fi
-        
-        # 重新生成配置
-        _info "更新配置..."
-        _regenerate_config "$core" "$proto"
-        
         _ok "配置已更新"
     else
         _err "添加失败"
@@ -28231,7 +28384,7 @@ _delete_user() {
             local name="${user_array[$((choice-1))]}"
             
             # 禁止删除 default 用户
-            if [[ "$name" == "default" ]]; then
+            if [[ "$name" == "default" || "$name" == default-* ]]; then
                 _err "default 用户不能删除"
                 _info "default 是协议的默认用户，删除会导致协议无法正常工作"
                 return
@@ -28243,10 +28396,6 @@ _delete_user() {
             
             if db_del_user "$core" "$proto" "$name"; then
                 _ok "用户 $name 已删除"
-                
-                # 重新生成配置
-                _info "更新配置..."
-                _regenerate_config "$core" "$proto"
                 
                 _ok "配置已更新"
             else
@@ -28423,10 +28572,6 @@ _toggle_user() {
             if db_set_user_enabled "$core" "$proto" "$name" "$new_state"; then
                 _ok "用户 $name 已${action}"
                 
-                # 重新生成配置
-                _info "更新配置..."
-                _regenerate_config "$core" "$proto"
-                
                 _ok "配置已更新"
             else
                 _err "操作失败"
@@ -28510,7 +28655,6 @@ _set_user_expire_date() {
                     read -rp "  用户当前已禁用，是否启用? [y/N]: " enable_now
                     if [[ "$enable_now" =~ ^[yY]$ ]]; then
                         db_set_user_enabled "$core" "$proto" "$name" true
-                        _regenerate_config "$core" "$proto"
                         _ok "用户已启用"
                     fi
                 fi
@@ -30112,7 +30256,7 @@ realm_status_logs_menu() {
                         listen_port=$(jq -r ".[$idx].listen_port" "$REALM_RULES_FILE")
                         remote_host=$(jq -r ".[$idx].remote_host" "$REALM_RULES_FILE")
                         remote_port=$(jq -r ".[$idx].remote_port" "$REALM_RULES_FILE")
-                        enabled=$(jq -r ".[$idx].enabled // true" "$REALM_RULES_FILE")
+                        enabled=$(jq -r "(.[$idx].enabled == true or .[$idx].enabled == null)" "$REALM_RULES_FILE")
                         ping_value=$(realm_ping_host "$remote_host")
                         [[ -z "$ping_value" ]] && ping_value="超时/N/A"
                         tcp_bytes=$(realm_get_traffic_bytes "$listen_port" tcp)
@@ -30911,7 +31055,9 @@ _snell_sync_traffic() {
             enabled=$(jq -r '.users[0].enabled' <<< "$row")
             expire=$(jq -r '.users[0].expire_date // ""' <<< "$row")
             if [[ "$enabled" == true ]] && { (( quota > 0 && used >= quota )) || [[ -n "$expire" && "$expire" < "$(date +%F)" ]]; }; then
-                db_set_user_enabled xray "$proto" "$name" false || return 1
+                local stop_reason=expired
+                (( quota > 0 && used >= quota )) && stop_reason=quota
+                db_set_user_enabled xray "$proto" "$name" false "$stop_reason" || return 1
                 if (( quota > 0 && used >= quota )); then
                     tg_send_over_quota "$name" "$proto" "$used" "$quota" xray
                 else

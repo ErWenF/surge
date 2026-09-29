@@ -18,6 +18,8 @@ _err() { echo "$*" >&2; }
 warp_status() { return 0; }
 rebuild_and_reload_xray() { echo xray > "$fixture/reloaded"; }
 rebuild_and_reload_singbox() { echo singbox > "$fixture/reloaded"; }
+_user_change_begin() { echo "$fixture"; }
+_user_change_apply() { echo "$1" > "$fixture/reloaded"; }
 printf '%s\n' '{"singbox":{"anytls":{"users":[{"name":"mm"},{"name":"default"}]}},"chain_proxy":{"nodes":[],"active":"unchanged"}}' > "$DB_FILE"
 # WARP present: explicit SOCKS5 entry is number 4. Create authenticated IPv6 node.
 _select_user_routing <<'INPUT'

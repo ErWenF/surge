@@ -40,7 +40,7 @@ SS2022 持续校时与特殊策略路由下的 UDP 回程处理见 [说明](docs
 
 nft脚本使用方法：
 ```bash
-curl -L https://raw.githubusercontent.com/mozisen/surge/main/nft.sh -o nft.sh  
+curl -L https://raw.githubusercontent.com/ErWenF/surge/main/nft.sh -o nft.sh
 chmod +x nft.sh  
 ./nft.sh  
 ```

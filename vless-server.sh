@@ -54,11 +54,11 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.2"
+readonly VERSION="3.7.3"
 readonly AUTHOR="Zyx0rx"
-readonly REPO_URL="https://github.com/mozisen/surge"
-readonly SCRIPT_REPO="mozisen/surge"
-readonly SCRIPT_SOURCE_REPO="mozisen/surge"
+readonly REPO_URL="https://github.com/ErWenF/surge"
+readonly SCRIPT_REPO="ErWenF/surge"
+readonly SCRIPT_SOURCE_REPO="ErWenF/surge"
 SCRIPT_SOURCE_REF="${VLESS_SCRIPT_SOURCE_REF:-main}"
 if [[ ! "$SCRIPT_SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
     echo "错误: VLESS_SCRIPT_SOURCE_REF 格式无效" >&2
@@ -8744,11 +8744,11 @@ _download_script_to() {
     return 1
 }
 
-# 获取低于当前版本的最新正式 Release。只接受纯数字语义化
-# 版本标签，因此 preview/beta/rc 以及 GitHub 标记的预发布版都会被排除。
+# 获取低于当前版本的最新正式标签；优先 Release，无 Release 时查标签。
+# 只接受纯数字语义化版本，排除 preview/beta/rc。
 # 输出: version|tag
 _get_previous_stable_script_release() {
-    local current="${1#v}" releases tag version best_version="" best_tag=""
+    local current="${1#v}" releases tags tag version best_version="" best_tag=""
     releases=$(curl -fsSL --connect-timeout 10 --max-time 30 \
         "https://api.github.com/repos/${SCRIPT_REPO}/releases?per_page=100" 2>/dev/null) || return 1
 
@@ -8762,6 +8762,21 @@ _get_previous_stable_script_release() {
             best_tag="$tag"
         fi
     done <<< "$(echo "$releases" | jq -r '.[] | select(.draft == false and .prerelease == false) | .tag_name // empty' 2>/dev/null)"
+
+    if [[ -z "$best_tag" ]]; then
+        tags=$(curl -fsSL --connect-timeout 10 --max-time 30 \
+            "https://api.github.com/repos/${SCRIPT_REPO}/tags?per_page=100" 2>/dev/null) || return 1
+        while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            version="${tag#v}"
+            [[ "$version" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]] || continue
+            _version_gt "$current" "$version" || continue
+            if [[ -z "$best_version" ]] || _version_gt "$version" "$best_version"; then
+                best_version="$version"
+                best_tag="$tag"
+            fi
+        done <<< "$(echo "$tags" | jq -r '.[].name // empty' 2>/dev/null)"
+    fi
 
     [[ -n "$best_version" && -n "$best_tag" ]] || return 1
     printf '%s|%s\n' "$best_version" "$best_tag"
@@ -8813,7 +8828,7 @@ _get_latest_script_version_from_raw() {
     echo "$version"
 }
 
-# 获取脚本最新版本号（优先 release，失败则 tag，带缓存）
+# 以当前下载分支的脚本为准；Release/标签只在该分支不可用时兜底。
 _get_latest_script_version() {
     local use_cache="${1:-true}"
     local force="${2:-false}"
@@ -8834,12 +8849,12 @@ _get_latest_script_version() {
         fi
     fi
 
-    version=$(_get_latest_version "$SCRIPT_REPO" "false" "true" 2>/dev/null)
+    version=$(_get_latest_script_version_from_raw)
     if [[ -z "$version" ]]; then
-        version=$(_get_latest_tag_version "$SCRIPT_REPO")
+        version=$(_get_latest_version "$SCRIPT_REPO" "false" "true" 2>/dev/null)
     fi
     if [[ -z "$version" ]]; then
-        version=$(_get_latest_script_version_from_raw)
+        version=$(_get_latest_tag_version "$SCRIPT_REPO")
     fi
     [[ -z "$version" ]] && return 1
 
@@ -30578,14 +30593,14 @@ rollback_script_version() {
     fi
     local backup_dir="$CFG/script-backups"
     local release_info previous_ver previous_tag rollback_file
-    _info "正在从 GitHub 查找上一个正式版本..."
+    _info "正在从 GitHub 查找上一个正式版本标签..."
     release_info=$(_get_previous_stable_script_release "$VERSION") || {
         _err "无法从 GitHub 获取低于 v${VERSION} 的正式版本"
         return 1
     }
     IFS='|' read -r previous_ver previous_tag <<< "$release_info"
 
-    _info "下载 GitHub Release ${previous_tag}..."
+    _info "下载 GitHub 版本标签 ${previous_tag}..."
     rollback_file=$(_fetch_script_release_tmp "$previous_tag") || {
         _err "${previous_tag} 下载或完整性校验失败"
         return 1
@@ -30631,7 +30646,7 @@ rollback_script_version() {
         echo "$saved_current" > "$backup_dir/previous"
         rm -f "$rollback_file"
         _ok "脚本已回退: v${VERSION} → v${previous_ver}"
-        echo -e "  ${D}来源: GitHub Release ${previous_tag}${NC}"
+        echo -e "  ${D}来源: GitHub 版本标签 ${previous_tag}${NC}"
         echo -e "  ${C}请重新运行 vless 使用回退版本${NC}"
         exit 0
     fi

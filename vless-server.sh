@@ -798,23 +798,39 @@ gen_xray_trojan_clients() {
 # 生成 Xray SS2022 多用户 clients 数组
 gen_xray_ss2022_clients() {
     local proto="$1"
-    
-    local users=$(db_get_users_stats "xray" "$proto")
-    if [[ -z "$users" ]]; then
-        # SS2022 多用户模式必须有 users 数组，返回空
-        echo "[]"
-        return
-    fi
-    
-    local clients="[]"
-    while IFS='|' read -r name uuid used quota enabled port routing; do
-        [[ -z "$name" || -z "$uuid" || "$enabled" != "true" ]] && continue
-        local email="${name}@${proto}"
-        # SS2022 使用 password 字段
-        clients=$(echo "$clients" | jq --arg pw "$uuid" --arg e "$email" '. + [{password: $pw, email: $e}]')
-    done <<< "$users"
-    
-    echo "$clients"
+    local port="$2"
+    db_get "xray" "$proto" | jq -c --arg port "$port" --arg proto "$proto" '
+        (if type == "array" then .[] else . end) |
+        select((.port | tostring) == $port) |
+        [.users[]? | select(.enabled != false) |
+            {password: .uuid, email: (.name + "@" + $proto)}]
+    '
+}
+
+_ss2022_key_len() {
+    case "$1" in
+        2022-blake3-aes-128-gcm) echo 16 ;;
+        2022-blake3-aes-256-gcm) echo 32 ;;
+        *) return 1 ;;
+    esac
+}
+
+_ss2022_valid_key() {
+    local key="$1" key_len="$2" actual canonical
+    [[ "$key" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+    canonical=$(printf '%s' "$key" | base64 -d 2>/dev/null | base64 | tr -d '\n') || return 1
+    [[ "$canonical" == "$key" ]] || return 1
+    actual=$(printf '%s' "$key" | base64 -d 2>/dev/null | wc -c | tr -d ' ') || return 1
+    [[ "$actual" == "$key_len" ]]
+}
+
+_ss2022_share_password() {
+    jq -r '
+        . as $cfg |
+        if .multi_user == true then
+            .password + ":" + ([.users[]? | select(.name == "default" or .name == ("default-" + ($cfg.port | tostring))) | .uuid][0] // "")
+        else .password end
+    ' <<< "$1"
 }
 
 # 生成 Xray SOCKS5 多用户 accounts 数组
@@ -875,10 +891,10 @@ gen_xray_socks_accounts() {
 # enabled: 是否启用
 
 # 添加用户到协议 (支持多端口数组格式)
-# 用法: db_add_user core protocol name credential [quota_gb] [expire_date] [port]
+# 用法: db_add_user core protocol name credential [quota_gb] [expire_date] [port] [routing] [allow_migration]
 _user_management_supported() {
     case "$1:$2" in
-        xray:vless|xray:vless-*|xray:vmess-ws|xray:trojan|xray:trojan-ws|singbox:vless|singbox:trojan|singbox:hy2|singbox:tuic|singbox:anytls) return 0 ;;
+        xray:vless|xray:vless-*|xray:vmess-ws|xray:trojan|xray:trojan-ws|xray:ss2022|singbox:vless|singbox:trojan|singbox:hy2|singbox:tuic|singbox:anytls) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -957,7 +973,7 @@ _user_change_apply() {
 }
 
 db_add_user() {
-    local core="$1" proto="$2" name="$3" uuid="$4" quota_gb="${5:-0}" expire_date="${6:-}" port="${7:-}" routing="${8:-}" backup
+    local core="$1" proto="$2" name="$3" uuid="$4" quota_gb="${5:-0}" expire_date="${6:-}" port="${7:-}" routing="${8:-}" allow_migration="${9:-false}" backup
     [[ ! -f "$DB_FILE" ]] && return 1
     [[ "$name" != default && "$name" != default-* ]] || { _err "default 为系统保留用户名"; return 1; }
     
@@ -984,6 +1000,30 @@ db_add_user() {
             if $port == "" or (.port | tostring) == $port then 1 else 0 end
         end' "$DB_FILE" 2>/dev/null) || return 1
     [[ "$matches" == 1 ]] || { _err "必须指定唯一有效的入站端口"; return 1; }
+
+    local ss_cfg method key_len default_key='' ss2022=false
+    if [[ "$core:$proto" == xray:ss2022 ]]; then
+        ss2022=true
+        [[ -n "$port" ]] || { _err "SS2022 添加用户必须指定入站端口"; return 1; }
+        ss_cfg=$(db_get "$core" "$proto" | jq -c --arg port "$port" '
+            if type == "array" then [.[] | select((.port | tostring) == $port)][0] else . end') || return 1
+        method=$(jq -r '.method // empty' <<< "$ss_cfg")
+        key_len=$(_ss2022_key_len "$method") || { _err "此 SS2022 加密方式不支持 Xray 多用户"; return 1; }
+        _ss2022_valid_key "$(jq -r '.password // empty' <<< "$ss_cfg")" "$key_len" || { _err "SS2022 服务端密钥格式或长度无效"; return 1; }
+        _ss2022_valid_key "$uuid" "$key_len" || { _err "SS2022 用户密钥格式或长度无效"; return 1; }
+        [[ "$(jq -r '.password' <<< "$ss_cfg")" != "$uuid" ]] || { _err "用户密钥不能与服务端密钥相同"; return 1; }
+        [[ "$(jq -r --arg u "$uuid" '[.users[]? | select(.uuid == $u)] | length' <<< "$ss_cfg")" == 0 ]] || { _err "此端口已有相同用户密钥"; return 1; }
+        if [[ "$(jq -r '.multi_user // false' <<< "$ss_cfg")" != true ]]; then
+            [[ "$allow_migration" == true ]] || { _err "旧单密钥客户端会失效，须在菜单确认端口迁移"; return 1; }
+            [[ "$(jq -r '(.users // []) | length' <<< "$ss_cfg")" == 0 ]] || { _err "此端口有旧版用户数据，拒绝自动迁移"; return 1; }
+            default_key=$(head -c "$key_len" /dev/urandom | base64 | tr -d '\n') || return 1
+            while [[ "$default_key" == "$uuid" || "$default_key" == "$(jq -r '.password' <<< "$ss_cfg")" ]]; do
+                default_key=$(head -c "$key_len" /dev/urandom | base64 | tr -d '\n') || return 1
+            done
+        else
+            [[ "$(jq -r --arg port "$port" '[.users[]? | select(.name == ("default-" + $port))] | length' <<< "$ss_cfg")" == 1 ]] || { _err "多用户端口缺少默认用户，拒绝添加"; return 1; }
+        fi
+    fi
     
 
     
@@ -1012,6 +1052,21 @@ db_add_user() {
     
     # 添加用户 (支持多端口数组，包含 expire_date)
     backup=$(_user_change_begin "$core") || return 1
+    if [[ "$ss2022" == true ]]; then
+        _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg u "$uuid" --arg d "$default_key" \
+            --arg port "$port" --arg r "$routing" --argjson q "$quota" --arg cr "$created" --arg exp "$expire_date" '
+            def add_ss_user:
+                (if .multi_user == true then . else
+                    .multi_user = true |
+                    .users = [{name:("default-" + $port),
+                        uuid:$d,quota:0,used:0,enabled:true,created:$cr,expire_date:""}]
+                end) |
+                .users += [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp,routing:$r}];
+            if (.[$c][$p] | type) == "array" then
+                .[$c][$p] |= map(if (.port | tostring) == $port then add_ss_user else . end)
+            else .[$c][$p] |= add_ss_user end
+        ' || return 1
+    else
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg u "$uuid" --arg port "$port" --arg r "$routing" \
        --argjson q "$quota" --arg cr "$created" --arg exp "$expire_date" '
         .[$c][$p] as $cfg |
@@ -1031,6 +1086,7 @@ db_add_user() {
             else .[$c][$p].users end) + [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp,routing:$r}])
         end
     ' || return 1
+    fi
     _user_change_apply "$core" "$backup" || return 1
     # 如果设置了到期日期，自动安装过期检查 cron
     [[ -n "$expire_date" ]] && ensure_expire_check_cron 2>/dev/null
@@ -3504,7 +3560,7 @@ reset_monthly_user_traffic() {
     local proto name
     month_key=$(date +%Y-%m)
     today=$(date +%F)
-    restore_xray=$(jq --arg today "$today" '[.xray // {} | to_entries[] | select(.key | startswith("snell") | not) | select(.key != "ss2022" and .key != "ss-legacy") | .value | (if type == "array" then .[] else . end) | .users[]? | select(.enabled == false and .disabled_reason == "quota" and ((.expire_date // "") == "" or .expire_date >= $today))] | length' "$DB_FILE") || return 1
+    restore_xray=$(jq --arg today "$today" '[.xray // {} | to_entries[] | select(.key | startswith("snell") | not) | select(.key != "ss-legacy") | .key as $p | .value | (if type == "array" then .[] else . end) | select($p != "ss2022" or .multi_user == true) | .users[]? | select(.enabled == false and .disabled_reason == "quota" and ((.expire_date // "") == "" or .expire_date >= $today))] | length' "$DB_FILE") || return 1
     restore_singbox=$(jq --arg today "$today" '[.singbox // {} | to_entries[] | select(.key != "ss2022" and .key != "ss-legacy") | .value | (if type == "array" then .[] else . end) | .users[]? | select(.enabled == false and .disabled_reason == "quota" and ((.expire_date // "") == "" or .expire_date >= $today))] | length' "$DB_FILE") || return 1
     snell_restore=$(jq -r --arg today "$today" '
         .xray // {} | to_entries[] | select(.key | startswith("snell")) |
@@ -3527,8 +3583,8 @@ reset_monthly_user_traffic() {
                 del(.last_alert_percent, .quota_exceeded_notified)
             ) else . end;
         .xray = ((.xray // {}) | with_entries(.key as $p | .value |=
-            (if type == "array" then map(reset_users(((($p | startswith("snell") | not) and $p != "ss2022" and $p != "ss-legacy") or .snell_id != null)))
-             else reset_users((($p | startswith("snell") | not) and $p != "ss2022" and $p != "ss-legacy")) end))) |
+            (if type == "array" then map(reset_users(((($p | startswith("snell") | not) and $p != "ss-legacy" and ($p != "ss2022" or .multi_user == true)) or .snell_id != null)))
+             else reset_users((($p | startswith("snell") | not) and $p != "ss-legacy" and ($p != "ss2022" or .multi_user == true))) end))) |
         .singbox = ((.singbox // {}) | with_entries(.key as $p | .value |=
             (if type == "array" then map(reset_users($p != "ss2022" and $p != "ss-legacy"))
              else reset_users($p != "ss2022" and $p != "ss-legacy") end)))
@@ -5634,21 +5690,31 @@ add_xray_inbound_v2() {
             fi
             ;;
         ss2022|ss-legacy)
+            local ss_clients='[]' ss_multi=false
+            if [[ "$base_protocol" == ss2022 ]]; then
+                ss_multi=$(echo "$cfg" | jq -r '.multi_user // false')
+                if [[ "$ss_multi" == true ]]; then
+                    ss_clients=$(gen_xray_ss2022_clients "$base_protocol" "$port") || { rm -f "$tmp_inbound"; return 1; }
+                    [[ "$(echo "$ss_clients" | jq 'length')" -gt 0 ]] || { _err "SS2022 多用户端口不能停用全部用户"; rm -f "$tmp_inbound"; return 1; }
+                fi
+            fi
             jq -n \
                 --argjson port "$port" \
                 --arg method "$method" \
                 --arg password "$password" \
+                --argjson clients "$ss_clients" \
+                --argjson multi "$ss_multi" \
                 --arg tag "$inbound_tag" \
                 --arg listen_addr "$listen_addr" \
             '{
                 port: $port,
                 listen: $listen_addr,
                 protocol: "shadowsocks",
-                settings: {
+                settings: ({
                     method: $method,
                     password: $password,
                     network: "tcp,udp"
-                },
+                } + (if $multi then {clients: $clients} else {} end)),
                 tag: $tag
             }' > "$tmp_inbound"
             ;;
@@ -20430,7 +20496,7 @@ show_all_share_links() {
                     vless-vision) link=$(gen_vless_vision_link "$ipv4" "$display_port" "$uuid" "$sni" "$country_code") ;;
                     vless-ws) link=$(gen_vless_ws_link "$ipv4" "$display_port" "$uuid" "$sni" "$path" "$country_code") ;;
                     vmess-ws) link=$(gen_vmess_ws_link "$ipv4" "$display_port" "$uuid" "$sni" "$path" "$country_code") ;;
-                    ss2022) link=$(gen_ss2022_link "$ipv4" "$display_port" "$method" "$password" "$country_code") ;;
+                    ss2022) link=$(gen_ss2022_link "$ipv4" "$display_port" "$method" "$(_ss2022_share_password "$cfg")" "$country_code") ;;
                     ss-legacy) link=$(gen_ss_legacy_link "$ipv4" "$display_port" "$method" "$password" "$country_code") ;;
                     hy2) link=$(gen_hy2_link "$ipv4" "$display_port" "$password" "$sni" "$country_code") ;;
                     trojan) link=$(gen_trojan_link "$ipv4" "$display_port" "$password" "$sni" "$country_code") ;;
@@ -20482,7 +20548,7 @@ show_all_share_links() {
                     vless-vision) link=$(gen_vless_vision_link "$ip6" "$display_port" "$uuid" "$sni" "$country_code") ;;
                     vless-ws) link=$(gen_vless_ws_link "$ip6" "$display_port" "$uuid" "$sni" "$path" "$country_code") ;;
                     vmess-ws) link=$(gen_vmess_ws_link "$ip6" "$display_port" "$uuid" "$sni" "$path" "$country_code") ;;
-                    ss2022) link=$(gen_ss2022_link "$ip6" "$display_port" "$method" "$password" "$country_code") ;;
+                    ss2022) link=$(gen_ss2022_link "$ip6" "$display_port" "$method" "$(_ss2022_share_password "$cfg")" "$country_code") ;;
                     ss-legacy) link=$(gen_ss_legacy_link "$ip6" "$display_port" "$method" "$password" "$country_code") ;;
                     hy2) link=$(gen_hy2_link "$ip6" "$display_port" "$password" "$sni" "$country_code") ;;
                     trojan) link=$(gen_trojan_link "$ip6" "$display_port" "$password" "$sni" "$country_code") ;;
@@ -21019,8 +21085,9 @@ show_single_protocol_info() {
                 join_code=$(echo "VMESS-WS|${ip_addr}|${link_port}|${uuid}|${sni}|${path}" | base64 -w 0)
                 ;;
             ss2022)
-                link=$(gen_ss2022_link "$ip_addr" "$link_port" "$method" "$password" "$country_code")
-                join_code=$(echo "SS2022|${ip_addr}|${link_port}|${method}|${password}" | base64 -w 0)
+                local share_password=$(_ss2022_share_password "$cfg")
+                link=$(gen_ss2022_link "$ip_addr" "$link_port" "$method" "$share_password" "$country_code")
+                join_code=$(echo "SS2022|${ip_addr}|${link_port}|${method}|${share_password}" | base64 -w 0)
                 ;;
             ss-legacy)
                 link=$(gen_ss_legacy_link "$ip_addr" "$link_port" "$method" "$password" "$country_code")
@@ -25177,7 +25244,7 @@ gen_v2ray_sub() {
                     [[ -n "$server_ip" ]] && link=$(gen_trojan_link "$server_ip" "$actual_port" "$password" "$sni" "$country_code")
                     ;;
                 ss2022)
-                    [[ -n "$server_ip" ]] && link=$(gen_ss2022_link "$server_ip" "$actual_port" "$method" "$password" "$country_code")
+                    [[ -n "$server_ip" ]] && link=$(gen_ss2022_link "$server_ip" "$actual_port" "$method" "$(_ss2022_share_password "$cfg")" "$country_code")
                     ;;
                 ss-legacy)
                     [[ -n "$server_ip" ]] && link=$(gen_ss_legacy_link "$server_ip" "$actual_port" "$method" "$password" "$country_code")
@@ -25380,7 +25447,7 @@ gen_clash_sub() {
     server: \"$server_ip\"
     port: $port
     cipher: $method
-    password: $password
+    password: $(_ss2022_share_password "$cfg")
     udp: true"
                 ;;
             ss-legacy)
@@ -25527,7 +25594,7 @@ gen_surge_sub() {
                     [[ -n "$server_ip" ]] && proxy="$name = trojan, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
                     ;;
                 ss2022)
-                    [[ -n "$server_ip" ]] && proxy="$name = ss, $server_ip, $port, encrypt-method=$method, password=$password"
+                    [[ -n "$server_ip" ]] && proxy="$name = ss, $server_ip, $port, encrypt-method=$method, password=$(_ss2022_share_password "$cfg")"
                     ;;
                 ss-legacy)
                     [[ -n "$server_ip" ]] && proxy="$name = ss, $server_ip, $port, encrypt-method=$method, password=$password"
@@ -27789,8 +27856,8 @@ _show_users_list() {
 # 多端口配置不会错误地套用第一个实例的 SNI、密钥或端口。
 _gen_user_share_link() {
     local core="$1" proto="$2" credential="$3" user_name="$4" user_port="${5:-}"
-    # 旧 SS 端口仍使用固定密钥；数据库中遗留的伪用户不能生成可连接的独立链接。
-    if [[ "$proto" == ss2022 || "$proto" == ss-legacy ]]; then
+    # 旧 SS 与未迁移的 SS2022 端口仍使用固定密钥。
+    if [[ "$proto" == ss-legacy || ( "$proto" == ss2022 && "$core" != xray ) ]]; then
         [[ "$user_name" == default || "$user_name" == default-* ]] || return 1
     fi
     if _is_snell_users_protocol "$proto"; then
@@ -27879,7 +27946,14 @@ _gen_user_share_link() {
         vless-ws) link=$(gen_vless_ws_link "$server_addr" "$display_port" "$credential" "$sni" "$path" "$remark") ;;
         vless-ws-notls) link=$(gen_vless_ws_notls_link "$server_addr" "$display_port" "$credential" "$path" "$host" "$remark") ;;
         vmess-ws) link=$(gen_vmess_ws_link "$server_addr" "$display_port" "$credential" "$sni" "$path" "$remark") ;;
-        ss2022) link=$(gen_ss2022_link "$server_addr" "$display_port" "$method" "$credential" "$remark") ;;
+        ss2022)
+            if [[ "$core" == xray && "$(echo "$cfg" | jq -r '.multi_user // false')" == true ]]; then
+                credential="${password}:${credential}"
+            else
+                [[ "$user_name" == default || "$user_name" == default-* ]] || return 1
+            fi
+            link=$(gen_ss2022_link "$server_addr" "$display_port" "$method" "$credential" "$remark")
+            ;;
         ss-legacy) link=$(gen_ss_legacy_link "$server_addr" "$display_port" "$method" "$credential" "$remark") ;;
         hy2) link=$(gen_hy2_link "$server_addr" "$display_port" "$credential" "$sni" "$remark") ;;
         trojan) link=$(gen_trojan_link "$server_addr" "$display_port" "$credential" "$sni" "$remark") ;;
@@ -28241,6 +28315,23 @@ _add_user() {
         [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#port_options[@]} )) || return 1
         selected_port="${port_options[$((choice-1))]}"
     fi
+
+    local ss_cfg='' ss_key_len='' allow_migration=false
+    if [[ "$core:$proto" == xray:ss2022 ]]; then
+        ss_cfg=$(db_get "$core" "$proto" | jq -c --arg port "$selected_port" '
+            if type == "array" then [.[] | select((.port | tostring) == $port)][0] else . end') || return 1
+        ss_key_len=$(_ss2022_key_len "$(echo "$ss_cfg" | jq -r '.method // empty')") || {
+            _err "此 SS2022 加密方式不支持 Xray 多用户，请使用 AES-128/256 的端口"
+            return 1
+        }
+        if [[ "$(echo "$ss_cfg" | jq -r '.multi_user // false')" != true ]]; then
+            _warn "端口 $selected_port 首次启用多用户后，原有单密钥客户端将无法连接。"
+            _warn "请先迁移已有客户端；脚本会生成新的默认用户链接。"
+            read -rp "  确认迁移此端口请输入 MIGRATE: " choice
+            [[ "$choice" == MIGRATE ]] || return 1
+            allow_migration=true
+        fi
+    fi
     
     echo ""
     _line
@@ -28286,11 +28377,7 @@ _add_user() {
             uuid=$(gen_uuid)
             ;;
         ss2022)
-            # SS2022 需要根据加密方式生成密钥
-            local method=$(db_get_field "$core" "$proto" "method")
-            local key_len=16
-            [[ "$method" == *"256"* ]] && key_len=32
-            uuid=$(head -c $key_len /dev/urandom 2>/dev/null | base64 -w 0)
+            uuid=$(head -c "$ss_key_len" /dev/urandom 2>/dev/null | base64 | tr -d '\n')
             ;;
         *)
             uuid=$(ask_password 16 "用户密码")
@@ -28358,7 +28445,7 @@ _add_user() {
     [[ "$confirm" =~ ^[nN]$ ]] && return
     
     # 添加到数据库 (包含 expire_date)
-    if db_add_user "$core" "$proto" "$name" "$uuid" "$quota_gb" "$expire_date" "$selected_port" "$user_routing"; then
+    if db_add_user "$core" "$proto" "$name" "$uuid" "$quota_gb" "$expire_date" "$selected_port" "$user_routing" "$allow_migration"; then
         _ok "用户 $name 添加成功"
         _ok "配置已更新"
     else

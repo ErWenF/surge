@@ -5900,39 +5900,124 @@ cleanup_hy2_nat_rules() {
 }
 
 sync_time() {
-    _info "同步系统时间..."
-    
-    # 仅接受经 TLS 验证的 Date 响应，避免未加密 HTTP 被篡改后修改系统时钟。
-    local http_time
-    http_time=$(timeout 5 curl -fsSI --connect-timeout 3 --max-time 5 \
-        --proto '=https' --proto-redir '=https' -- https://www.cloudflare.com/ 2>/dev/null |
-        awk 'BEGIN{IGNORECASE=1} /^date:/{sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit}')
-    if [[ -n "$http_time" ]]; then
-        if date -s "$http_time" &>/dev/null; then
-            _ok "时间同步完成 (HTTPS)"
-            return 0
+    _info "检查持续校时服务..."
+    local service="" candidate attempt chrony_config server new_chrony=false
+
+    if [[ -n "${VLESS_NTP_SERVERS:-}" &&
+          ! "$VLESS_NTP_SERVERS" =~ ^[A-Za-z0-9.:-]+(\ [A-Za-z0-9.:-]+)*$ ]]; then
+        _warn "VLESS_NTP_SERVERS 包含无效字符"
+        return 1
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        for candidate in systemd-timesyncd chronyd chrony ntpd ntp; do
+            if systemctl is-active --quiet "$candidate" 2>/dev/null; then
+                service="$candidate"
+                break
+            fi
+        done
+        if [[ -z "$service" ]]; then
+            if command -v systemd-detect-virt >/dev/null 2>&1 &&
+               systemd-detect-virt --container --quiet 2>/dev/null; then
+                _warn "容器时钟由宿主机管理；请在宿主机启用持续校时"
+                return 1
+            fi
+            if systemctl cat systemd-timesyncd >/dev/null 2>&1; then
+                service="systemd-timesyncd"
+                if [[ -n "${VLESS_NTP_SERVERS:-}" ]]; then
+                    mkdir -p /etc/systemd/timesyncd.conf.d
+                    printf '[Time]\nNTP=%s\n' "$VLESS_NTP_SERVERS" > /etc/systemd/timesyncd.conf.d/90-vless.conf
+                fi
+            else
+                if ! command -v chronyd >/dev/null 2>&1; then
+                    if [[ "$DISTRO" == "debian" || "$DISTRO" == "ubuntu" ]]; then
+                        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chrony >/dev/null 2>&1 ||
+                            { apt-get update -qq >/dev/null 2>&1 &&
+                              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chrony >/dev/null 2>&1; }
+                    else
+                        yum install -y chrony >/dev/null 2>&1
+                    fi || {
+                        _warn "无法安装 chrony；请检查软件源"
+                        return 1
+                    }
+                    new_chrony=true
+                fi
+                if [[ "$DISTRO" == "debian" || "$DISTRO" == "ubuntu" ]]; then
+                    service="chrony"
+                else
+                    service="chronyd"
+                fi
+            fi
+            systemctl enable --now "$service" >/dev/null 2>&1 || {
+                _warn "无法启用 $service"
+                return 1
+            }
+        elif ! systemctl is-enabled --quiet "$service" 2>/dev/null; then
+            systemctl enable "$service" >/dev/null 2>&1 || _warn "$service 未能设置为开机启动"
+        fi
+    elif [[ "$DISTRO" == "alpine" ]] && command -v rc-service >/dev/null 2>&1; then
+        for candidate in chronyd ntpd openntpd; do
+            if rc-service "$candidate" status >/dev/null 2>&1; then
+                service="$candidate"
+                break
+            fi
+        done
+        if [[ -z "$service" ]]; then
+            if [[ -n "${container:-}" ]]; then
+                _warn "容器时钟由宿主机管理；请在宿主机启用持续校时"
+                return 1
+            fi
+            if ! command -v chronyd >/dev/null 2>&1; then
+                apk add --no-cache chrony >/dev/null 2>&1 || {
+                    _warn "无法安装 chrony；请检查软件源"
+                    return 1
+                }
+                new_chrony=true
+            fi
+            rc-update add chronyd default >/dev/null 2>&1 && rc-service chronyd start >/dev/null 2>&1 || {
+                _warn "无法启用 chronyd"
+                return 1
+            }
+            service="chronyd"
+        else
+            rc-update add "$service" default >/dev/null 2>&1 || _warn "$service 未能设置为开机启动"
+        fi
+    else
+        _warn "未发现受支持的持续校时服务管理器"
+        return 1
+    fi
+
+    if [[ "$new_chrony" == true && -n "${VLESS_NTP_SERVERS:-}" ]]; then
+        for chrony_config in /etc/chrony/chrony.conf /etc/chrony.conf; do
+            [[ -f "$chrony_config" ]] && break
+        done
+        [[ -f "$chrony_config" ]] || { _warn "找不到 chrony 配置文件"; return 1; }
+        for server in $VLESS_NTP_SERVERS; do
+            printf '\nserver %s iburst\n' "$server" >> "$chrony_config"
+        done
+        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+            systemctl restart "$service" >/dev/null 2>&1 || return 1
+        else
+            rc-service chronyd restart >/dev/null 2>&1 || return 1
         fi
     fi
-    
-    # 方法2: 使用ntpdate (如果可用)
-    if command -v ntpdate &>/dev/null; then
-        if timeout 5 ntpdate -s pool.ntp.org &>/dev/null; then
-            _ok "时间同步完成 (NTP)"
+
+    for ((attempt=0; attempt<30; attempt++)); do
+        if { [[ "$service" == "systemd-timesyncd" ]] &&
+             [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == "yes" ]]; } ||
+           { [[ "$service" == "chronyd" || "$service" == "chrony" ]] &&
+             chronyc tracking 2>/dev/null | grep -Eq '^Leap status[[:space:]]*:[[:space:]]*Normal'; } ||
+           { [[ "$service" == "ntpd" || "$service" == "ntp" ]] &&
+             ntpq -c rv 2>/dev/null | grep -Eq 'leap=00'; } ||
+           { [[ "$service" == "openntpd" ]] &&
+             ntpctl -s status 2>/dev/null | grep -qi 'clock synced'; }; then
+            _ok "持续校时已启用并完成同步 ($service)"
             return 0
         fi
-    fi
-    
-    # 方法3: 使用timedatectl (systemd系统)
-    if command -v timedatectl &>/dev/null; then
-        if timeout 5 timedatectl set-ntp true &>/dev/null; then
-            _ok "时间同步完成 (systemd)"
-            return 0
-        fi
-    fi
-    
-    # 如果所有方法都失败，跳过时间同步
-    _warn "时间同步失败，继续安装..."
-    return 0
+        sleep 2
+    done
+    _warn "$service 已启动，但尚未确认时间同步；请检查 NTP 网络可达性"
+    return 1
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -31077,6 +31162,11 @@ _snell_edit_user() {
 
 # 命令行参数处理
 case "${1:-}" in
+    --ensure-time-sync)
+        check_root
+        sync_time
+        exit $?
+        ;;
     --snell-prepare)
         check_root
         _snell_prepare_user "${2:-}" "${3:-}"
@@ -31144,6 +31234,7 @@ case "${1:-}" in
         echo "用法: $0 [选项]"
         echo ""
         echo "选项:"
+        echo "  --ensure-time-sync  启用并验证持续校时 (可选 VLESS_NTP_SERVERS)"
         echo "  --sync-traffic       同步流量数据到数据库 (用于定时任务)"
         echo "  --show-traffic       显示实时流量统计"
         echo "  --tg-bot-poll        处理 Telegram 用户机器人消息 (用于定时任务)"

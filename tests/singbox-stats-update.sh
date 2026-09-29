@@ -15,13 +15,13 @@ _singbox_stats_enabled() { return 0; }
 _get_latest_version() { echo 1.15.0; }
 svc() {
     echo "$1" >> "$fixture/events"
-    if [[ "$1" == status ]]; then [[ "$running" == true ]]; else return 0; fi
+    if [[ "$1" == status ]]; then [[ "$service_running" == true ]]; else return 0; fi
 }
 _build_singbox_stats_core() {
     echo "build:$1" >> "$fixture/events"
     [[ "$build_failed" != true ]]
 }
-running=true
+service_running=true
 _update_core_to_version Sing-box stable 1.15.0 vless-singbox install_singbox
 [[ "$(cat "$fixture/events")" == $'status\nbuild:1.15.0' ]]
 : > "$fixture/events"
@@ -34,7 +34,7 @@ install_singbox stable true 1.16.0
 build_failed=true
 if _update_singbox_preserving_stats stable 1.15.0; then exit 1; fi
 [[ "$(cat "$fixture/events")" == $'status\nbuild:1.15.0' ]]
-running=false; build_failed=false
+service_running=false; build_failed=false
 : > "$fixture/events"
 _update_singbox_preserving_stats stable 1.15.0
 [[ "$(cat "$fixture/events")" == $'status\nbuild:1.15.0\nstop' ]]

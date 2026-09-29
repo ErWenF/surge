@@ -175,4 +175,13 @@ jq -e '.xray.ss2022.multi_user == true and (.xray.ss2022.users | map(.name) == [
 [[ $(gen_xray_ss2022_clients ss2022 33335 | jq 'length') == 2 ]]
 [[ ! -f "$fixture/starts" ]]
 
+_db_apply '.xray.ss2022={port:33336,password:"MDEyMzQ1Njc4OWFiY2RlZg==",method:"2022-blake3-aes-128-gcm",users:[{name:"default",uuid:"MDEyMzQ1Njc4OWFiY2RlZg==",quota:123,used:11,enabled:false,disabled_reason:"manual",created:"2025-01-01"}]}'
+rm -f "$CFG/config.json"
+db_add_user xray ss2022 migrated "$user_key" 0 '' 33336 '' true
+jq -e '.xray.ss2022 | .multi_user == true and .users[0].name == "default-33336" and .users[0].uuid != .password and .users[0].quota == 123 and .users[0].used == 11 and .users[0].enabled == false and .users[0].disabled_reason == "manual" and .users[0].created == "2025-01-01" and .users[1].name == "migrated"' "$DB_FILE" >/dev/null
+_db_apply '.xray.ss2022.multi_user=false | .xray.ss2022.users=[{name:"unknown",uuid:"MDEyMzQ1Njc4OWFiY2RlZg=="}]'
+cp "$DB_FILE" "$fixture/before-unknown-ss"
+if db_add_user xray ss2022 rejected "$user_key" 0 '' 33336 '' true; then exit 1; fi
+cmp "$DB_FILE" "$fixture/before-unknown-ss"
+
 echo 'PASS port-scoped users, SS2022 migration, rollback, stopped-core state, monthly reset'

@@ -1001,7 +1001,7 @@ db_add_user() {
         end' "$DB_FILE" 2>/dev/null) || return 1
     [[ "$matches" == 1 ]] || { _err "必须指定唯一有效的入站端口"; return 1; }
 
-    local ss_cfg method key_len default_key='' ss2022=false
+    local ss_cfg method key_len server_key legacy_users_ok default_key='' ss2022=false
     if [[ "$core:$proto" == xray:ss2022 ]]; then
         ss2022=true
         [[ -n "$port" ]] || { _err "SS2022 添加用户必须指定入站端口"; return 1; }
@@ -1009,15 +1009,24 @@ db_add_user() {
             if type == "array" then [.[] | select((.port | tostring) == $port)][0] else . end') || return 1
         method=$(jq -r '.method // empty' <<< "$ss_cfg")
         key_len=$(_ss2022_key_len "$method") || { _err "此 SS2022 加密方式不支持 Xray 多用户"; return 1; }
-        _ss2022_valid_key "$(jq -r '.password // empty' <<< "$ss_cfg")" "$key_len" || { _err "SS2022 服务端密钥格式或长度无效"; return 1; }
+        server_key=$(jq -r '.password // empty' <<< "$ss_cfg")
+        _ss2022_valid_key "$server_key" "$key_len" || { _err "SS2022 服务端密钥格式或长度无效"; return 1; }
         _ss2022_valid_key "$uuid" "$key_len" || { _err "SS2022 用户密钥格式或长度无效"; return 1; }
-        [[ "$(jq -r '.password' <<< "$ss_cfg")" != "$uuid" ]] || { _err "用户密钥不能与服务端密钥相同"; return 1; }
+        [[ "$server_key" != "$uuid" ]] || { _err "用户密钥不能与服务端密钥相同"; return 1; }
         [[ "$(jq -r --arg u "$uuid" '[.users[]? | select(.uuid == $u)] | length' <<< "$ss_cfg")" == 0 ]] || { _err "此端口已有相同用户密钥"; return 1; }
         if [[ "$(jq -r '.multi_user // false' <<< "$ss_cfg")" != true ]]; then
             [[ "$allow_migration" == true ]] || { _err "旧单密钥客户端会失效，须在菜单确认端口迁移"; return 1; }
-            [[ "$(jq -r '(.users // []) | length' <<< "$ss_cfg")" == 0 ]] || { _err "此端口有旧版用户数据，拒绝自动迁移"; return 1; }
+            legacy_users_ok=$(jq -r --arg port "$port" --arg master "$server_key" '
+                (.users // []) as $users |
+                if ($users | type) != "array" then false
+                elif ($users | length) == 0 then true
+                else ($users | length) == 1 and
+                    ($users[0].name == "default" or $users[0].name == ("default-" + $port)) and
+                    $users[0].uuid == $master end
+            ' <<< "$ss_cfg") || return 1
+            [[ "$legacy_users_ok" == true ]] || { _err "此端口有无法确认的旧版用户数据，拒绝自动迁移"; return 1; }
             default_key=$(head -c "$key_len" /dev/urandom | base64 | tr -d '\n') || return 1
-            while [[ "$default_key" == "$uuid" || "$default_key" == "$(jq -r '.password' <<< "$ss_cfg")" ]]; do
+            while [[ "$default_key" == "$uuid" || "$default_key" == "$server_key" ]]; do
                 default_key=$(head -c "$key_len" /dev/urandom | base64 | tr -d '\n') || return 1
             done
         else
@@ -1058,8 +1067,10 @@ db_add_user() {
             def add_ss_user:
                 (if .multi_user == true then . else
                     .multi_user = true |
-                    .users = [{name:("default-" + $port),
-                        uuid:$d,quota:0,used:0,enabled:true,created:$cr,expire_date:""}]
+                    .users = (if (.users // [] | length) == 0 then
+                        [{name:("default-" + $port),
+                            uuid:$d,quota:0,used:0,enabled:true,created:$cr,expire_date:""}]
+                    else [.users[0] | .name = ("default-" + $port) | .uuid = $d] end)
                 end) |
                 .users += [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp,routing:$r}];
             if (.[$c][$p] | type) == "array" then

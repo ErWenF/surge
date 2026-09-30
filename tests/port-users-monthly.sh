@@ -13,6 +13,8 @@ load_function() {
 }
 for fn in _ss2022_key_len _ss2022_valid_key _ss2022_share_password gen_xray_ss2022_clients \
     gen_ss2022_link _gen_user_share_link \
+    _db_lock_acquire _db_lock_release _with_db_lock _restore_db_backup \
+    _traffic_snapshot _xray_traffic_counters _commit_traffic_snapshots \
     _user_management_supported _user_change_begin _user_change_apply db_add_user db_del_user \
     db_set_user_enabled db_get_user db_get_user_field db_get_users_stats db_list_users \
     gen_xray_vless_clients gen_xray_vmess_clients gen_xray_trojan_clients \
@@ -22,6 +24,8 @@ for fn in _ss2022_key_len _ss2022_valid_key _ss2022_share_password gen_xray_ss20
 done
 
 _db_apply() { jq "$@" "$DB_FILE" > "$fixture/new.json" && mv "$fixture/new.json" "$DB_FILE"; }
+_flush_core_traffic() { :; }
+_core_traffic_epoch() { echo test-epoch; }
 db_exists() { jq -e --arg c "$1" --arg p "$2" '.[$c][$p] != null' "$DB_FILE" >/dev/null; }
 db_get() { jq --arg c "$1" --arg p "$2" '.[$c][$p]' "$DB_FILE"; }
 is_standalone_protocol() { return 1; }

@@ -7,6 +7,7 @@ for fn in _singbox_stats_build_version _update_singbox_preserving_stats _update_
     eval "$(awk -v fn="$fn" 'index($0,fn"() {")==1 {on=1} on {print} on && $0=="}" {exit}' "$repo/vless-server.sh")"
 done
 _info() { :; }
+_with_db_lock() { DB_LOCK_OWNER=$BASHPID; "$@"; }
 _err() { :; }
 _check_core_update_deps() { :; }
 _confirm_core_update_version() { :; }

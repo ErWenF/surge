@@ -36,6 +36,8 @@ exec sh vless-server.sh
 vless
 ```
 
+[v3.7.4 核心流程修复与实测范围](docs/core-safety-review.md)。已有安装可直接更新脚本，无需卸载重装。
+
 SS2022 持续校时与特殊策略路由下的 UDP 回程处理见 [说明](docs/ss2022-time-and-udp.md)。
 
 nft脚本使用方法：

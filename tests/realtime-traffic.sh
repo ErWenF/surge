@@ -4,9 +4,10 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 DB_FILE="$fixture/db.json"
-for fn in get_all_traffic_stats db_list_protocols db_list_users _singbox_stat_key_for_user _is_snell_users_protocol _snell_managed _snell_rows; do
+for fn in _traffic_snapshot _xray_traffic_counters get_all_traffic_stats db_list_protocols db_list_users _singbox_stat_key_for_user _is_snell_users_protocol _snell_managed _snell_rows; do
     eval "$(awk -v fn="$fn" 'index($0, fn "() {") == 1 {on=1} on {print} on && $0 == "}" {exit}' "$repo/vless-server.sh")"
 done
+_core_traffic_epoch() { echo test-epoch; }
 printf '%s\n' '{"xray":{"vless":{"users":[{"name":"default"}]},"snell-v6":[{"snell_id":"abc","users":[{"name":"default"}]}]},"singbox":{"vless":{"users":[{"name":"default"}]},"trojan":{"users":[{"name":"default"}]},"anytls":{"users":[{"name":"default"}]},"ss2022":{"password":"test"}},"meta":{"snell_users_v1":true}}' > "$DB_FILE"
 _snell_managed() { return 0; }
 _pgrep() { [[ "$offline" != true ]]; }

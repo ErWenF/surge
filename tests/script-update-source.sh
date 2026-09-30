@@ -11,17 +11,17 @@ for fn in _version_gt _get_latest_script_version _get_previous_stable_script_rel
     load_function "$fn"
 done
 
-grep -q '^readonly VERSION="3.7.3"$' "$repo/vless-server.sh"
+grep -q '^readonly VERSION="3.7.4"$' "$repo/vless-server.sh"
 grep -q '^readonly SCRIPT_REPO="ErWenF/surge"$' "$repo/vless-server.sh"
 grep -q '^readonly SCRIPT_SOURCE_REPO="ErWenF/surge"$' "$repo/vless-server.sh"
 SCRIPT_REPO=ErWenF/surge
 SCRIPT_VERSION_CACHE_FILE="$fixture/cache"
 _init_version_cache() { :; }
 _is_cache_fresh() { return 1; }
-_get_latest_script_version_from_raw() { echo 3.7.3; }
+_get_latest_script_version_from_raw() { echo 3.7.4; }
 _get_latest_version() { echo 3.7.2; }
 _get_latest_tag_version() { echo 3.7.1; }
-[[ $(_get_latest_script_version false true) == 3.7.3 ]]
+[[ $(_get_latest_script_version false true) == 3.7.4 ]]
 
 _get_latest_script_version_from_raw() { return 1; }
 [[ $(_get_latest_script_version false true) == 3.7.2 ]]

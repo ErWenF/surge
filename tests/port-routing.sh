@@ -10,13 +10,15 @@ mkdir -p "$CFG"
 load_function() {
     eval "$(awk -v fn="$1" 'index($0, fn "() {") == 1 {on=1} on {print} on && $0 == "}" {exit}' "$repo/vless-server.sh")"
 }
-for fn in db_get_port_config db_set_port_routing db_update_port db_remove_port db_del db_chain_node_exists db_get_chain_node \
+for fn in _db_lock_acquire _db_lock_release _with_db_lock _restore_db_backup \
+    db_get_port_config db_set_port_routing db_update_port db_remove_port db_del db_chain_node_exists db_get_chain_node \
     db_del_chain_node db_rename_chain_node gen_xray_chain_outbound gen_singbox_chain_outbound \
     _apply_port_routing_config apply_port_routing_change; do
     load_function "$fn"
 done
 _db_apply() { jq "$@" "$DB_FILE" > "$fixture/new.json" && mv "$fixture/new.json" "$DB_FILE"; }
 _err() { echo "$*" >&2; }
+_flush_core_traffic() { :; }
 
 jq -n '{
     xray:{socks:[{port:21001},{port:21002}]},

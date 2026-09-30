@@ -36,7 +36,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.7.2 [服务端]
+#  多协议代理一键部署脚本 v3.7.4 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 默认处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.3"
+readonly VERSION="3.7.4"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -126,22 +126,35 @@ readonly DB_FILE="$CFG/db.json"
 readonly DB_LOCK_FILE="$CFG/.db.lock"
 DB_LOCK_FD=""
 DB_LOCK_DIR_HELD=false
+DB_LOCK_OWNER=""
+DB_LOCK_DEPTH=0
 
 _db_lock_acquire() {
+    if [[ "${DB_LOCK_OWNER:-}" == "$BASHPID" ]]; then
+        DB_LOCK_DEPTH=$((DB_LOCK_DEPTH + 1))
+        return 0
+    fi
+    # A child must not unlock its parent's inherited flock descriptor.
+    if [[ -n "${DB_LOCK_FD:-}" ]]; then exec {DB_LOCK_FD}>&-; DB_LOCK_FD=""; fi
+    DB_LOCK_DIR_HELD=false
+    local lock_file="${DB_LOCK_FILE:-$CFG/.db.lock}"
+    DB_LOCK_HELD_FILE="$lock_file"
     mkdir -p "$CFG" || return 1
     if command -v flock >/dev/null 2>&1; then
-        exec {DB_LOCK_FD}>"$DB_LOCK_FILE" || return 1
+        exec {DB_LOCK_FD}>"$lock_file" || return 1
         flock -x "$DB_LOCK_FD" || {
             exec {DB_LOCK_FD}>&-
             DB_LOCK_FD=""
             return 1
         }
     else
-        local lock_dir="${DB_LOCK_FILE}.d" owner attempt
+        local lock_dir="${lock_file}.d" owner attempt
         for ((attempt=0; attempt<200; attempt++)); do
             if mkdir "$lock_dir" 2>/dev/null; then
-                printf '%s\n' "$$" >"$lock_dir/pid"
+                printf '%s\n' "$BASHPID" >"$lock_dir/pid"
                 DB_LOCK_DIR_HELD=true
+                DB_LOCK_OWNER=$BASHPID
+                DB_LOCK_DEPTH=1
                 return 0
             fi
             owner=$(cat "$lock_dir/pid" 2>/dev/null || true)
@@ -155,19 +168,33 @@ _db_lock_acquire() {
         _err "等待数据库锁超时"
         return 1
     fi
+    DB_LOCK_OWNER=$BASHPID
+    DB_LOCK_DEPTH=1
 }
 
 _db_lock_release() {
+    [[ "${DB_LOCK_OWNER:-}" == "$BASHPID" ]] || return 0
+    DB_LOCK_DEPTH=$((DB_LOCK_DEPTH - 1))
+    (( DB_LOCK_DEPTH == 0 )) || return 0
     if [[ -n "${DB_LOCK_FD:-}" ]]; then
         flock -u "$DB_LOCK_FD" 2>/dev/null || true
         exec {DB_LOCK_FD}>&-
         DB_LOCK_FD=""
     fi
     if [[ "${DB_LOCK_DIR_HELD:-false}" == "true" ]]; then
-        rm -f "${DB_LOCK_FILE}.d/pid" 2>/dev/null
-        rmdir "${DB_LOCK_FILE}.d" 2>/dev/null || true
+        rm -f "${DB_LOCK_HELD_FILE}.d/pid" 2>/dev/null
+        rmdir "${DB_LOCK_HELD_FILE}.d" 2>/dev/null || true
         DB_LOCK_DIR_HELD=false
     fi
+    DB_LOCK_OWNER=""
+}
+
+_with_db_lock() {
+    (
+        _db_lock_acquire || return 1
+        trap 'DB_LOCK_DEPTH=1; _db_lock_release' EXIT
+        "$@"
+    )
 }
 
 # 初始化数据库
@@ -899,6 +926,22 @@ _user_management_supported() {
     esac
 }
 
+_restore_db_backup() {
+    local staged
+    staged=$(mktemp "${DB_FILE}.restore.XXXXXX") || return 1
+    cp -p "$1" "$staged" && mv "$staged" "$DB_FILE" && return 0
+    rm -f "$staged"
+    return 1
+}
+
+_rebuild_core_config() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _rebuild_core_config "$@"; return $?; fi
+    local core="$1" reload="${2:-true}" backup
+    _flush_core_traffic "$core" || return 1
+    backup=$(_user_change_begin "$core") || return 1
+    _user_change_apply "$core" "$backup" "$reload"
+}
+
 _user_change_begin() {
     local core="$1" config service backup
     case "$core" in
@@ -912,11 +955,14 @@ _user_change_begin() {
     cp -p "$DB_FILE" "$backup/db.json" || return 1
     [[ ! -f "$config" ]] || cp -p "$config" "$backup/active.json" || return 1
     svc status "$service" >/dev/null 2>&1 && touch "$backup/running"
+    svc is-enabled "$service" >/dev/null 2>&1 && touch "$backup/enabled"
     printf '%s\n' "$backup"
 }
 
 _user_change_apply() {
     local core="$1" backup="$2" config service binary candidate staged failed='' restarted=false
+    local reload="${3:-true}" removed_ports="${4:-[]}"
+    local check_port="${5:-}"
     case "$core" in
         xray) config="$CFG/config.json"; service=vless-reality; binary="${XRAY_BIN:-/usr/local/bin/xray}" ;;
         singbox) config="$CFG/singbox.json"; service=vless-singbox; binary="${SINGBOX_BIN:-/usr/local/bin/sing-box}" ;;
@@ -932,12 +978,20 @@ _user_change_apply() {
         if [[ "$core" == xray ]]; then
             "$binary" run -test -c "$candidate" >/dev/null 2>&1 || failed='Xray 配置校验失败'
         else
-            "$binary" check -c "$candidate" >/dev/null 2>&1 || failed='Sing-box 配置校验失败'
+            ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true "$binary" check -c "$candidate" >/dev/null 2>&1 || failed='Sing-box 配置校验失败'
         fi
     fi
-    if [[ -z "$failed" && -f "$backup/active.json" ]]; then
-        jq -ne --slurpfile before "$backup/active.json" --slurpfile after "$candidate" '
-            (($before[0].inbounds // [] | map(.tag)) - ($after[0].inbounds // [] | map(.tag))) | length == 0
+    if [[ -z "$failed" && -f "$backup/active.json" ]] &&
+        jq -e 'type == "object" and (.inbounds | type) == "array"' "$backup/active.json" >/dev/null 2>&1; then
+        jq -ne --arg c "$core" --argjson removed "$removed_ports" \
+            --slurpfile db "$DB_FILE" --slurpfile before "$backup/active.json" --slurpfile after "$candidate" '
+            [$db[0].xray.ss2022 // empty | (if type == "array" then .[] else . end) |
+                select(.multi_user == true and all(.users[]?; .enabled == false)) | .port] as $closed |
+            [$before[0].inbounds[]? | . as $ib |
+                select(($removed | index($ib.port // $ib.listen_port)) == null) |
+                select($c != "xray" or .protocol != "shadowsocks" or ($closed | index($ib.port)) == null) |
+                .tag] as $expected |
+            ($expected - [$after[0].inbounds[]?.tag]) | length == 0
         ' >/dev/null 2>&1 || failed='候选配置缺少原有入站'
     fi
     if [[ -z "$failed" ]]; then
@@ -947,32 +1001,52 @@ _user_change_apply() {
         cp -p "$candidate" "$staged" && mv "$staged" "$config" || failed='配置写入失败'
         [[ -z "$failed" ]] || rm -f "$staged"
     fi
-    if [[ -z "$failed" && -f "$backup/running" ]]; then
-        svc status "$service" >/dev/null 2>&1 || failed='原核心已停止'
+    if [[ -z "$failed" && ( "$reload" == start || ( "$reload" == true && -f "$backup/running" ) ) ]]; then
+        local action=start
+        if [[ -f "$backup/running" ]]; then
+            action=restart
+            svc status "$service" >/dev/null 2>&1 || failed='原核心已停止'
+        fi
         if [[ -z "$failed" ]]; then
             restarted=true
-            svc restart "$service" >/dev/null 2>&1 || failed='核心重启失败'
+            svc "$action" "$service" >/dev/null 2>&1 || failed='核心启动或重启失败'
         fi
         if [[ -z "$failed" ]]; then
             sleep "${USER_CHANGE_HEALTH_DELAY:-1}"
             svc status "$service" >/dev/null 2>&1 || failed='核心健康检查失败'
+            if [[ -z "$failed" && -n "$check_port" ]] && command -v ss >/dev/null &&
+                jq -e --argjson port "$check_port" 'any(.inbounds[]?; (.port // .listen_port) == $port)' "$candidate" >/dev/null; then
+                ss -H -lntu "( sport = :$check_port )" 2>/dev/null | grep -q . || failed='入站端口未监听'
+            fi
         fi
     fi
+    if [[ -z "$failed" && "$reload" == start ]]; then
+        svc enable "$service" >/dev/null 2>&1 || failed='开机启动设置失败'
+    fi
     [[ -z "$failed" ]] && return 0
-    cp -p "$backup/db.json" "$DB_FILE" || _err "数据库回滚失败: $backup"
+    _restore_db_backup "$backup/db.json" || _err "数据库回滚失败: $backup"
     if [[ -f "$backup/active.json" ]]; then
         cp -p "$backup/active.json" "$config" || _err "配置回滚失败: $backup"
     else
         rm -f "$config"
     fi
     if [[ "$restarted" == true ]]; then
-        svc restart "$service" >/dev/null 2>&1 && svc status "$service" >/dev/null 2>&1 || _err "服务回滚失败: $backup"
+        if [[ -f "$backup/running" ]]; then
+            svc restart "$service" >/dev/null 2>&1 && svc status "$service" >/dev/null 2>&1 || _err "服务回滚失败: $backup"
+        else
+            svc stop "$service" >/dev/null 2>&1 || _err "服务停止回滚失败: $backup"
+        fi
     fi
     _err "$failed，已尝试恢复；备份: $backup"
+    if [[ "$reload" == start ]]; then
+        if [[ -f "$backup/enabled" ]]; then svc enable "$service" >/dev/null 2>&1 || true
+        else svc disable "$service" >/dev/null 2>&1 || true; fi
+    fi
     return 1
 }
 
 db_add_user() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock db_add_user "$@"; return $?; fi
     local core="$1" proto="$2" name="$3" uuid="$4" quota_gb="${5:-0}" expire_date="${6:-}" port="${7:-}" routing="${8:-}" allow_migration="${9:-false}" backup
     [[ ! -f "$DB_FILE" ]] && return 1
     [[ "$name" != default && "$name" != default-* ]] || { _err "default 为系统保留用户名"; return 1; }
@@ -1060,6 +1134,7 @@ db_add_user() {
     local created=$(date '+%Y-%m-%d')
     
     # 添加用户 (支持多端口数组，包含 expire_date)
+    _flush_core_traffic "$core" || return 1
     backup=$(_user_change_begin "$core") || return 1
     if [[ "$ss2022" == true ]]; then
         _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg u "$uuid" --arg d "$default_key" \
@@ -1108,12 +1183,14 @@ db_add_user() {
 # 删除用户 (支持多端口数组格式)
 # 用法: db_del_user "xray" "vless" "用户名"
 db_del_user() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock db_del_user "$@"; return $?; fi
     local core="$1" proto="$2" name="$3" backup
     if _snell_managed "$proto"; then
         _snell_delete_user "$proto" "$name"
         return $?
     fi
     [[ ! -f "$DB_FILE" ]] && return 1
+    _flush_core_traffic "$core" || return 1
     backup=$(_user_change_begin "$core") || return 1
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" '
         .[$c][$p] as $cfg |
@@ -1428,6 +1505,7 @@ db_set_user_quota() {
 # 启用/禁用用户 (支持多端口数组格式)
 # 用法: db_set_user_enabled "xray" "vless" "用户名" true/false
 db_set_user_enabled() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock db_set_user_enabled "$@"; return $?; fi
     local core="$1" proto="$2" name="$3" enabled="$4" reason="${5:-manual}" backup=''
     [[ ! -f "$DB_FILE" ]] && return 1
     if [[ "$enabled" == true ]]; then
@@ -1443,6 +1521,7 @@ db_set_user_enabled() {
     fi
     
     if ! _snell_managed "$proto"; then
+        _flush_core_traffic "$core" || return 1
         backup=$(_user_change_begin "$core") || return 1
     fi
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg reason "$reason" --argjson e "$enabled" '
@@ -1537,8 +1616,10 @@ db_set_user_alert_state() {
 #   "chain:节点名" - 链式代理指定节点
 #   "balancer:组名" - 负载均衡组
 db_set_user_routing() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock db_set_user_routing "$@"; return $?; fi
     local core="$1" proto="$2" name="$3" routing="$4" backup
     [[ ! -f "$DB_FILE" ]] && return 1
+    _flush_core_traffic "$core" || return 1
     backup=$(_user_change_begin "$core") || return 1
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg r "$routing" '
         .[$c][$p] as $cfg |
@@ -1822,21 +1903,25 @@ ${server_display}
 # 执行过期用户检查和禁用
 check_and_disable_expired_users() {
     local notify="${1:-}"
-    local count=0
+    local count=0 failed=0
     
     local expired_users=$(db_get_expired_users)
     [[ -z "$expired_users" ]] && echo "$count" && return 0
     
     while IFS='|' read -r core proto name expire_date days_left; do
         [[ -z "$name" ]] && continue
-        db_set_user_enabled "$core" "$proto" "$name" false expired
-        ((count++))
+        if ! db_set_user_enabled "$core" "$proto" "$name" false expired; then
+            failed=$((failed + 1))
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 停用失败: $name ($proto)" >> "$CFG/expire.log"
+            continue
+        fi
+        count=$((count + 1))
         [[ "$notify" == "--notify" ]] && send_tg_expired_notice "$name" "$proto" "$expire_date" "$core"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 禁用: $name ($proto)" >> "$CFG/expire.log"
     done <<< "$expired_users"
     
-    [[ $count -gt 0 ]] && rebuild_and_reload_xray "silent" 2>/dev/null
     echo "$count"
+    (( failed == 0 ))
 }
 
 # 发送即将过期提醒
@@ -2006,56 +2091,14 @@ db_migrate_to_multiuser() {
 # 用法: rebuild_and_reload_xray [silent]
 # 参数: silent - 如果设置则不输出成功信息
 rebuild_and_reload_xray() {
-    local silent="${1:-}"
-    
-    # 重新生成 Xray 配置
-    if generate_xray_config 2>/dev/null; then
-        # 检查 Xray 服务是否在运行
-        if svc status vless-reality 2>/dev/null; then
-            # 重启服务确保配置生效 (reload 可能不可靠)
-            if svc restart vless-reality 2>/dev/null; then
-                [[ -z "$silent" ]] && _ok "配置已更新并重载"
-                return 0
-            else
-                [[ -z "$silent" ]] && _err "配置已更新，但服务重启失败"
-                return 1
-            fi
-        else
-            [[ -z "$silent" ]] && _ok "配置已更新"
-            return 0
-        fi
-    else
-        [[ -z "$silent" ]] && _err "配置重建失败"
-        return 1
-    fi
+    _rebuild_core_config xray true
 }
 
 # 用户变更后重建 Sing-box 配置并重载服务
 # 用法: rebuild_and_reload_singbox [silent]
 # 参数: silent - 如果设置则不输出成功信息
 rebuild_and_reload_singbox() {
-    local silent="${1:-}"
-    
-    # 重新生成 Sing-box 配置
-    if generate_singbox_config; then
-        # 检查 Sing-box 服务是否在运行
-        if svc status vless-singbox 2>/dev/null; then
-            # 重载服务
-            if svc restart vless-singbox 2>/dev/null; then
-                [[ -z "$silent" ]] && _ok "Sing-box 配置已更新并重载"
-                return 0
-            else
-                [[ -z "$silent" ]] && _warn "配置已更新，服务重载失败"
-                return 1
-            fi
-        else
-            [[ -z "$silent" ]] && _ok "Sing-box 配置已更新"
-            return 0
-        fi
-    else
-        [[ -z "$silent" ]] && _err "Sing-box 配置重建失败"
-        return 1
-    fi
+    _rebuild_core_config singbox true
 }
 
 
@@ -2812,7 +2855,8 @@ _download_singbox_stats_core() {
     chmod 755 "$work/bin/sing-box"
 }
 
-_build_singbox_stats_core() (
+_build_singbox_stats_core() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _build_singbox_stats_core "$@"; return $?; fi
     # 保留函数名兼容现有调用；只下载已验证的预编译包，绝不在服务器编译。
     local version work arch backup stage rc
     version="${1:-$(sing-box version | awk '/^sing-box version / {print $3; exit}')}"
@@ -2821,24 +2865,26 @@ _build_singbox_stats_core() (
     [[ "$arch" == amd64 || "$arch" == arm64 ]] || { _err "暂无此架构预编译包，请本地从官方源码编译带 with_v2ray_api 的核心；原核心保留"; return 1; }
     work=$(mktemp -d) || { _err "无法创建下载临时目录，请检查磁盘空间/权限"; return 1; }
     stage="下载预编译统计核心"
-    trap 'rc=$?; if [[ $rc != 0 ]]; then _err "统计核心安装失败，阶段: $stage，退出码: $rc"; fi; rm -rf "$work"; exit "$rc"' EXIT
+    trap "rm -rf $(printf '%q' "$work"); DB_LOCK_DEPTH=1; _db_lock_release" EXIT
     _download_singbox_stats_core "$version" "$arch" "$work" || return 1
     stage="验证新核心及现有配置"
     "$work/bin/sing-box" version | grep -q with_v2ray_api || return 1
     [[ "$("$work/bin/sing-box" version | awk '/^sing-box version / {print $3; exit}')" == "$version" ]] || { _err "构建输出版本与目标不一致"; return 1; }
-    "$work/bin/sing-box" check -c "$CFG/singbox.json" || { _err "新核心不兼容现有配置，已取消替换"; return 1; }
+    ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true "$work/bin/sing-box" check -c "$CFG/singbox.json" || { _err "新核心不兼容现有配置，已取消替换"; return 1; }
     stage="安装 grpcurl 查询工具"
     install_singbox_stats_client || return 1
     stage="备份并替换核心"
+    _flush_core_traffic singbox || return 1
     backup=$(mktemp -d "$CFG/singbox-stats-backup.XXXXXX") || return 1
     chmod 700 "$backup"
-    cp -p /usr/local/bin/sing-box "$backup/sing-box" && cp -p "$CFG/singbox.json" "$backup/singbox.json" || return 1
+    cp -p /usr/local/bin/sing-box "$backup/sing-box" && cp -p "$CFG/singbox.json" "$backup/singbox.json" &&
+        cp -p "$DB_FILE" "$backup/db.json" || return 1
     # 安装暂存文件后 rename，避免覆盖正在执行的二进制。
     install -m 755 "$work/bin/sing-box" /usr/local/bin/sing-box.stats-new &&
         mv -f /usr/local/bin/sing-box.stats-new /usr/local/bin/sing-box || return 1
     stage="重建配置/重启服务/验证统计接口"
     # 更新时不重写已验证配置，避免新版本配置变化导致无意丢失现有设置。
-    if { [[ -n "${1:-}" ]] || generate_singbox_config; } && /usr/local/bin/sing-box check -c "$CFG/singbox.json" && svc restart vless-singbox; then
+    if { [[ -n "${1:-}" ]] || generate_singbox_config; } && ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true /usr/local/bin/sing-box check -c "$CFG/singbox.json" && svc restart vless-singbox; then
         local attempt
         for attempt in 1 2 3 4 5; do
             if singbox_api_query 'user>>>' false >/dev/null; then
@@ -2850,13 +2896,13 @@ _build_singbox_stats_core() (
     fi
     if install -m 755 "$backup/sing-box" /usr/local/bin/sing-box.stats-restore &&
         mv -f /usr/local/bin/sing-box.stats-restore /usr/local/bin/sing-box &&
-        cp -p "$backup/singbox.json" "$CFG/singbox.json" && svc restart vless-singbox; then
+        cp -p "$backup/singbox.json" "$CFG/singbox.json" && _restore_db_backup "$backup/db.json" && svc restart vless-singbox; then
         _err "统计核心启动验证失败，已恢复原核心及配置；备份: $backup"
     else
         _err "自动恢复失败，请使用备份手动恢复: $backup"
     fi
     return 1
-)
+}
 
 _singbox_stats_enabled() {
     sing-box version 2>/dev/null | grep -q with_v2ray_api ||
@@ -2864,6 +2910,7 @@ _singbox_stats_enabled() {
 }
 
 _update_singbox_preserving_stats() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _update_singbox_preserving_stats "$@"; return $?; fi
     local channel="${1:-stable}" target="${2:-}" running=false update_rc
     if [[ -z "$target" ]]; then
         [[ "$channel" == stable || -z "$channel" ]] || { _err "统计保留更新暂不接受预发布通道，请选择稳定版"; return 1; }
@@ -2883,95 +2930,25 @@ _update_singbox_preserving_stats() {
 # 确保 Sing-box 协议的默认用户落入 users[]，便于统计 / 限额 / 到期统一处理
 _ensure_singbox_default_users() {
     [[ ! -f "$DB_FILE" ]] && return 0
-    local today
-    today=$(date +%F)
-
-    python3 - "$DB_FILE" "$today" <<'PY'
-import json, sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-today = sys.argv[2]
-
-data = json.loads(path.read_text())
-changed = [False]
-singbox = data.get('singbox') or {}
-
-for proto in ('vless', 'trojan', 'hy2', 'tuic', 'anytls'):
-    cfg = singbox.get(proto)
-    if cfg is None:
-        continue
-
-    def default_secret(obj):
-        if proto == 'tuic':
-            return obj.get('uuid') or ''
-        return obj.get('password') or obj.get('username') or obj.get('uuid') or ''
-
-    def normalize_obj(obj, default_name='default'):
-        if not isinstance(obj, dict):
-            return obj
-
-        secret = default_secret(obj)
-        if not secret:
-            return obj
-
-        users = obj.get('users')
-        if not isinstance(users, list):
-            users = []
-
-        default_user = None
-        for user in users:
-            if isinstance(user, dict) and user.get('name') in (default_name, 'default'):
-                default_user = user
-                break
-
-        if default_user is None:
-            users.insert(0, {
-                'name': default_name,
-                'uuid': secret,
-                'quota': 0,
-                'used': 0,
-                'enabled': True,
-                'created': today,
-                'expire_date': ''
-            })
-            obj['users'] = users
-            changed[0] = True
-        else:
-            if default_user['name'] != default_name:
-                default_user['name'] = default_name
-                changed[0] = True
-            if not default_user.get('uuid'):
-                default_user['uuid'] = secret
-                changed[0] = True
-            if 'quota' not in default_user:
-                default_user['quota'] = 0
-                changed[0] = True
-            if 'used' not in default_user:
-                default_user['used'] = 0
-                changed[0] = True
-            if 'enabled' not in default_user:
-                default_user['enabled'] = True
-                changed[0] = True
-            if 'created' not in default_user or not default_user.get('created'):
-                default_user['created'] = today
-                changed[0] = True
-            if 'expire_date' not in default_user:
-                default_user['expire_date'] = ''
-                changed[0] = True
-            obj['users'] = users
-
-        return obj
-
-    if isinstance(cfg, list):
-        singbox[proto] = [normalize_obj(item, f"default-{item.get('port')}") if isinstance(item, dict) else item for item in cfg]
-    else:
-        singbox[proto] = normalize_obj(cfg)
-
-if changed[0]:
-    data['singbox'] = singbox
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-PY
+    _db_apply --arg today "$(date +%F)" '
+        def normalize($proto; $name):
+            (if $proto == "tuic" then .uuid else (.password // .username // .uuid) end) as $secret |
+            if ($secret // "") == "" then . else
+                {name:$name, uuid:$secret, quota:0, used:0, enabled:true, created:$today, expire_date:""} as $default |
+                if any(.users[]?; .name == $name or .name == "default") then
+                    .users |= map(if .name == $name or .name == "default" then
+                        $default + . | .name = $name |
+                        if (.uuid // "") == "" then .uuid = $secret else . end
+                    else . end)
+                elif (.users // [] | length) == 0 then .users = [$default]
+                else . end
+            end;
+        .singbox |= ((. // {}) | with_entries(
+            .key as $p | if ["vless","trojan","hy2","tuic","anytls"] | index($p) then
+                .value |= (if type == "array" then map(normalize($p; "default-" + (.port|tostring)))
+                    else normalize($p; "default") end)
+            else . end))
+    '
 }
 
 # 生成 Sing-box 用户的内部统计键，避免不同协议同名用户（如 default）互相撞统计
@@ -3053,13 +3030,102 @@ mark_traffic_sync_result() {
          if $s == "ok" then .meta.last_traffic_sync = $t else . end' || true
 }
 
-# 同步实现。外层 sync_all_user_traffic() 负责加锁，避免 cron 与 TG 查询同时
-# 使用 -reset 读取核心计数器而造成流量遗漏。
+_core_traffic_epoch() {
+    local core="$1" service process pid start boot
+    case "$core" in
+        xray) service=vless-reality; process=xray ;;
+        singbox) service=vless-singbox; process=sing-box ;;
+        *) return 1 ;;
+    esac
+    pid=$(cat "/run/${service}.pid" 2>/dev/null) || pid=''
+    if [[ ! "$pid" =~ ^[1-9][0-9]*$ || "$(cat "/proc/$pid/comm" 2>/dev/null)" != "$process" ]] && command -v systemctl >/dev/null; then
+        pid=$(systemctl show "$service" -p MainPID --value 2>/dev/null) || pid=''
+    fi
+    if [[ ! "$pid" =~ ^[1-9][0-9]*$ || "$(cat "/proc/$pid/comm" 2>/dev/null)" != "$process" ]]; then
+        local entry cmd
+        for entry in /proc/[0-9]*; do
+            [[ "$(cat "$entry/comm" 2>/dev/null)" == "$process" ]] || continue
+            cmd=$(tr '\0' ' ' < "$entry/cmdline" 2>/dev/null) || continue
+            [[ "$cmd" == *"$CFG/"* ]] || continue
+            pid=${entry##*/}; break
+        done
+    fi
+    [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/$pid/stat" && "$(cat "/proc/$pid/comm" 2>/dev/null)" == "$process" ]] || return 1
+    start=$(awk '{print $22}' "/proc/$pid/stat") || return 1
+    boot=$(cat /proc/sys/kernel/random/boot_id) || return 1
+    printf '%s:%s:%s\n' "$boot" "$pid" "$start"
+}
+
+_traffic_snapshot() {
+    local core="$1" raw="$2" expected_epoch="${3:-}" epoch
+    epoch=$(_core_traffic_epoch "$core") || return 1
+    [[ -z "$expected_epoch" || "$expected_epoch" == "$epoch" ]] || return 1
+    printf '%s\n' "$raw" | jq -Rsn --arg c "$core" --arg epoch "$epoch" --slurpfile db "$DB_FILE" '
+        [inputs | split("\n")[] | select(length > 0) | split(" ") |
+            if length != 2 or (.[0] | test("^user>>>.+>>>traffic>>>(uplink|downlink)$") | not) or
+                (.[1] | test("^[0-9]+$") | not) then error("invalid counter")
+            else {key:.[0],value:(.[1]|tonumber)} end] | from_entries as $now |
+        ($db[0].meta.traffic_snapshots[$c] // {}) as $old |
+        {core:$c,epoch:$epoch,counters:$now,deltas:($now | with_entries(
+            .key as $k | .value = (if $old.epoch == $epoch and .value >= ($old.counters[$k] // 0)
+                then .value - ($old.counters[$k] // 0) else .value end)))}
+    '
+}
+
+_xray_traffic_counters() {
+    jq -er '
+        if type != "object" then error("invalid stats") else
+        (.stat // .Stat // []) | map(
+            {name:(.name // .Name),value:(.value // .Value // 0)} |
+            if (.name | type) != "string" or ((.value | tostring) | test("^[0-9]+$") | not)
+            then error("invalid counter") else "\(.name) \(.value)" end
+        ) | join("\n") end'
+}
+
+_commit_traffic_snapshots() {
+    _db_apply --slurpfile snapshots "$1" '
+        def account($core; $proto; $delta):
+            if .users then .users |= map(
+                (if $core == "xray" then (.name + "@" + $proto) else ($proto + "-" + .name) end) as $key |
+                .used = ((.used // 0) + ($delta["user>>>"+$key+">>>traffic>>>uplink"] // 0) +
+                    ($delta["user>>>"+$key+">>>traffic>>>downlink"] // 0)))
+            else . end;
+        reduce $snapshots[] as $s (.;
+            .[$s.core] |= ((. // {}) | with_entries(.key as $p | .value |=
+                (if type == "array" then map(account($s.core; $p; $s.deltas)) else account($s.core; $p; $s.deltas) end))) |
+            .meta.traffic_snapshots[$s.core] = {epoch:$s.epoch,counters:$s.counters})
+    '
+}
+
+_flush_core_traffic() {
+    local core="$1" config service raw snapshot tmp rc epoch
+    case "$core" in
+        xray) config="$CFG/config.json"; service=vless-reality
+            jq -e '.api.services | index("StatsService") != null' "$config" >/dev/null 2>&1 || return 0 ;;
+        singbox) config="$CFG/singbox.json"; service=vless-singbox
+            jq -e '.experimental.v2ray_api.stats.enabled == true' "$config" >/dev/null 2>&1 || return 0 ;;
+        *) return 1 ;;
+    esac
+    svc status "$service" >/dev/null 2>&1 || return 0
+    epoch=$(_core_traffic_epoch "$core") || return 1
+    if [[ "$core" == xray ]]; then
+        raw=$(xray_api_query 'user>>>' false) &&
+            raw=$(_xray_traffic_counters <<< "$raw") || return 1
+    else raw=$(singbox_api_query 'user>>>' false) || return 1; fi
+    snapshot=$(_traffic_snapshot "$core" "$raw" "$epoch") || return 1
+    tmp=$(mktemp) || return 1
+    printf '%s\n' "$snapshot" > "$tmp" && _commit_traffic_snapshots "$tmp"
+    rc=$?
+    rm -f "$tmp"
+    return "$rc"
+}
+
+# Read cumulative counters; accounting and its checkpoint commit atomically.
 _sync_all_user_traffic_unlocked() {
-    local reset="${1:-true}"  # 默认重置计数器
+    local reset="${1:-true}"  # 兼容旧参数：true 时检查月重置，API 始终读取累计值。
     
     [[ ! -f "$DB_FILE" ]] && return 1
-    _ensure_singbox_default_users
+    _ensure_singbox_default_users || return 1
     
     _snell_sync_traffic || { mark_traffic_sync_result "snell_error" 0; return 1; }
     
@@ -3082,31 +3148,45 @@ _sync_all_user_traffic_unlocked() {
     fi
     
     # 使用临时文件存储 API 结果，避免内存问题
-    local tmp_stats
+    local tmp_stats tmp_snapshots snapshot raw epoch
     tmp_stats=$(mktemp) || { mark_traffic_sync_result "temp_error" 0; return 1; }
+    tmp_snapshots=$(mktemp) || { rm -f "$tmp_stats"; return 1; }
     : > "$tmp_stats"
     
-    # 一次性获取所有流量统计（带重置选项）
-    local reset_flag=""
-    [[ "$reset" == "true" ]] && reset_flag="-reset"
-    
+    # 一次读取用户累计值；写库成功前不清空核心计数器。
     local xray_failed=false xray_output=''
     if [[ "$has_xray" == "true" ]]; then
-        if ! xray_output=$(xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} $reset_flag 2>/dev/null) ||
+        if ! epoch=$(_core_traffic_epoch xray) ||
+            ! xray_output=$(xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} -pattern 'user>>>' 2>/dev/null) ||
             ! printf '%s\n' "$xray_output" | jq -e 'type == "object" and ((.stat // .Stat // []) | type == "array")' >/dev/null 2>&1; then
             xray_failed=true
         else
-            printf '%s\n' "$xray_output" | jq -r '(.stat // .Stat // [])[] | "\(.name // .Name) \(.value // .Value // 0)"' >> "$tmp_stats" || xray_failed=true
+            if raw=$(_xray_traffic_counters <<< "$xray_output") &&
+                snapshot=$(_traffic_snapshot xray "$raw" "$epoch"); then
+                printf '%s\n' "$snapshot" >> "$tmp_snapshots"
+                printf '%s\n' "$snapshot" | jq -r '.deltas | to_entries[] | "\(.key) \(.value)"' >> "$tmp_stats" || xray_failed=true
+            else xray_failed=true; fi
         fi
     fi
 
     local singbox_failed=false
     if [[ "$has_singbox" == "true" ]]; then
-        if ! singbox_stats_available || ! singbox_api_query "user>>>" "$reset" >> "$tmp_stats"; then
+        if ! singbox_stats_available || ! epoch=$(_core_traffic_epoch singbox) || ! raw=$(singbox_api_query "user>>>" false) ||
+            ! snapshot=$(_traffic_snapshot singbox "$raw" "$epoch"); then
             singbox_failed=true
             _warn "Sing-box 流量读取失败，本次未同步其用户流量" >&2
+        else
+            printf '%s\n' "$snapshot" >> "$tmp_snapshots"
+            printf '%s\n' "$snapshot" | jq -r '.deltas | to_entries[] | "\(.key) \(.value)"' >> "$tmp_stats" || singbox_failed=true
         fi
     fi
+
+    if [[ -s "$tmp_snapshots" ]] && ! _commit_traffic_snapshots "$tmp_snapshots"; then
+        rm -f "$tmp_stats" "$tmp_snapshots"
+        mark_traffic_sync_result "db_write_error" 0
+        return 1
+    fi
+    rm -f "$tmp_snapshots"
     
     if [[ ! -s "$tmp_stats" ]]; then
         rm -f "$tmp_stats"
@@ -3138,9 +3218,8 @@ _sync_all_user_traffic_unlocked() {
             downlink=${downlink:-0}
             local traffic=$((uplink + downlink))
             
-            if [[ "$traffic" -gt 0 ]]; then
-                db_update_user_traffic "xray" "$proto" "$user" "$traffic"
-                ((++updated))
+            if [[ "$traffic" -ge 0 ]]; then
+                [[ "$traffic" == 0 ]] || ((++updated))
                 
                 local quota=$(db_get_user_field "xray" "$proto" "$user" "quota")
                 local used=$(db_get_user_field "xray" "$proto" "$user" "used")
@@ -3193,9 +3272,8 @@ _sync_all_user_traffic_unlocked() {
                 downlink=${downlink:-0}
                 local traffic=$((uplink + downlink))
 
-                if [[ "$traffic" -gt 0 ]]; then
-                    db_update_user_traffic "singbox" "$proto" "$user" "$traffic"
-                    ((++updated))
+                if [[ "$traffic" -ge 0 ]]; then
+                    [[ "$traffic" == 0 ]] || ((++updated))
 
                     local quota=$(db_get_user_field "singbox" "$proto" "$user" "quota")
                     local used=$(db_get_user_field "singbox" "$proto" "$user" "used")
@@ -3251,11 +3329,12 @@ _sync_all_user_traffic_unlocked() {
 # 同步所有用户流量到数据库
 # 用法: sync_all_user_traffic [reset]
 sync_all_user_traffic() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock sync_all_user_traffic "$@"; return $?; fi
     local reset="${1:-true}" owner attempt rc
 
     for attempt in {1..10}; do
         if mkdir "$TRAFFIC_SYNC_LOCK_DIR" 2>/dev/null; then
-            printf '%s\n' "$$" > "$TRAFFIC_SYNC_LOCK_DIR/pid"
+            printf '%s\n' "$BASHPID" > "$TRAFFIC_SYNC_LOCK_DIR/pid"
             _sync_all_user_traffic_unlocked "$reset"
             rc=$?
             rm -f "$TRAFFIC_SYNC_LOCK_DIR/pid" 2>/dev/null
@@ -3272,8 +3351,8 @@ sync_all_user_traffic() {
         sleep 1
     done
 
-    # 另一个同步任务仍在运行；它完成后数据库即为最新，避免再次 reset。
-    return 0
+    _err "流量同步仍被占用，请稍后重试"
+    return 1
 }
 
 # 获取所有用户流量统计 (用于显示)
@@ -3281,24 +3360,28 @@ sync_all_user_traffic() {
 # 按数据库枚举用户；支持 Xray、Sing-box 命名用户和 Snell 防火墙计数。
 get_all_traffic_stats() {
     [[ -f "$DB_FILE" ]] || return 1
-    local core proto user key raw parsed snapshot row up down status supported
+    local core proto user key raw parsed snapshot row up down status supported xray_epoch singbox_epoch
     local xray_stats="" singbox_stats="" xray_ok=false singbox_ok=false
-    if _pgrep xray &>/dev/null && raw=$(xray_api_query "user>>>" false); then
-        if parsed=$(printf '%s\n' "$raw" | jq -er '
-            if type != "object" then error("invalid stats") else
-            (.stat // .Stat // []) | map(
-                {name:(.name // .Name), value:(.value // .Value // 0)} |
-                if (.name | type) != "string" or ((.value | tostring) | test("^[0-9]+$") | not)
-                then error("invalid counter") else "\(.name) \(.value)" end
-            ) | join("\n") end' 2>/dev/null); then
+    if _pgrep xray &>/dev/null && xray_epoch=$(_core_traffic_epoch xray) && raw=$(xray_api_query "user>>>" false); then
+        if parsed=$(_xray_traffic_counters <<< "$raw" 2>/dev/null); then
             xray_stats="$parsed"; xray_ok=true
         fi
     fi
-    if _pgrep sing-box &>/dev/null && singbox_stats_available &&
+    if _pgrep sing-box &>/dev/null && singbox_stats_available && singbox_epoch=$(_core_traffic_epoch singbox) &&
         raw=$(singbox_api_query "user>>>" false); then
         if printf '%s\n' "$raw" | awk 'NF && (NF != 2 || $1 !~ /^user>>>/ || $2 !~ /^[0-9]+$/) {bad=1} END {exit bad}'; then
             singbox_stats="$raw"; singbox_ok=true
         fi
+    fi
+    if [[ "$xray_ok" == true ]]; then
+        if parsed=$(_traffic_snapshot xray "$xray_stats" "$xray_epoch"); then
+            xray_stats=$(jq -r '.deltas | to_entries[] | "\(.key) \(.value)"' <<< "$parsed")
+        else xray_ok=false; fi
+    fi
+    if [[ "$singbox_ok" == true ]]; then
+        if parsed=$(_traffic_snapshot singbox "$singbox_stats" "$singbox_epoch"); then
+            singbox_stats=$(jq -r '.deltas | to_entries[] | "\(.key) \(.value)"' <<< "$parsed")
+        else singbox_ok=false; fi
     fi
     for core in xray singbox; do
         for proto in $(db_list_protocols "$core"); do
@@ -3565,10 +3648,12 @@ set_traffic_monthly_reset_day() {
 }
 
 reset_monthly_user_traffic() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock reset_monthly_user_traffic "$@"; return $?; fi
     [[ ! -f "$DB_FILE" ]] && return 0
     local month_key today restore_xray restore_singbox snell_restore monthly_backup
     local xray_backup='' singbox_backup='' xray_applied=false singbox_applied=false snell_applied=false failed=''
     local proto name
+    _flush_core_traffic xray && _flush_core_traffic singbox || return 1
     month_key=$(date +%Y-%m)
     today=$(date +%F)
     restore_xray=$(jq --arg today "$today" '[.xray // {} | to_entries[] | select(.key | startswith("snell") | not) | select(.key != "ss-legacy") | .key as $p | .value | (if type == "array" then .[] else . end) | select($p != "ss2022" or .multi_user == true) | .users[]? | select(.enabled == false and .disabled_reason == "quota" and ((.expire_date // "") == "" or .expire_date >= $today))] | length' "$DB_FILE") || return 1
@@ -3617,7 +3702,7 @@ reset_monthly_user_traffic() {
         printf '%s\n' "$month_key" > "$TRAFFIC_MONTHLY_RESET_LAST_FILE" || failed='月重置状态写入失败'
     fi
     if [[ -n "$failed" ]]; then
-        cp -p "$monthly_backup" "$DB_FILE" || _err "月重置数据库回滚失败: $monthly_backup"
+        _restore_db_backup "$monthly_backup" || _err "月重置数据库回滚失败: $monthly_backup"
         if [[ "$xray_applied" == true ]]; then
             if [[ -f "$xray_backup/active.json" ]]; then cp -p "$xray_backup/active.json" "$CFG/config.json" || _err "Xray 月重置配置回滚失败: $xray_backup"; else rm -f "$CFG/config.json"; fi
             [[ ! -f "$xray_backup/running" ]] || svc restart vless-reality >/dev/null 2>&1 || _err "Xray 月重置服务回滚失败: $xray_backup"
@@ -4428,7 +4513,7 @@ gen_xray_user_routing_outbounds() {
 
 # 在最终入站列表上匹配真实 tag，规则覆盖 TCP/UDP 和 IPv4/IPv6。
 _apply_port_routing_config() {
-    local core="$1" file="$2" entry protocol port target tag base tags outbound tmp
+    local core="$1" file="$2" entry protocol port target tag base tags outbound tmp closed
     [[ -f "$DB_FILE" ]] || return 1
     while IFS= read -r entry; do
         [[ -z "$entry" ]] && continue
@@ -4439,8 +4524,15 @@ _apply_port_routing_config() {
             _err "端口出口引用了不存在的入站: $core/$protocol/$port"
             return 1
         }
+        closed=false
+        if [[ "$core:$protocol" == xray:ss2022 ]] && db_get_port_config "$core" "$protocol" "$port" |
+            jq -e '.multi_user == true and all(.users[]?; .enabled == false)' >/dev/null; then
+            closed=true
+        fi
         tag="port-route-${core}-${protocol}-${port}"
-        if [[ "$core" == xray ]]; then
+        if [[ "$closed" == true ]]; then
+            tags='[]'
+        elif [[ "$core" == xray ]]; then
             base="${protocol}-${port}"
             if jq -e --argjson port "$port" '
                 [.inbounds[] | select(.port == $port and .tag != "api" and
@@ -4486,7 +4578,7 @@ _apply_port_routing_config() {
                 if $out != null then .outbounds += [$out] else . end
                 | .routing.rules = (
                     [(.routing.rules // [])[] | select(.inboundTag == ["api"])] +
-                    [{type:"field", inboundTag:$tags, outboundTag:$tag}] +
+                    (if ($tags|length) > 0 then [{type:"field", inboundTag:$tags, outboundTag:$tag}] else [] end) +
                     [(.routing.rules // [])[] | select(.inboundTag != ["api"])]
                   )
             ' "$file" > "$tmp"; then rm -f "$tmp"; return 1; fi
@@ -4494,7 +4586,7 @@ _apply_port_routing_config() {
             if ! jq --arg tag "$tag" --argjson tags "$tags" --argjson out "${outbound:-null}" '
                 if $out != null then .outbounds += [$out] else . end
                 | .route = (.route // {rules:[], final:"direct"})
-                | .route.rules = ([{inbound:$tags, outbound:$tag}] + (.route.rules // []))
+                | .route.rules = ((if ($tags|length) > 0 then [{inbound:$tags, outbound:$tag}] else [] end) + (.route.rules // []))
             ' "$file" > "$tmp"; then rm -f "$tmp"; return 1; fi
         fi
         mv "$tmp" "$file" || return 1
@@ -4504,6 +4596,10 @@ _apply_port_routing_config() {
 
 # 生成 Xray 多 inbounds 配置
 generate_xray_config() {
+    if [[ -z "${XRAY_CONFIG_OUTPUT:-}" ]]; then _rebuild_core_config xray false; else _render_xray_config; fi
+}
+
+_render_xray_config() {
     local xray_output_file="${XRAY_CONFIG_OUTPUT:-$CFG/config.json}"
     local xray_protocols=$(get_xray_protocols)
     [[ -z "$xray_protocols" ]] && return 1
@@ -5022,7 +5118,7 @@ generate_xray_config() {
 
         # 检查是否为多端口数组
         if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
-            # 多端口模式：为每个端口创建临时单端口配置
+            # 多端口模式：直接传入每个端口的数据，不临时改写数据库。
             local port_count=$(echo "$cfg" | jq 'length')
             local i=0
             local port_success=0
@@ -5031,17 +5127,14 @@ generate_xray_config() {
                 local single_cfg=$(echo "$cfg" | jq ".[$i]")
                 local port=$(echo "$single_cfg" | jq -r '.port')
 
-                # 临时存储单端口配置
-                local tmp_protocol="${p}_port_${port}"
-                db_add "xray" "$tmp_protocol" "$single_cfg"
-
-                # 调用原有函数处理
-                if add_xray_inbound_v2 "$tmp_protocol"; then
+                if add_xray_inbound_v2 "$p" "$single_cfg"; then
                     ((port_success++))
+                elif [[ $? == 2 ]]; then
+                    ((port_success++))
+                else
+                    _err "入站 $p/$port 生成失败，取消整份配置"
+                    return 1
                 fi
-
-                # 清理临时配置
-                db_del "xray" "$tmp_protocol"
 
                 ((i++))
             done
@@ -5049,16 +5142,18 @@ generate_xray_config() {
             if [[ $port_success -gt 0 ]]; then
                 ((success_count++))
             else
-                _warn "协议 $p 配置生成失败，跳过"
-                failed_protocols+="$p "
+                _err "协议 $p 没有有效端口，取消整份配置"
+                return 1
             fi
         else
             # 单端口模式：使用原有逻辑
             if add_xray_inbound_v2 "$p"; then
                 ((success_count++))
+            elif [[ $? == 2 ]]; then
+                ((success_count++))
             else
-                _warn "协议 $p 配置生成失败，跳过"
-                failed_protocols+="$p "
+                _err "入站 $p 生成失败，取消整份配置"
+                return 1
             fi
         fi
     done
@@ -5155,8 +5250,10 @@ add_xray_inbound_v2() {
     local protocol=$1
     
     # 从数据库读取配置
-    local cfg=""
-    if db_exists "xray" "$protocol"; then
+    local cfg="${2:-}"
+    if [[ -n "$cfg" ]]; then
+        :
+    elif db_exists "xray" "$protocol"; then
         cfg=$(db_get "xray" "$protocol")
     else
         _err "协议 $protocol 在数据库中不存在 (xray 分类)"
@@ -5706,7 +5803,9 @@ add_xray_inbound_v2() {
                 ss_multi=$(echo "$cfg" | jq -r '.multi_user // false')
                 if [[ "$ss_multi" == true ]]; then
                     ss_clients=$(gen_xray_ss2022_clients "$base_protocol" "$port") || { rm -f "$tmp_inbound"; return 1; }
-                    [[ "$(echo "$ss_clients" | jq 'length')" -gt 0 ]] || { _err "SS2022 多用户端口不能停用全部用户"; rm -f "$tmp_inbound"; return 1; }
+                    # An empty SS2022 clients list would accept the server key.
+                    # Omit this listener until a user is enabled again.
+                    [[ "$(echo "$ss_clients" | jq 'length')" -gt 0 ]] || { rm -f "$tmp_inbound"; return 2; }
                 fi
             fi
             jq -n \
@@ -5863,24 +5962,35 @@ is_paused()       { [[ -f "$CFG/paused" ]]; }
 
 # 配置 DNS64 (纯 IPv6 环境)
 configure_dns64() {
-    # 检测 IPv4 网络是否可用
-    if ping -c 1 -W 2 8.8.8.8 &>/dev/null; then
-        return 0  # IPv4 正常，无需配置
-    fi
+    # DNS64 is opt-in; missing ping or filtered ICMP proves nothing about IPv4.
+    [[ "${VLESS_CONFIGURE_DNS64:-0}" == 1 ]] || return 0
+    command -v curl >/dev/null && command -v dig >/dev/null && command -v ip >/dev/null || return 1
+    curl -4 -fsS --connect-timeout 3 --max-time 5 https://api.ipify.org >/dev/null 2>&1 && return 0
+    ip -6 route show default 2>/dev/null | grep -q . || { _err "没有 IPv6 默认路由，未修改 DNS"; return 1; }
+    [[ ! -L /etc/resolv.conf ]] || { _err "系统托管 resolv.conf，请通过系统网络管理器配置 DNS64"; return 1; }
+    dig @2001:4860:4860::6464 ipv4only.arpa AAAA +short +time=2 +tries=1 2>/dev/null |
+        grep -q ':' || { _err "DNS64 不可达，未修改 DNS"; return 1; }
     
     _warn "检测到纯 IPv6 环境，准备配置 DNS64..."
     
     # 备份原有配置
-    if [[ -f /etc/resolv.conf ]] && [[ ! -f /etc/resolv.conf.bak ]]; then
-        cp /etc/resolv.conf /etc/resolv.conf.bak
-    fi
+    [[ -f /etc/resolv.conf ]] && cp -p /etc/resolv.conf /etc/resolv.conf.bak || return 1
     
     # 写入 DNS64 服务器
-    cat > /etc/resolv.conf << 'EOF'
+    if ! cat > /etc/resolv.conf << 'EOF'
 nameserver 2a00:1098:2b::1
 nameserver 2001:4860:4860::6464
 nameserver 2a00:1098:2c::1
 EOF
+    then
+        cp -p /etc/resolv.conf.bak /etc/resolv.conf || _err "DNS 恢复失败"
+        return 1
+    fi
+    if ! dig ipv4only.arpa AAAA +short +time=2 +tries=1 2>/dev/null | grep -q ':'; then
+        cp -p /etc/resolv.conf.bak /etc/resolv.conf
+        _err "DNS64 验证失败，已恢复原 DNS"
+        return 1
+    fi
     
     _ok "DNS64 配置完成 (Kasper Sky + Google DNS64 + Trex)"
 }
@@ -5932,7 +6042,7 @@ _install_optional_qrencode() {
 
 check_dependencies() {
     # 先配置 DNS64 (如果是纯 IPv6 环境)
-    configure_dns64
+    configure_dns64 || return 1
     
     local missing_deps=()
     local need_install=false
@@ -6101,41 +6211,26 @@ force_cleanup() {
 
 # 清理 Hysteria2/TUIC 端口跳跃 NAT 规则
 cleanup_hy2_nat_rules() {
-    # 清理 Hysteria2 端口跳跃规则
-    if db_exists "singbox" "hy2"; then
-        local port=$(db_get_field "singbox" "hy2" "port")
-        local hs=$(db_get_field "singbox" "hy2" "hop_start"); hs="${hs:-20000}"
-        local he=$(db_get_field "singbox" "hy2" "hop_end"); he="${he:-50000}"
-        [[ -n "$port" ]] && {
-            iptables -t nat -D PREROUTING -p udp --dport ${hs}:${he} -m comment --comment vless-hy2-hop -j REDIRECT --to-ports ${port} 2>/dev/null
-            iptables -t nat -D OUTPUT -p udp --dport ${hs}:${he} -m comment --comment vless-hy2-hop -j REDIRECT --to-ports ${port} 2>/dev/null
-            ip6tables -t nat -D PREROUTING -p udp --dport ${hs}:${he} -m comment --comment vless-hy2-hop -j REDIRECT --to-ports ${port} 2>/dev/null
-            ip6tables -t nat -D OUTPUT -p udp --dport ${hs}:${he} -m comment --comment vless-hy2-hop -j REDIRECT --to-ports ${port} 2>/dev/null
-            # 兼容清理由旧版本创建、尚未带 comment 的规则。
-            iptables -t nat -D PREROUTING -p udp --dport ${hs}:${he} -j REDIRECT --to-ports ${port} 2>/dev/null
-            iptables -t nat -D OUTPUT -p udp --dport ${hs}:${he} -j REDIRECT --to-ports ${port} 2>/dev/null
-            ip6tables -t nat -D PREROUTING -p udp --dport ${hs}:${he} -j REDIRECT --to-ports ${port} 2>/dev/null
-            ip6tables -t nat -D OUTPUT -p udp --dport ${hs}:${he} -j REDIRECT --to-ports ${port} 2>/dev/null
-        }
-    fi
-    # 清理 TUIC 端口跳跃规则
-    if db_exists "singbox" "tuic"; then
-        local port=$(db_get_field "singbox" "tuic" "port")
-        local hs=$(db_get_field "singbox" "tuic" "hop_start"); hs="${hs:-20000}"
-        local he=$(db_get_field "singbox" "tuic" "hop_end"); he="${he:-50000}"
-        [[ -n "$port" ]] && {
-            iptables -t nat -D PREROUTING -p udp --dport ${hs}:${he} -m comment --comment vless-tuic-hop -j REDIRECT --to-ports ${port} 2>/dev/null
-            iptables -t nat -D OUTPUT -p udp --dport ${hs}:${he} -m comment --comment vless-tuic-hop -j REDIRECT --to-ports ${port} 2>/dev/null
-            ip6tables -t nat -D PREROUTING -p udp --dport ${hs}:${he} -m comment --comment vless-tuic-hop -j REDIRECT --to-ports ${port} 2>/dev/null
-            ip6tables -t nat -D OUTPUT -p udp --dport ${hs}:${he} -m comment --comment vless-tuic-hop -j REDIRECT --to-ports ${port} 2>/dev/null
-            iptables -t nat -D PREROUTING -p udp --dport ${hs}:${he} -j REDIRECT --to-ports ${port} 2>/dev/null
-            iptables -t nat -D OUTPUT -p udp --dport ${hs}:${he} -j REDIRECT --to-ports ${port} 2>/dev/null
-            ip6tables -t nat -D PREROUTING -p udp --dport ${hs}:${he} -j REDIRECT --to-ports ${port} 2>/dev/null
-            ip6tables -t nat -D OUTPUT -p udp --dport ${hs}:${he} -j REDIRECT --to-ports ${port} 2>/dev/null
-        }
-    fi
-    # 不再扫描并删除系统中的其他 REDIRECT 规则。上面仅按数据库记录的
-    # 端口范围删除本脚本创建的 HY2/TUIC 规则。
+    local selected="${1:-}" selected_port="${2:-all}" saved="${3:-}" proto cfg row port hs he tool chain
+    for proto in hy2 tuic; do
+        [[ -z "$selected" || "$selected" == "$proto" ]] || continue
+        if [[ -n "$saved" ]]; then cfg="$saved"; else cfg=$(db_get singbox "$proto") || continue; fi
+        while IFS= read -r row; do
+            port=$(jq -r '.port // empty' <<< "$row")
+            [[ "$port" =~ ^[0-9]+$ ]] || continue
+            [[ "$selected_port" == all || "$selected_port" == "$port" ]] || continue
+            hs=$(jq -r '.hop_start // 20000' <<< "$row")
+            he=$(jq -r '.hop_end // 50000' <<< "$row")
+            [[ "$hs" =~ ^[0-9]+$ && "$he" =~ ^[0-9]+$ ]] || continue
+            for tool in iptables ip6tables; do
+                for chain in PREROUTING OUTPUT; do
+                    "$tool" -t nat -D "$chain" -p udp --dport "$hs:$he" -m comment --comment "vless-${proto}-hop" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+                    "$tool" -t nat -D "$chain" -p udp --dport "$hs:$he" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+                done
+            done
+        done < <(jq -c 'if type == "array" then .[] else . end' <<< "$cfg")
+    done
+    return 0
 }
 
 sync_time() {
@@ -9790,6 +9885,98 @@ _archive_paths_safe() {
     done <<<"$entries"
 }
 
+_replace_core_binary() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _replace_core_binary "$@"; return $?; fi
+    local name="$1" candidate="$2" assets="${3:-}" directory="${CORE_BIN_DIR:-/usr/local/bin}"
+    local binary="$directory/$name" config service backup staged asset failed='' running=false replaced=false
+    local snell=false proto row id item
+    local -a running_services=()
+    local asset_dir="${XRAY_ASSET_DIR:-/usr/local/share/xray}"
+    case "$name" in
+        xray) config="$CFG/config.json"; service=vless-reality ;;
+        sing-box) config="$CFG/singbox.json"; service=vless-singbox ;;
+        snell-server-v5|snell-server-v6)
+            snell=true; proto="snell-${name##*-}"; config="$CFG/$proto.conf"; service="vless-$proto" ;;
+        *) return 1 ;;
+    esac
+    if [[ "$snell" == true ]]; then
+        snell_binary_works "$candidate" || { _err "新核心无法执行，未更换原核心"; return 1; }
+    else "$candidate" version >/dev/null 2>&1 || { _err "新核心无法执行，未更换原核心"; return 1; }; fi
+    if [[ -f "$config" && "$snell" != true ]]; then
+        if [[ "$name" == xray ]]; then
+            XRAY_LOCATION_ASSET="${assets:-$asset_dir}" "$candidate" run -test -c "$config" >/dev/null 2>&1 || return 1
+        else ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true "$candidate" check -c "$config" >/dev/null 2>&1 || return 1; fi
+    fi
+    if [[ "$snell" == true ]]; then _snell_sync_traffic || return 1
+    elif [[ "$name" == xray ]]; then _flush_core_traffic xray || return 1
+    else _flush_core_traffic singbox || return 1; fi
+    mkdir -p "$CFG/backups/core-updates" "$directory" || return 1
+    backup=$(mktemp -d "$CFG/backups/core-updates/${name}.XXXXXX") || return 1
+    chmod 700 "$backup"
+    [[ ! -f "$binary" ]] || cp -p "$binary" "$backup/binary" || return 1
+    [[ ! -f "$config" ]] || cp -p "$config" "$backup/config.json" || return 1
+    if [[ "$name" == xray && -n "$assets" ]]; then
+        mkdir -p "$backup/assets" "$asset_dir" || return 1
+        for asset in "$assets"/*.dat; do
+            [[ -f "$asset" ]] || { _err "Xray 下载包缺少数据文件"; return 1; }
+            [[ ! -f "$asset_dir/${asset##*/}" ]] || cp -p "$asset_dir/${asset##*/}" "$backup/assets/" || return 1
+        done
+    fi
+    if [[ "$snell" == true ]]; then
+        SNELL_RAW_SERVICE=1 svc status "$service" >/dev/null 2>&1 && running_services+=("$service")
+        svc status "${service}-shadowtls-backend" >/dev/null 2>&1 && running_services+=("${service}-shadowtls-backend")
+        if _snell_managed "$proto"; then
+            while IFS= read -r row; do
+                id=$(jq -r '.snell_id' <<< "$row")
+                [[ "$id" =~ ^[0-9a-f]{24}$ ]] || return 1
+                svc status "vless-snellu-$id" >/dev/null 2>&1 && running_services+=("vless-snellu-$id")
+            done <<< "$(_snell_rows "$proto")"
+        fi
+    elif svc status "$service" >/dev/null 2>&1; then running_services+=("$service"); fi
+    [[ ${#running_services[@]} == 0 ]] || running=true
+    staged=$(mktemp "$directory/.${name}.new.XXXXXX") || return 1
+    if install -m 755 "$candidate" "$staged" && mv "$staged" "$binary"; then replaced=true; else failed='核心替换失败'; fi
+    rm -f "$staged"
+    if [[ -z "$failed" && "$name" == xray && -n "$assets" ]]; then
+        for asset in "$assets"/*.dat; do
+            staged=$(mktemp "$asset_dir/.asset.XXXXXX") || { failed='数据文件暂存失败'; break; }
+            if ! cp -p "$asset" "$staged" || ! mv "$staged" "$asset_dir/${asset##*/}"; then
+                failed='数据文件安装失败'; rm -f "$staged"; break
+            fi
+        done
+        [[ -n "$failed" ]] || fix_selinux_context || failed='核心文件权限设置失败'
+    fi
+    if [[ -z "$failed" && "$running" == true ]]; then
+        for item in "${running_services[@]}"; do
+            SNELL_RAW_SERVICE=1 svc restart "$item" >/dev/null 2>&1 || { failed='新核心重启失败'; break; }
+            sleep "${CORE_UPDATE_HEALTH_DELAY:-1}"
+            SNELL_RAW_SERVICE=1 svc status "$item" >/dev/null 2>&1 || { failed='新核心健康检查失败'; break; }
+        done
+    fi
+    if [[ -z "$failed" ]]; then _ok "核心已安全更新；备份: $backup"; return 0; fi
+    if [[ "$replaced" == true ]]; then
+        if [[ -f "$backup/binary" ]]; then
+            staged=$(mktemp "$directory/.${name}.restore.XXXXXX") &&
+                cp -p "$backup/binary" "$staged" && mv "$staged" "$binary" || _err "核心回滚失败: $backup"
+        else rm -f "$binary"; fi
+        if [[ "$name" == xray && -n "$assets" ]]; then
+            for asset in "$assets"/*.dat; do
+                if [[ -f "$backup/assets/${asset##*/}" ]]; then
+                    cp -p "$backup/assets/${asset##*/}" "$asset_dir/${asset##*/}" || _err "数据文件回滚失败: $backup"
+                else rm -f "$asset_dir/${asset##*/}"; fi
+            done
+        fi
+    fi
+    [[ ! -f "$backup/config.json" ]] || cp -p "$backup/config.json" "$config" || _err "配置回滚失败: $backup"
+    if [[ "$running" == true ]]; then
+        for item in "${running_services[@]}"; do
+            SNELL_RAW_SERVICE=1 svc restart "$item" >/dev/null 2>&1 && SNELL_RAW_SERVICE=1 svc status "$item" >/dev/null 2>&1 || _err "服务恢复失败: $backup"
+        done
+    fi
+    _err "$failed，已尝试恢复；备份: $backup"
+    return 1
+}
+
 # 通用二进制下载安装函数
 _install_binary() {
     local name="$1" repo="$2" url_pattern="$3" install_kind="$4"
@@ -9877,10 +10064,7 @@ _install_binary() {
         xray)
             _archive_paths_safe "$tmp/pkg" zip &&
             unzip -oq "$tmp/pkg" -d "$tmp/" &&
-            install -m 755 "$tmp/xray" /usr/local/bin/xray &&
-            mkdir -p /usr/local/share/xray &&
-            cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null &&
-            fix_selinux_context && install_ok=true
+            _replace_core_binary xray "$tmp/xray" "$tmp" && install_ok=true
             ;;
         singbox)
             _archive_paths_safe "$tmp/pkg" tar.gz &&
@@ -9888,7 +10072,7 @@ _install_binary() {
             local singbox_bin
             singbox_bin=$(find "$tmp" -name sing-box -type f -print -quit) &&
             [[ -n "$singbox_bin" ]] &&
-            install -m 755 "$singbox_bin" /usr/local/bin/sing-box &&
+            _replace_core_binary sing-box "$singbox_bin" &&
             install_ok=true
             ;;
         grpcurl)
@@ -10349,81 +10533,7 @@ _update_core_to_version() {
         _update_singbox_preserving_stats "$channel" "$version"
         return $?
     fi
-
-    local binary_name
-    case "$core" in
-        Xray) binary_name="xray" ;;
-        Sing-box) binary_name="sing-box" ;;
-        "Snell v5") binary_name="snell-server-v5" ;;
-        *) _err "未知核心: $core"; return 1 ;;
-    esac
-
-    # 备份当前版本
-    local backup_file
-    if ! backup_file=$(_backup_core_binary "$binary_name"); then
-        # 备份失败但继续更新（可能是首次安装）
-        _warn "备份失败，继续更新（无法回滚）"
-        backup_file=""
-    fi
-
-    local need_restart=false
-    if svc status "$service" 2>/dev/null; then
-        need_restart=true
-        if ! svc stop "$service" 2>/dev/null; then
-            _err "停止服务失败，为避免风险已终止更新"
-            return 1
-        fi
-        _info "服务已停止"
-    fi
-
-    # 执行更新
-    if "$install_func" "$channel" "true" "$version"; then
-        _ok "${core} 内核已更新 (v${version})"
-
-        # 重启服务
-        if [[ "$need_restart" == "true" ]]; then
-            _info "重新启动服务..."
-            if ! svc start "$service" 2>/dev/null; then
-                _err "服务启动失败，请手动检查: svc start $service"
-                return 1
-            fi
-            _ok "服务已启动"
-        fi
-
-        # 展示变更日志
-        case "$core" in
-            Xray) _show_changelog_summary "XTLS/Xray-core" "$version" 8 ;;
-            Sing-box) _show_changelog_summary "SagerNet/sing-box" "$version" 8 ;;
-            "Snell v5") _show_changelog_summary "surge-networks/snell" "$version" 8 ;;
-        esac
-
-        # 清理旧备份 (保留最近 3 个)
-        if [[ -n "$backup_file" ]]; then
-            local backup_dir=$(dirname "$backup_file")
-            ls -t "$backup_dir/${binary_name}_"* 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null
-        fi
-        return 0
-    fi
-
-    # 更新失败，尝试回滚
-    _err "${core} 内核更新失败"
-    if [[ -n "$backup_file" ]]; then
-        _warn "尝试回滚到之前版本..."
-        if ! _rollback_core_binary "$binary_name" "$backup_file"; then
-            _err "回滚失败，请手动恢复: cp $backup_file /usr/local/bin/$binary_name"
-        fi
-    fi
-
-    # 尝试恢复服务
-    if [[ "$need_restart" == "true" ]]; then
-        _warn "尝试恢复服务..."
-        if svc start "$service" 2>/dev/null; then
-            _ok "服务已恢复"
-        else
-            _err "服务恢复失败，请手动启动: svc start $service"
-        fi
-    fi
-    return 1
+    "$install_func" "$channel" true "$version"
 }
 
 # 后台异步更新核心版本信息（用于版本管理菜单）
@@ -10714,16 +10824,6 @@ update_xray_core() {
         is_new_install=true
     fi
 
-    local need_restart=false service_running=false
-    if svc status vless-reality 2>/dev/null; then
-        service_running=true
-        need_restart=true
-        _info "停止 vless-reality 服务..."
-        if ! svc stop vless-reality 2>/dev/null; then
-            _warn "停止服务失败，继续更新"
-        fi
-    fi
-
     if install_xray "$channel" "true"; then
         _ok "Xray 内核已更新"
         local new_version
@@ -10731,27 +10831,10 @@ update_xray_core() {
         if [[ -n "$new_version" && "$is_new_install" != "true" ]]; then
             _show_changelog_summary "XTLS/Xray-core" "$new_version" 10
         fi
-        if [[ "$need_restart" == "true" ]]; then
-            _info "重新启动 vless-reality 服务..."
-            if svc start vless-reality 2>/dev/null; then
-                _ok "服务已启动"
-            else
-                _err "服务启动失败，请手动检查配置: svc start vless-reality"
-                return 1
-            fi
-        fi
         return 0
     fi
 
     _err "Xray 内核更新失败"
-    if [[ "$service_running" == "true" ]]; then
-        _warn "尝试恢复服务..."
-        if svc start vless-reality 2>/dev/null; then
-            _ok "服务已恢复"
-        else
-            _err "服务恢复失败，请手动检查: svc start vless-reality"
-        fi
-    fi
     return 1
 }
 
@@ -10770,16 +10853,6 @@ update_singbox_core() {
         is_new_install=true
     fi
 
-    local need_restart=false service_running=false
-    if svc status vless-singbox 2>/dev/null; then
-        service_running=true
-        need_restart=true
-        _info "停止 vless-singbox 服务..."
-        if ! svc stop vless-singbox 2>/dev/null; then
-            _warn "停止服务失败，继续更新"
-        fi
-    fi
-
     if install_singbox "$channel" "true"; then
         _ok "Sing-box 内核已更新"
         local new_version
@@ -10787,27 +10860,10 @@ update_singbox_core() {
         if [[ -n "$new_version" && "$is_new_install" != "true" ]]; then
             _show_changelog_summary "SagerNet/sing-box" "$new_version" 10
         fi
-        if [[ "$need_restart" == "true" ]]; then
-            _info "重新启动 vless-singbox 服务..."
-            if svc start vless-singbox 2>/dev/null; then
-                _ok "服务已启动"
-            else
-                _err "服务启动失败，请手动检查配置: svc start vless-singbox"
-                return 1
-            fi
-        fi
         return 0
     fi
 
     _err "Sing-box 内核更新失败"
-    if [[ "$service_running" == "true" ]]; then
-        _warn "尝试恢复服务..."
-        if svc start vless-singbox 2>/dev/null; then
-            _ok "服务已恢复"
-        else
-            _err "服务恢复失败，请手动检查: svc start vless-singbox"
-        fi
-    fi
     return 1
 }
 
@@ -10815,98 +10871,16 @@ update_snell_v5_core() {
     local channel="${1:-stable}"
     _check_core_update_deps || return 1
     _confirm_core_update "Snell v5" "$channel" || return 1
-
-    local is_new_install=false
-    if ! check_cmd snell-server-v5; then
-        _warn "未检测到 Snell v5，将执行安装"
-        is_new_install=true
-    fi
-
-    local need_restart=false service_running=false
-    if svc status vless-snell-v5 2>/dev/null; then
-        service_running=true
-        need_restart=true
-        _info "停止 vless-snell-v5 服务..."
-        if ! svc stop vless-snell-v5 2>/dev/null; then
-            _warn "停止服务失败，继续更新"
-        fi
-    fi
-
-    if install_snell_v5 "$channel" "true"; then
-        _ok "Snell v5 内核已更新"
-        local new_version
-        new_version=$(_get_snell_v5_version)
-        if [[ -n "$new_version" && "$new_version" != "未安装" && "$new_version" != "未知" && "$is_new_install" != "true" ]]; then
-            _show_changelog_summary "surge-networks/snell" "$new_version" 10
-        fi
-        if [[ "$need_restart" == "true" ]]; then
-            _info "重新启动 vless-snell-v5 服务..."
-            if svc start vless-snell-v5 2>/dev/null; then
-                _ok "服务已启动"
-            else
-                _err "服务启动失败，请手动检查配置: svc start vless-snell-v5"
-                return 1
-            fi
-        fi
-        return 0
-    fi
-
-    _err "Snell v5 内核更新失败"
-    if [[ "$service_running" == "true" ]]; then
-        _warn "尝试恢复服务..."
-        if svc start vless-snell-v5 2>/dev/null; then
-            _ok "服务已恢复"
-        else
-            _err "服务恢复失败，请手动检查: svc start vless-snell-v5"
-        fi
-    fi
-    return 1
+    install_snell_v5 "$channel" true
 }
 
 update_snell_v6_core() {
-    local version="${1:-}"
-    [[ -z "$version" ]] && version=$(_get_snell_v6_latest_version "true")
-    local channel="prerelease"
-    [[ "$version" =~ ^6\.[0-9]+\.[0-9]+$ ]] && channel="stable"
+    local version="${1:-}" channel=prerelease
+    [[ -n "$version" ]] || version=$(_get_snell_v6_latest_version true)
+    [[ ! "$version" =~ ^6\.[0-9]+\.[0-9]+$ ]] || channel=stable
     _check_core_update_deps || return 1
     _confirm_core_update_version "Snell v6" "$channel" "$version" || return 1
-
-    if [[ ! "$version" =~ ^6\.[0-9]+\.[0-9]+([A-Za-z][A-Za-z0-9._-]*)?$ ]]; then
-        _err "无效的 Snell v6 版本号：$version"
-        return 1
-    fi
-
-    local backup_file=""
-    backup_file=$(_backup_core_binary "snell-server-v6") || backup_file=""
-
-    local was_running=false
-    if svc status vless-snell-v6 2>/dev/null; then
-        was_running=true
-        _info "停止 vless-snell-v6 服务..."
-        svc stop vless-snell-v6 2>/dev/null || { _err "停止服务失败"; return 1; }
-    fi
-
-    rm -f /usr/local/bin/snell-server-v6
-    if install_snell_v6 "$version"; then
-        _ok "Snell v6 内核已更新至 v${version}"
-        if [[ "$was_running" == "true" ]]; then
-            if svc start vless-snell-v6 2>/dev/null; then
-                _ok "vless-snell-v6 服务已启动"
-            else
-                _err "新版本安装成功，但服务启动失败"
-                return 1
-            fi
-        fi
-        return 0
-    fi
-
-    _err "Snell v6 内核更新失败"
-    if [[ -n "$backup_file" && -f "$backup_file" ]]; then
-        _warn "正在回滚旧版本..."
-        cp "$backup_file" /usr/local/bin/snell-server-v6 && chmod 755 /usr/local/bin/snell-server-v6
-        [[ "$was_running" == "true" ]] && svc start vless-snell-v6 2>/dev/null || true
-    fi
-    return 1
+    install_snell_v6 "$version"
 }
 
 update_snell_v6_core_custom() {
@@ -11122,129 +11096,102 @@ _update_core_with_channel_select() {
 }
 
 _restore_core_switch_backup() {
-    local backup_dir="$1"
-    [[ -f "$backup_dir/db.json" ]] || return 1
-    cp -f "$backup_dir/db.json" "$DB_FILE" || return 1
-    if [[ -f "$backup_dir/config.json" ]]; then
-        cp -f "$backup_dir/config.json" "$CFG/config.json"
-    else
-        rm -f "$CFG/config.json"
-    fi
-    if [[ -f "$backup_dir/singbox.json" ]]; then
-        cp -f "$backup_dir/singbox.json" "$CFG/singbox.json"
-    else
-        rm -f "$CFG/singbox.json"
-    fi
-    create_server_scripts
-    start_services >/dev/null 2>&1 || true
+    local backup_dir="$1" core file service failed=0
+    _restore_db_backup "$backup_dir/db.json" || return 1
+    for core in xray singbox; do
+        file=config.json; service=vless-reality
+        [[ "$core" != singbox ]] || { file=singbox.json; service=vless-singbox; }
+        if [[ -f "$backup_dir/$core/active.json" ]]; then
+            cp -p "$backup_dir/$core/active.json" "$CFG/$file" || failed=1
+        else rm -f "$CFG/$file" || failed=1; fi
+        if [[ -f "$backup_dir/$core/enabled" ]]; then
+            svc enable "$service" >/dev/null 2>&1 || failed=1
+        else svc disable "$service" >/dev/null 2>&1 || true; fi
+        if [[ -f "$backup_dir/$core/running" ]]; then
+            svc restart "$service" >/dev/null 2>&1 && svc status "$service" >/dev/null 2>&1 || failed=1
+        else svc stop "$service" >/dev/null 2>&1 || true; fi
+    done
+    return "$failed"
 }
 
 switch_protocol_core() {
-    local protocol="$1" target_core="$2"
-    local source_core
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock switch_protocol_core "$@"; return $?; fi
+    local protocol="$1" target_core="$2" source_core cfg
     source_core=$(get_protocol_core "$protocol")
-    [[ "$source_core" == "$target_core" ]] && { _warn "$protocol 已由 $target_core 运行"; return 1; }
-    protocol_supports_core "$protocol" "$target_core" || { _err "$protocol 不支持 $target_core"; return 1; }
-
-    local cfg
-    cfg=$(db_get "$source_core" "$protocol") || { _err "无法读取 $protocol 配置"; return 1; }
-    if [[ "$protocol" == "vless" ]] && echo "$cfg" | jq -e '
+    [[ "$source_core" != "$target_core" ]] || { _warn "$protocol 已由 $target_core 运行"; return 1; }
+    protocol_supports_core "$protocol" "$target_core" || return 1
+    cfg=$(db_get "$source_core" "$protocol") || return 1
+    if [[ "$protocol" == vless ]] && jq -e '
         if type == "array" then any(.[]; (.security_mode // "reality") != "reality")
-        else (.security_mode // "reality") != "reality" end' >/dev/null 2>&1; then
-        _err "VLESS Encryption 暂不支持切换到 Sing-box"
-        return 1
+        else (.security_mode // "reality") != "reality" end' <<< "$cfg" >/dev/null; then
+        _err "VLESS Encryption 暂不支持切换到 Sing-box"; return 1
     fi
-    if [[ "$target_core" == "singbox" && "$protocol" =~ ^ss ]] && \
-       echo "$cfg" | jq -e '
-           def has_custom_users:
-               . as $cfg |
-               any(($cfg.users // [])[]?;
-                   .name != "default" or .uuid != ($cfg.password // $cfg.uuid));
-           if type == "array" then any(.[]; has_custom_users) else has_custom_users end
-       ' >/dev/null 2>&1; then
-        _err "多用户 Shadowsocks 暂不支持切换到 Sing-box"
-        return 1
+    if [[ "$target_core" == singbox && "$protocol" =~ ^ss ]] && jq -e '
+        def custom: . as $c | .multi_user == true or any(.users[]?;
+            .name != "default" or .uuid != ($c.password // $c.uuid));
+        if type == "array" then any(.[]; custom) else custom end' <<< "$cfg" >/dev/null; then
+        _err "多用户 Shadowsocks 暂不支持切换到 Sing-box"; return 1
     fi
-
+    db_exists "$target_core" "$protocol" && { _err "目标核心已有此协议，拒绝覆盖"; return 1; }
     case "$target_core" in
-        xray) install_xray || { _err "Xray 安装失败，未执行切换"; return 1; } ;;
-        singbox) install_singbox || { _err "Sing-box 安装失败，未执行切换"; return 1; } ;;
-        *) _err "不支持的目标内核: $target_core"; return 1 ;;
+        xray) install_xray || return 1 ;;
+        singbox) install_singbox || return 1 ;;
+        *) return 1 ;;
     esac
-
-    local backup_root="$CFG/backups/core-switch"
-    local timestamp backup_dir
-    timestamp=$(date '+%Y%m%d_%H%M%S')
-    backup_dir="$backup_root/${protocol}_${source_core}_to_${target_core}_${timestamp}"
-    mkdir -p "$backup_dir" || return 1
-    cp -f "$DB_FILE" "$backup_dir/db.json" || return 1
-    [[ -f "$CFG/config.json" ]] && cp -f "$CFG/config.json" "$backup_dir/config.json"
-    [[ -f "$CFG/singbox.json" ]] && cp -f "$CFG/singbox.json" "$backup_dir/singbox.json"
-
-    _info "迁移数据库记录: $source_core → $target_core"
-    if ! _db_apply --arg from "$source_core" --arg to "$target_core" --arg p "$protocol" '
-        .[$to][$p] = .[$from][$p] | del(.[$from][$p])
-        | .port_routing = [(.port_routing // [])[] |
-            if .core == $from and .protocol == $p then .core = $to else . end]
-    '; then
-        _err "数据库迁移失败"
-        return 1
-    fi
-
-    local failed=""
-    local xray_remaining singbox_remaining
-    xray_remaining=$(get_xray_protocols)
-    singbox_remaining=$(get_singbox_protocols)
-
-    if [[ -n "$xray_remaining" ]]; then
-        generate_xray_config || failed="Xray 配置生成失败"
-        if [[ -z "$failed" ]] && ! /usr/local/bin/xray run -test -c "$CFG/config.json" >/dev/null 2>&1; then
-            failed="Xray 配置校验失败"
-        fi
-    else
-        rm -f "$CFG/config.json"
-        svc stop vless-reality >/dev/null 2>&1 || true
-        svc disable vless-reality >/dev/null 2>&1 || true
-    fi
-    if [[ -z "$failed" && -n "$singbox_remaining" ]]; then
-        generate_singbox_config || failed="Sing-box 配置生成失败"
-        if [[ -z "$failed" ]] && ! /usr/local/bin/sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
-            failed="Sing-box 配置校验失败"
-        fi
-    elif [[ -z "$singbox_remaining" ]]; then
-        rm -f "$CFG/singbox.json"
-        svc stop vless-singbox >/dev/null 2>&1 || true
-        svc disable vless-singbox >/dev/null 2>&1 || true
-    fi
-
+    _flush_core_traffic xray && _flush_core_traffic singbox || return 1
+    local backup_dir core removed remaining service action failed='' saved allowed
+    mkdir -p "$CFG/backups/core-switch" || return 1
+    backup_dir=$(mktemp -d "$CFG/backups/core-switch/switch.XXXXXX") || return 1
+    chmod 700 "$backup_dir"
+    cp -p "$DB_FILE" "$backup_dir/db.json" || return 1
+    for core in xray singbox; do
+        saved=$(_user_change_begin "$core") || return 1
+        mv "$saved" "$backup_dir/$core" || return 1
+    done
+    removed=$(jq -c '[if type == "array" then .[] else . end | .port]' <<< "$cfg") || return 1
+    _db_apply --arg from "$source_core" --arg to "$target_core" --arg p "$protocol" '
+        .[$to][$p] = .[$from][$p] | del(.[$from][$p]) |
+        .port_routing = [(.port_routing // [])[] |
+            if .core == $from and .protocol == $p then .core = $to else . end]' || return 1
+    # Validate both candidates before changing either service.
+    for core in "$target_core" "$source_core"; do
+        if [[ "$core" == xray ]]; then remaining=$(get_xray_protocols); else remaining=$(get_singbox_protocols); fi
+        [[ -n "$remaining" ]] || continue
+        allowed='[]'
+        [[ "$core" != "$source_core" ]] || allowed="$removed"
+        _user_change_apply "$core" "$backup_dir/$core" false "$allowed" || { failed='候选配置应用失败'; break; }
+    done
     if [[ -z "$failed" ]]; then
-        create_server_scripts
-        if [[ "$target_core" == "singbox" ]]; then
-            create_singbox_service
-        else
-            create_service "$protocol"
-        fi
-        start_services || failed="目标内核服务启动失败"
+        if [[ "$target_core" == singbox ]]; then create_singbox_service || failed='服务创建失败'; else create_service "$protocol" || failed='服务创建失败'; fi
     fi
-
-    local target_service="vless-reality"
-    [[ "$target_core" == "singbox" ]] && target_service="vless-singbox"
-    if [[ -z "$failed" ]] && ! svc status "$target_service" >/dev/null 2>&1; then
-        failed="目标内核服务状态异常"
+    if [[ -z "$failed" ]]; then
+        for core in "$source_core" "$target_core"; do
+            service=vless-reality
+            [[ "$core" != singbox ]] || service=vless-singbox
+            if [[ "$core" == xray ]]; then remaining=$(get_xray_protocols); else remaining=$(get_singbox_protocols); fi
+            if [[ -z "$remaining" ]]; then
+                if [[ -f "$backup_dir/$core/running" ]]; then svc stop "$service" || { failed='原核心停止失败'; break; }; fi
+                svc disable "$service" || { failed='取消开机启动失败'; break; }
+                if [[ "$core" == xray ]]; then rm -f "$CFG/config.json"; else rm -f "$CFG/singbox.json"; fi
+            elif [[ -f "$backup_dir/$core/running" || ( "$core" == "$target_core" && -f "$backup_dir/$source_core/running" ) ]]; then
+                action=start
+                [[ ! -f "$backup_dir/$core/running" ]] || action=restart
+                svc "$action" "$service" || { failed='核心启动失败'; break; }
+                sleep "${USER_CHANGE_HEALTH_DELAY:-1}"
+                svc status "$service" || { failed='核心健康检查失败'; break; }
+            fi
+            if [[ "$core" == "$target_core" && -f "$backup_dir/$source_core/enabled" ]]; then
+                svc enable "$service" || { failed='目标开机启动设置失败'; break; }
+            fi
+        done
     fi
-
     if [[ -n "$failed" ]]; then
-        _err "$failed，正在自动回滚..."
-        _restore_core_switch_backup "$backup_dir"
-        _warn "已恢复 $protocol 的 $source_core 配置"
+        _restore_core_switch_backup "$backup_dir" || _err "切换回滚失败: $backup_dir"
+        _err "$failed，已尝试恢复；备份: $backup_dir"
         return 1
     fi
-
-    [[ -f "$CFG/sub.info" ]] && generate_sub_files
-    _ok "$(get_protocol_name "$protocol") 内核切换完成: $source_core → $target_core"
-    _ok "用户、流量、分流、TG 绑定和订阅配置已保留"
-    echo -e "  ${D}回滚备份: $backup_dir${NC}"
-    return 0
+    [[ ! -f "$CFG/sub.info" ]] || generate_sub_files || _warn "订阅更新失败，请重试"
+    _ok "协议已切换: $source_core → $target_core；备份: $backup_dir"
 }
 
 protocol_core_switch_menu() {
@@ -11559,8 +11506,12 @@ _build_singbox_ruleset_defs() {
 
 # 生成 Sing-box 统一配置（所有选用 Sing-box 的协议共用一个进程）
 generate_singbox_config() {
+    if [[ -z "${SINGBOX_CONFIG_OUTPUT:-}" ]]; then _rebuild_core_config singbox false; else _render_singbox_config; fi
+}
+
+_render_singbox_config() {
     local singbox_output_file="${SINGBOX_CONFIG_OUTPUT:-$CFG/singbox.json}"
-    _ensure_singbox_default_users
+    _ensure_singbox_default_users || return 1
     local singbox_protocols=$(db_list_protocols "singbox")
     [[ -z "$singbox_protocols" ]] && return 1
     
@@ -11939,21 +11890,20 @@ generate_singbox_config() {
     for proto in $singbox_protocols; do
         local protocol_cfg
         protocol_cfg=$(db_get "singbox" "$proto")
-        [[ -z "$protocol_cfg" ]] && continue
+        [[ -n "$protocol_cfg" ]] || return 1
 
         # 数据库兼容单对象与多端口数组，每个实例生成一个独立 inbound。
         while IFS= read -r cfg; do
         [[ -z "$cfg" ]] && continue
         
         local port=$(echo "$cfg" | jq -r '.port // empty')
-        [[ -z "$port" ]] && continue
-        
+        [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) || return 1
         local inbound=""
         
         case "$proto" in
             vless)
                 local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
-                [[ "$security_mode" != "reality" ]] && { _warn "Sing-box 暂不接管 VLESS Encryption，已跳过"; continue; }
+                [[ "$security_mode" != "reality" ]] && { _err "Sing-box 不支持此 VLESS 模式，取消整份配置"; return 1; }
                 local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
                 local private_key=$(echo "$cfg" | jq -r '.private_key // empty')
                 local short_id=$(echo "$cfg" | jq -r '.short_id // empty')
@@ -12108,7 +12058,7 @@ generate_singbox_config() {
                 local sni=$(echo "$cfg" | jq -r '.sni // "www.bing.com"')
                 local cert_path="$CFG/certs/server.crt"
                 local key_path="$CFG/certs/server.key"
-                [[ ! -f "$cert_path" || ! -f "$key_path" ]] && continue
+                [[ -f "$cert_path" && -f "$key_path" ]] || return 1
 
                 # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
                 local users_json="[]"
@@ -12146,6 +12096,9 @@ generate_singbox_config() {
         if [[ -n "$inbound" ]]; then
             inbounds=$(echo "$inbounds" | jq --argjson ib "$inbound" '. += [$ib]')
             ((success_count++))
+        else
+            _err "入站 $proto/$port 生成失败，取消整份配置"
+            return 1
         fi
         done < <(echo "$protocol_cfg" | jq -c 'if type == "array" then .[] else . end')
     done
@@ -12518,28 +12471,18 @@ install_snell_v5() {
         return 1
     fi
 
-    if ! install -m 755 \
-        "$tmp/snell-server" \
-        /usr/local/bin/snell-server-v5; then
-        rm -rf "$tmp"
-        _err "Snell v5 二进制安装失败"
-        return 1
-    fi
-
-    if ! prepare_snell_binary /usr/local/bin/snell-server-v5; then
-        _snell_alpine_diagnostics /usr/local/bin/snell-server-v5
+    chmod 755 "$tmp/snell-server" || { rm -rf "$tmp"; return 1; }
+    if ! prepare_snell_binary "$tmp/snell-server" || ! snell_binary_works "$tmp/snell-server"; then
+        _snell_alpine_diagnostics "$tmp/snell-server"
         rm -rf "$tmp"
         _err "Snell v5 Alpine 兼容处理失败"
         return 1
     fi
 
+    _replace_core_binary snell-server-v5 "$tmp/snell-server"
+    local rc=$?
     rm -rf "$tmp"
-
-    if [[ ! -x /usr/local/bin/snell-server-v5 ]] || ! snell_binary_works /usr/local/bin/snell-server-v5; then
-        _snell_alpine_diagnostics /usr/local/bin/snell-server-v5
-        _err "Snell v5 安装验证失败"
-        return 1
-    fi
+    [[ "$rc" == 0 ]] || return "$rc"
 
     _ok "Snell v5 v${version} 已安装"
     return 0
@@ -12611,8 +12554,10 @@ install_snell_v6() {
         return 1
     fi
 
-    install -m 755 "$staged" "$bin" || { rm -rf "$tmp"; _err "Snell v6 二进制安装失败"; return 1; }
+    _replace_core_binary snell-server-v6 "$staged"
+    local rc=$?
     rm -rf "$tmp"
+    [[ "$rc" == 0 ]] || return "$rc"
 
     [[ -x "$bin" ]] || { _err "Snell v6 安装验证失败"; return 1; }
     if ! _save_snell_v6_installed_version "$version"; then
@@ -13660,6 +13605,11 @@ log "INFO: Watchdog 启动"
 while true; do
     for svc_info in $(get_all_services); do
         IFS=':' read -r svc_name proc_name <<< "$svc_info"
+        [[ ! -f "$CFG/paused" && ! -f "$CFG/${svc_name}.paused" ]] || continue
+        if command -v systemctl >/dev/null 2>&1; then
+            state=$(systemctl is-active "$svc_name" 2>/dev/null)
+            [[ "$state" != inactive && "$state" != unknown ]] || continue
+        fi
         # 多种方式检测进程，兼容精简 Alpine。
         if ! process_running "$proc_name"; then
             log "CRITICAL: $proc_name 进程不存在，尝试重启 $svc_name..."
@@ -13687,22 +13637,19 @@ if ! command -v iptables &>/dev/null; then
 fi
 
 # 从数据库读取配置
-port=$(jq -r '.singbox.hy2.port // empty' "$DB_FILE" 2>/dev/null)
-hop_enable=$(jq -r '.singbox.hy2.hop_enable // empty' "$DB_FILE" 2>/dev/null)
-hop_start=$(jq -r '.singbox.hy2.hop_start // empty' "$DB_FILE" 2>/dev/null)
-hop_end=$(jq -r '.singbox.hy2.hop_end // empty' "$DB_FILE" 2>/dev/null)
+while IFS='|' read -r port hop_enable hop_start hop_end; do
 
-[[ -z "$port" ]] && exit 0
+[[ -z "$port" ]] && continue
 
 hop_start="${hop_start:-20000}"
 hop_end="${hop_end:-50000}"
 
 if ! [[ "$port" =~ ^[0-9]+$ && "$hop_start" =~ ^[0-9]+$ && "$hop_end" =~ ^[0-9]+$ ]]; then
-  exit 0
+  continue
 fi
 port=$((10#$port)); hop_start=$((10#$hop_start)); hop_end=$((10#$hop_end))
 if (( port < 1 || port > 65535 || hop_start < 1 || hop_end > 65535 || hop_start >= hop_end )); then
-  exit 0
+  continue
 fi
 
 # 清理旧规则 (IPv4)
@@ -13714,7 +13661,7 @@ ip6tables -t nat -D OUTPUT -p udp --dport ${hop_start}:${hop_end} -m comment --c
 ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null
 ip6tables -t nat -D OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null
 
-[[ "${hop_enable:-0}" != "1" ]] && exit 0
+[[ "${hop_enable:-0}" != "1" ]] && continue
 
 # 添加规则 (IPv4)
 iptables -t nat -C PREROUTING -p udp --dport ${hop_start}:${hop_end} -m comment --comment vless-hy2-hop -j REDIRECT --to-ports $port 2>/dev/null \
@@ -13727,6 +13674,9 @@ ip6tables -t nat -C PREROUTING -p udp --dport ${hop_start}:${hop_end} -m comment
   || ip6tables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -m comment --comment vless-hy2-hop -j REDIRECT --to-ports $port
 ip6tables -t nat -C OUTPUT -p udp --dport ${hop_start}:${hop_end} -m comment --comment vless-hy2-hop -j REDIRECT --to-ports $port 2>/dev/null \
   || ip6tables -t nat -A OUTPUT -p udp --dport ${hop_start}:${hop_end} -m comment --comment vless-hy2-hop -j REDIRECT --to-ports $port
+done < <(jq -r '.singbox.hy2 // empty | (if type == "array" then .[] else . end) |
+    [.port, (.hop_enable // 0), (.hop_start // 20000), (.hop_end // 50000)] | join("|")' "$DB_FILE")
+exit 0
 EOFSCRIPT
     fi
 
@@ -13746,22 +13696,19 @@ if ! command -v iptables &>/dev/null; then
 fi
 
 # 从数据库读取配置
-port=$(jq -r '.singbox.tuic.port // empty' "$DB_FILE" 2>/dev/null)
-hop_enable=$(jq -r '.singbox.tuic.hop_enable // empty' "$DB_FILE" 2>/dev/null)
-hop_start=$(jq -r '.singbox.tuic.hop_start // empty' "$DB_FILE" 2>/dev/null)
-hop_end=$(jq -r '.singbox.tuic.hop_end // empty' "$DB_FILE" 2>/dev/null)
+while IFS='|' read -r port hop_enable hop_start hop_end; do
 
-[[ -z "$port" ]] && exit 0
+[[ -z "$port" ]] && continue
 
 hop_start="${hop_start:-20000}"
 hop_end="${hop_end:-50000}"
 
 if ! [[ "$port" =~ ^[0-9]+$ && "$hop_start" =~ ^[0-9]+$ && "$hop_end" =~ ^[0-9]+$ ]]; then
-  exit 0
+  continue
 fi
 port=$((10#$port)); hop_start=$((10#$hop_start)); hop_end=$((10#$hop_end))
 if (( port < 1 || port > 65535 || hop_start < 1 || hop_end > 65535 || hop_start >= hop_end )); then
-  exit 0
+  continue
 fi
 
 # 清理旧规则 (IPv4)
@@ -13773,7 +13720,7 @@ ip6tables -t nat -D OUTPUT -p udp --dport ${hop_start}:${hop_end} -m comment --c
 ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null
 ip6tables -t nat -D OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null
 
-[[ "${hop_enable:-0}" != "1" ]] && exit 0
+[[ "${hop_enable:-0}" != "1" ]] && continue
 
 # 添加规则 (IPv4)
 iptables -t nat -C PREROUTING -p udp --dport ${hop_start}:${hop_end} -m comment --comment vless-tuic-hop -j REDIRECT --to-ports $port 2>/dev/null \
@@ -13786,6 +13733,9 @@ ip6tables -t nat -C PREROUTING -p udp --dport ${hop_start}:${hop_end} -m comment
   || ip6tables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -m comment --comment vless-tuic-hop -j REDIRECT --to-ports $port
 ip6tables -t nat -C OUTPUT -p udp --dport ${hop_start}:${hop_end} -m comment --comment vless-tuic-hop -j REDIRECT --to-ports $port 2>/dev/null \
   || ip6tables -t nat -A OUTPUT -p udp --dport ${hop_start}:${hop_end} -m comment --comment vless-tuic-hop -j REDIRECT --to-ports $port
+done < <(jq -r '.singbox.tuic // empty | (if type == "array" then .[] else . end) |
+    [.port, (.hop_enable // 0), (.hop_start // 20000), (.hop_end // 50000)] | join("|")' "$DB_FILE")
+exit 0
 EOFSCRIPT
     fi
 
@@ -14023,6 +13973,7 @@ svc() { # svc action service_name
             stop)    rc-service "$name" stop &>/dev/null ;;
             enable)  rc-update add "$name" default &>/dev/null ;;
             disable) rc-update del "$name" default &>/dev/null ;;
+            is-enabled) [[ -e "/etc/runlevels/default/$name" ]] ;;
             reload)  rc-service "$name" reload &>/dev/null || rc-service "$name" restart &>/dev/null ;;
             status)
                 rc-service "$name" status &>/dev/null && return 0
@@ -14032,6 +13983,7 @@ svc() { # svc action service_name
                 [[ -n "$p" ]] && _pgrep "$p" && return 0
                 return 1
                 ;;
+            *) return 1 ;;
         esac
     else
         case "$action" in
@@ -14039,63 +13991,39 @@ svc() { # svc action service_name
                 _svc_try systemctl "$action" "$name" || { _err "详细状态信息:"; systemctl status "$name" --no-pager -l || true; return 1; }
                 ;;
             stop|enable|disable) systemctl "$action" "$name" &>/dev/null ;;
+            is-enabled) systemctl is-enabled --quiet "$name" 2>/dev/null ;;
             reload) systemctl reload "$name" &>/dev/null || systemctl restart "$name" &>/dev/null ;;
             status)
                 local state; state=$(systemctl is-active "$name" 2>/dev/null)
-                [[ "$state" == active || "$state" == activating ]]
+                [[ "$state" == active ]]
                 ;;
+            *) return 1 ;;
         esac
     fi
+    local rc=$?
+    if [[ "$rc" == 0 && ( "$name" == vless-reality || "$name" == vless-singbox ) ]]; then
+        case "$action" in
+            stop) touch "$CFG/${name}.paused" ;;
+            start|restart) rm -f "$CFG/${name}.paused" ;;
+        esac
+    fi
+    return "$rc"
 }
 
 # 通用服务启动/重启辅助函数
 # 用法: _start_core_service "服务名" "进程名" "协议列表" "配置生成函数"
 _start_core_service() {
-    local service_name="$1"
-    local process_name="$2"
-    local protocols="$3"
-    local gen_config_func="$4"
-    local failed_services_ref="$5"
-    
-    local is_running=false
-    svc status "$service_name" >/dev/null 2>&1 && is_running=true
-    
-    local action_word="启动"
-    [[ "$is_running" == "true" ]] && action_word="更新"
-    
-    _info "${action_word} ${process_name} 配置..."
-    
-    if ! $gen_config_func; then
-        _err "${process_name} 配置生成失败"
-        return 1
-    fi
-    
-    svc enable "$service_name" 2>/dev/null
-    
-    local svc_action="start"
-    [[ "$is_running" == "true" ]] && svc_action="restart"
-    
-    if ! svc $svc_action "$service_name"; then
-        _err "${process_name} 服务${action_word}失败"
-        return 1
-    fi
-    
-    # 等待服务启动。OpenRC 的 PID 文件/服务状态比精简 Alpine 中可能缺失的
-    # pgrep 更可靠；同时保留进程检测以兼容非标准服务管理环境。
-    local wait_count=0
-    local max_wait=$([[ "$is_running" == "true" ]] && echo 5 || echo 10)
-    while [[ $wait_count -lt $max_wait ]]; do
-        if svc status "$service_name" >/dev/null 2>&1 || _pgrep "$process_name"; then
-            local proto_list=$(echo $protocols | tr '\n' ' ')
-            _ok "${process_name} 服务已${action_word} (协议: $proto_list)"
-            return 0
-        fi
-        sleep 1
-        ((wait_count++))
-    done
-    
-    _err "${process_name} 进程未运行"
-    return 1
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _start_core_service "$@"; return $?; fi
+    local service_name="$1" process_name="$2" protocols="$3" core backup
+    case "$service_name" in
+        vless-reality) core=xray ;;
+        vless-singbox) core=singbox ;;
+        *) return 1 ;;
+    esac
+    _flush_core_traffic "$core" || return 1
+    backup=$(_user_change_begin "$core") || return 1
+    _user_change_apply "$core" "$backup" start || return 1
+    _ok "$process_name 服务已启动 (协议: $(echo "$protocols" | tr '\n' ' '))"
 }
 
 start_services() {
@@ -14202,17 +14130,13 @@ ensure_singbox_runtime_consistency() {
     local need_rebuild=false
     [[ ! -f "$CFG/singbox.json" ]] && need_rebuild=true
 
-    if [[ "$need_rebuild" == "false" ]] && ! /usr/local/bin/sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
+    if [[ "$need_rebuild" == "false" ]] && ! ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true /usr/local/bin/sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
         need_rebuild=true
     fi
 
     if [[ "$need_rebuild" == "true" ]]; then
         _info "检测到 Sing-box 配置缺失或无效，正在自动重建..."
-        generate_singbox_config || return 1
-        create_server_scripts
-        create_singbox_service
-        svc enable vless-singbox >/dev/null 2>&1 || true
-        svc restart vless-singbox || svc start vless-singbox || return 1
+        _rebuild_core_config singbox || return 1
         _ok "Sing-box 配置已自动修复"
     fi
 }
@@ -17106,17 +17030,17 @@ _del_routing_rule() {
 
 # 重新生成代理配置的辅助函数
 _regenerate_proxy_configs() {
+    local rc=0
     local xray_protocols=$(get_xray_protocols)
     if [[ -n "$xray_protocols" ]]; then
-        generate_xray_config
-        svc restart vless-reality 2>/dev/null
+        rebuild_and_reload_xray || rc=1
     fi
     
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
-        generate_singbox_config
-        svc restart vless-singbox 2>/dev/null
+        rebuild_and_reload_singbox || rc=1
     fi
+    return "$rc"
 }
 
 # WARP 管理菜单 (二选一模式)
@@ -17316,16 +17240,13 @@ configure_direct_outbound() {
     local xray_protocols=$(get_xray_protocols)
     if [[ -n "$xray_protocols" ]]; then
         _info "重新生成 Xray 配置..."
-        svc stop vless-reality 2>/dev/null
-        generate_xray_config
-        svc start vless-reality 2>/dev/null
+        _rebuild_core_config xray || return 1
     fi
     
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
         _info "重新生成 Sing-box 配置..."
-        svc stop vless-singbox 2>/dev/null
-        generate_singbox_config
+        _rebuild_core_config singbox || return 1
     fi
 }
 
@@ -17564,18 +17485,14 @@ setup_warp_ipv6_chain() {
     # 重新生成 Xray 配置
     local xray_protocols=$(get_xray_protocols)
     if [[ -n "$xray_protocols" ]]; then
-        svc stop vless-reality 2>/dev/null
-        generate_xray_config
-        svc start vless-reality 2>/dev/null
+        _rebuild_core_config xray || return 1
         _ok "Xray 配置已更新"
     fi
     
     # 重新生成 Sing-box 配置
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
-        svc stop vless-singbox 2>/dev/null
-        generate_singbox_config
-        svc start vless-singbox 2>/dev/null
+        _rebuild_core_config singbox || return 1
         _ok "Sing-box 配置已更新"
     fi
     
@@ -17593,12 +17510,12 @@ setup_warp_ipv6_chain() {
 
 # 修改端口出口时保留可回滚备份，只重启该端口所属核心。
 apply_port_routing_change() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock apply_port_routing_change "$@"; return $?; fi
     local core="$1" protocol="$2" port="$3" target="$4"
-    local service config binary generator backup candidate staged=''
-    local restart_attempted=false config_installed=false rollback_failed=false failed=''
+    local service config binary backup
     case "$core" in
-        xray) service=vless-reality; config="$CFG/config.json"; binary=/usr/local/bin/xray; generator=generate_xray_config ;;
-        singbox) service=vless-singbox; config="$CFG/singbox.json"; binary=/usr/local/bin/sing-box; generator=generate_singbox_config ;;
+        xray) service=vless-reality; config="$CFG/config.json"; binary="${XRAY_BIN:-/usr/local/bin/xray}" ;;
+        singbox) service=vless-singbox; config="$CFG/singbox.json"; binary="${SINGBOX_BIN:-/usr/local/bin/sing-box}" ;;
         *) return 1 ;;
     esac
     if ! svc status "$service" >/dev/null 2>&1; then
@@ -17606,71 +17523,10 @@ apply_port_routing_change() {
         return 1
     fi
     [[ -x "$binary" && -f "$config" && -f "$DB_FILE" ]] || return 1
-    mkdir -p "$CFG/backups/port-routing" || return 1
-    backup=$(mktemp -d "$CFG/backups/port-routing/${core}-${protocol}-${port}.XXXXXX") || return 1
-    chmod 700 "$backup"
-    cp -p "$DB_FILE" "$backup/db.json" && cp -p "$config" "$backup/active.json" || return 1
-    candidate="$backup/candidate.json"
-
-    db_set_port_routing "$core" "$protocol" "$port" "$target" || failed='数据库更新失败'
-    if [[ -z "$failed" ]]; then
-        if [[ "$core" == xray ]]; then
-            XRAY_CONFIG_OUTPUT="$candidate" "$generator" || failed='候选配置生成失败'
-        else
-            SINGBOX_CONFIG_OUTPUT="$candidate" "$generator" || failed='候选配置生成失败'
-        fi
-    fi
-    if [[ -z "$failed" ]]; then
-        if [[ "$core" == xray ]]; then
-            "$binary" run -test -c "$candidate" >/dev/null 2>&1 || failed='Xray 原生校验失败'
-        else
-            "$binary" check -c "$candidate" >/dev/null 2>&1 || failed='Sing-box 原生校验失败'
-        fi
-    fi
-    if [[ -z "$failed" ]]; then
-        staged=$(mktemp "${config}.new.XXXXXX") || failed='运行配置暂存失败'
-    fi
-    if [[ -z "$failed" ]]; then
-        if cp -p "$candidate" "$staged" && mv "$staged" "$config"; then
-            config_installed=true
-        else
-            failed='运行配置写入失败'
-            rm -f "$staged"
-        fi
-    fi
-    if [[ -z "$failed" ]]; then
-        svc status "$service" >/dev/null 2>&1 || failed='核心已停止，未重启'
-    fi
-    if [[ -z "$failed" ]]; then
-        restart_attempted=true
-        svc restart "$service" >/dev/null 2>&1 || failed='核心重启失败'
-    fi
-    if [[ -z "$failed" ]]; then
-        sleep 1
-        svc status "$service" >/dev/null 2>&1 || failed='服务健康检查失败'
-        if [[ -z "$failed" ]] && command -v ss >/dev/null 2>&1; then
-            ss -H -lntu "( sport = :$port )" 2>/dev/null | grep -q . || failed='入站端口未监听'
-        fi
-    fi
-    if [[ -n "$failed" ]]; then
-        cp -p "$backup/db.json" "$DB_FILE" || rollback_failed=true
-        if [[ "$config_installed" == true ]]; then
-            staged=$(mktemp "${config}.restore.XXXXXX") || rollback_failed=true
-            if [[ -n "$staged" ]]; then
-                cp -p "$backup/active.json" "$staged" && mv "$staged" "$config" || rollback_failed=true
-            fi
-            [[ -f "$staged" ]] && rm -f "$staged"
-        fi
-        if [[ "$restart_attempted" == true ]]; then
-            svc restart "$service" >/dev/null 2>&1 && svc status "$service" >/dev/null 2>&1 || rollback_failed=true
-        fi
-        if [[ "$rollback_failed" == true ]]; then
-            _err "$failed，自动回滚未完成，请从 $backup 恢复"
-        else
-            _err "$failed，已恢复数据库和运行配置；备份: $backup"
-        fi
-        return 1
-    fi
+    _flush_core_traffic "$core" || return 1
+    backup=$(_user_change_begin "$core") || return 1
+    db_set_port_routing "$core" "$protocol" "$port" "$target" || return 1
+    _user_change_apply "$core" "$backup" true '[]' "$port" || return 1
     _ok "端口出口已生效；备份: $backup"
 }
 
@@ -21535,6 +21391,46 @@ select_port_to_uninstall() {
     fi
 }
 
+_uninstall_core_port() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _uninstall_core_port "$@"; return $?; fi
+    local core="$1" proto="$2" port="$3" backup cfg removed remaining service config failed=''
+    case "$core" in
+        xray) service=vless-reality; config="$CFG/config.json" ;;
+        singbox) service=vless-singbox; config="$CFG/singbox.json" ;;
+        *) return 1 ;;
+    esac
+    cfg=$(db_get "$core" "$proto") || return 1
+    removed=$(jq -c --arg p "$port" '[if type == "array" then .[] else . end |
+        select($p == "all" or (.port|tostring) == $p) | .port]' <<< "$cfg") || return 1
+    [[ "$removed" != '[]' ]] || return 1
+    _flush_core_traffic "$core" || return 1
+    backup=$(_user_change_begin "$core") || return 1
+    if [[ "$port" == all ]]; then db_del "$core" "$proto" || return 1; else db_remove_port "$core" "$proto" "$port" || return 1; fi
+    if [[ "$core" == xray ]]; then remaining=$(get_xray_protocols); else remaining=$(get_singbox_protocols); fi
+    if [[ -n "$remaining" ]]; then
+        _user_change_apply "$core" "$backup" true "$removed" || return 1
+    else
+        if [[ -f "$backup/running" ]]; then svc stop "$service" >/dev/null 2>&1 || failed='核心停止失败'; fi
+        [[ -n "$failed" ]] || svc disable "$service" >/dev/null 2>&1 || failed='取消开机启动失败'
+        [[ -n "$failed" ]] || rm -f "$config" || failed='配置清理失败'
+        if [[ -n "$failed" ]]; then
+            _restore_db_backup "$backup/db.json" || _err "卸载数据库回滚失败: $backup"
+            [[ ! -f "$backup/active.json" ]] || cp -p "$backup/active.json" "$config" || _err "卸载配置回滚失败: $backup"
+            [[ ! -f "$backup/enabled" ]] || svc enable "$service" >/dev/null 2>&1 || _err "开机启动回滚失败: $backup"
+            [[ ! -f "$backup/running" ]] || svc start "$service" >/dev/null 2>&1 || _err "卸载服务恢复失败: $backup"
+            _err "$failed，已尝试恢复；备份: $backup"
+            return 1
+        fi
+    fi
+    if [[ "$core" == singbox && ( "$proto" == hy2 || "$proto" == tuic ) ]]; then
+        cleanup_hy2_nat_rules "$proto" "$port" "$cfg"
+        if ! db_exists "$core" "$proto"; then rm -rf "$CFG/certs/$proto"; fi
+    fi
+    db_exists "$core" "$proto" || rm -f "$CFG/${proto}.join"
+    [[ ! -f "$CFG/sub.info" ]] || generate_sub_files || _warn "端口已卸载，订阅更新失败，请重试"
+    _ok "端口卸载完成；备份: $backup"
+}
+
 # 卸载指定协议
 uninstall_specific_protocol() {
     local installed=$(get_installed_protocols)
@@ -21592,129 +21488,10 @@ uninstall_specific_protocol() {
         return 1
     fi
     
-    # 停止相关服务
-    if [[ "$core" == "xray" ]]; then
-        # Xray 协议：需要重新生成配置
-        # 根据选择的端口进行卸载
-        if [[ "$SELECTED_PORT" == "all" ]]; then
-            echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
-            unregister_protocol "$selected_protocol"
-            rm -f "$CFG/${selected_protocol}.join"
-        else
-            echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
-            
-            # 删除指定端口实例
-            if [[ "$core" != "standalone" ]]; then
-                db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
-                
-                # 检查是否还有其他端口实例
-                local remaining_ports=$(db_list_ports "$core" "$selected_protocol")
-                if [[ -z "$remaining_ports" ]]; then
-                    # 没有剩余端口，完全卸载
-                    echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
-                    db_del "$core" "$selected_protocol"
-                    rm -f "$CFG/${selected_protocol}.join"
-                else
-                    echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行${NC}"
-                fi
-            else
-                # 独立协议不支持多端口，直接卸载
-                unregister_protocol "$selected_protocol"
-                rm -f "$CFG/${selected_protocol}.join"
-            fi
-        fi
-        
-        # 检查是否还有其他 Xray 协议
-        local remaining_xray=$(get_xray_protocols)
-        if [[ -n "$remaining_xray" ]]; then
-            _info "重新生成 Xray 配置..."
-            svc stop vless-reality 2>/dev/null
-            rm -f "$CFG/config.json"
-            
-            if generate_xray_config; then
-                _ok "Xray 配置已更新"
-                svc start vless-reality
-            else
-                _err "Xray 配置生成失败"
-            fi
-        else
-            _info "没有其他 Xray 协议，停止 Xray 服务..."
-            svc stop vless-reality 2>/dev/null
-            rm -f "$CFG/config.json"
-            _ok "Xray 服务已停止"
-        fi
-    elif [[ "$core" == "singbox" ]]; then
-        # Sing-box 协议 (hy2/tuic)：需要重新生成配置
-        
-        # Hysteria2: 先清理 iptables 端口跳跃规则
-        if [[ "$selected_protocol" == "hy2" ]]; then
-            cleanup_hy2_nat_rules
-            rm -rf "$CFG/certs/hy2"
-        fi
-        
-        # TUIC: 先清理 iptables 端口跳跃规则，删除证书目录
-        if [[ "$selected_protocol" == "tuic" ]]; then
-            cleanup_hy2_nat_rules
-            rm -rf "$CFG/certs/tuic"
-        fi
-        
-        # 根据选择的端口进行卸载
-        if [[ "$SELECTED_PORT" == "all" ]]; then
-            echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
-            unregister_protocol "$selected_protocol"
-            rm -f "$CFG/${selected_protocol}.join"
-        else
-            echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
-            
-            # 删除指定端口实例
-            if [[ "$core" != "standalone" ]]; then
-                db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
-                
-                # 检查是否还有其他端口实例
-                local remaining_ports=$(db_list_ports "$core" "$selected_protocol")
-                if [[ -z "$remaining_ports" ]]; then
-                    # 没有剩余端口，完全卸载
-                    echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
-                    db_del "$core" "$selected_protocol"
-                    rm -f "$CFG/${selected_protocol}.join"
-                else
-                    echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行${NC}"
-                fi
-            else
-                # 独立协议不支持多端口，直接卸载
-                unregister_protocol "$selected_protocol"
-                rm -f "$CFG/${selected_protocol}.join"
-            fi
-        fi
-        
-        # 检查是否还有其他 Sing-box 协议
-        local remaining_singbox=$(get_singbox_protocols)
-        if [[ -n "$remaining_singbox" ]]; then
-            _info "重新生成 Sing-box 配置..."
-            svc stop vless-singbox 2>/dev/null
-            rm -f "$CFG/singbox.json"
-            
-            if generate_singbox_config; then
-                _ok "Sing-box 配置已更新"
-                svc start vless-singbox
-            else
-                _err "Sing-box 配置生成失败"
-            fi
-        else
-            _info "没有其他 Sing-box 协议，停止 Sing-box 服务..."
-            svc stop vless-singbox 2>/dev/null
-            svc disable vless-singbox 2>/dev/null
-            rm -f "$CFG/singbox.json"
-            # 删除 Sing-box 服务文件
-            if [[ "$DISTRO" == "alpine" ]]; then
-                rc-update del vless-singbox default 2>/dev/null
-                rm -f "/etc/init.d/vless-singbox"
-            else
-                rm -f "/etc/systemd/system/vless-singbox.service"
-                systemctl daemon-reload
-            fi
-            _ok "Sing-box 服务已停止"
-        fi
+    if [[ "$core" == xray || "$core" == singbox ]]; then
+        _uninstall_core_port "$core" "$selected_protocol" "$SELECTED_PORT" || { _err "端口卸载失败"; _pause; return 1; }
+        _pause
+        return 0
     else
         # 独立协议 (Snell/AnyTLS/ShadowTLS)：停止服务，删除配置和服务文件
         local service_name="vless-${selected_protocol}"
@@ -21790,7 +21567,7 @@ uninstall_specific_protocol() {
     
     # 检查是否还有需要订阅服务的协议
     local has_sub_protocol=false
-    for proto in vless-ws vless-vision trojan vmess-ws; do
+    for proto in $(get_installed_protocols); do
         if is_protocol_installed "$proto"; then
             has_sub_protocol=true
             break
@@ -22325,19 +22102,7 @@ do_install_server() {
                 case "$master_choice" in
                     1)
                         _info "卸载 $existing_master_name..."
-                        unregister_protocol "$existing_master"
-                        rm -f "$CFG/${existing_master}.join"
-                        # 重新生成 Xray 配置
-                        local remaining_xray=$(get_xray_protocols)
-                        if [[ -n "$remaining_xray" ]]; then
-                            svc stop vless-reality 2>/dev/null
-                            rm -f "$CFG/config.json"
-                            generate_xray_config
-                            svc start vless-reality 2>/dev/null
-                        else
-                            svc stop vless-reality 2>/dev/null
-                            rm -f "$CFG/config.json"
-                        fi
+                        _uninstall_core_port xray "$existing_master" all || return 1
                         _ok "$existing_master_name 已卸载"
                         break
                         ;;
@@ -23632,22 +23397,14 @@ do_install_server() {
         _ok "$current_service 已启用并启动"
     fi
     
-    if start_services; then
+    local current_started=true
+    if [[ "$core" == xray ]] && ! is_standalone_protocol "$current_protocol"; then
+        _start_core_service vless-reality xray "$(get_xray_protocols)" generate_xray_config || current_started=false
+    elif [[ "$core" == singbox ]]; then
+        _start_core_service vless-singbox sing-box "$(get_singbox_protocols)" generate_singbox_config || current_started=false
+    fi
+    if [[ "$current_started" == true ]]; then
         create_shortcut   # 安装成功才创建快捷命令
-
-        # 对 Sing-box 协议做一次显式重建与校验，避免交互安装后配置未完全落盘
-        if [[ "$core" == "singbox" ]]; then
-            generate_singbox_config || { _err "Sing-box 配置重建失败"; _pause; return 1; }
-            create_server_scripts
-            create_singbox_service
-            svc enable vless-singbox >/dev/null 2>&1 || true
-            svc restart vless-singbox || svc start vless-singbox || { _err "Sing-box 服务重启失败"; _pause; return 1; }
-            if [[ ! -f "$CFG/singbox.json" ]] || ! /usr/local/bin/sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
-                _err "Sing-box 配置文件未正确生成或校验失败"
-                _pause
-                return 1
-            fi
-        fi
 
         # 已启用 TG 通知且当前安装的是 Xray 协议时，自动补齐流量统计定时任务
         if [[ "$core" == "xray" ]]; then
@@ -28784,266 +28541,8 @@ _set_user_expire_date() {
 # 更新 Xray/Sing-box 配置文件中的用户列表、用户级路由规则、链式代理和负载均衡并重载服务
 _regenerate_config() {
     local core="$1" proto="$2"
-    if _snell_managed "$proto"; then
-        # Snell 数据库操作已处理对应实例，不能顺便启动其他手动停止的用户。
-        return 0
-    fi
-    local config_file=""
-    local service_name=""
-
-    # Sing-box 使用统一生成器维护所有入站、分流和统计设置，不能套用
-    # Xray 的局部 jq 更新逻辑。完整重建也可正确处理切换后的共同协议。
-    if [[ "$core" == "singbox" ]]; then
-        config_file="$CFG/singbox.json"
-        service_name="vless-singbox"
-        if ! generate_singbox_config; then
-            _err "Sing-box 配置重建失败，用户信息已保存在数据库"
-            return 1
-        fi
-        if ! /usr/local/bin/sing-box check -c "$config_file" >/dev/null 2>&1; then
-            _err "Sing-box 配置校验失败，服务未重启"
-            return 1
-        fi
-        if svc status "$service_name" >/dev/null 2>&1; then
-            svc restart "$service_name" || { _err "Sing-box 服务重启失败"; return 1; }
-        else
-            svc start "$service_name" || { _err "Sing-box 服务启动失败"; return 1; }
-        fi
-        _ok "Sing-box 用户配置已重建并生效"
-        return 0
-    fi
-    
-    # 确定配置文件路径和服务名称
-    if [[ "$core" == "xray" ]]; then
-        config_file="$CFG/config.json"
-        service_name="vless-reality"
-    fi
-    
-    # 检查配置文件是否存在
-    if [[ ! -f "$config_file" ]]; then
-        _info "用户信息已保存到数据库"
-        return 0
-    fi
-    
-    # 从数据库读取用户列表
-    local db_users=$(db_get_field "$core" "$proto" "users")
-    local users_json=""
-    local xray_user_rules="[]"
-    local xray_balancer_rules="[]"
-    local needed_chain_nodes=""
-    local needed_balancer_groups=""
-    
-    if [[ -n "$db_users" && "$db_users" != "null" ]]; then
-        # 有用户列表，转换为 Xray 格式的 clients 数组
-        # email 格式为 用户名@协议，用于流量统计
-        users_json=$(echo "$db_users" | jq -c --arg proto "$proto" '[.[] | select(.enabled == true) | {id: .uuid, email: (.name + "@" + $proto), flow: "xtls-rprx-vision"}]' 2>/dev/null)
-        
-        # 生成用户级路由规则
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            local user_name=$(echo "$line" | jq -r '.name')
-            local user_routing=$(echo "$line" | jq -r '.routing // ""')
-            
-            [[ -z "$user_name" || -z "$user_routing" ]] && continue
-            
-            # user 字段需要匹配 clients 中的 email 格式：用户名@协议
-            local user_email="${user_name}@${proto}"
-            
-            case "$user_routing" in
-                direct)
-                    xray_user_rules=$(echo "$xray_user_rules" | jq --arg user "$user_email" \
-                        '. + [{"type": "field", "user": [$user], "outboundTag": "direct"}]')
-                    ;;
-                warp)
-                    xray_user_rules=$(echo "$xray_user_rules" | jq --arg user "$user_email" \
-                        '. + [{"type": "field", "user": [$user], "outboundTag": "warp"}]')
-                    ;;
-                chain:*)
-                    local node_name="${user_routing#chain:}"
-                    xray_user_rules=$(echo "$xray_user_rules" | jq --arg user "$user_email" --arg tag "chain-${node_name}-prefer-ipv4" \
-                        '. + [{"type": "field", "user": [$user], "outboundTag": $tag}]')
-                    needed_chain_nodes="$needed_chain_nodes $node_name"
-                    ;;
-                balancer:*)
-                    local group_name="${user_routing#balancer:}"
-                    # 负载均衡使用 balancerTag 而不是 outboundTag
-                    xray_balancer_rules=$(echo "$xray_balancer_rules" | jq --arg user "$user_email" --arg tag "$group_name" \
-                        '. + [{"type": "field", "user": [$user], "balancerTag": $tag}]')
-                    needed_balancer_groups="$needed_balancer_groups $group_name"
-                    ;;
-            esac
-        done < <(echo "$db_users" | jq -c '.[] | select(.enabled == true and .routing != null and .routing != "")')
-    else
-        # 使用默认 UUID
-        local default_uuid=$(db_get_field "$core" "$proto" "uuid")
-        if [[ -n "$default_uuid" ]]; then
-            users_json="[{\"id\": \"$default_uuid\", \"email\": \"default@${proto}\", \"flow\": \"xtls-rprx-vision\"}]"
-        fi
-    fi
-    
-    # 从数据库读取链式代理节点配置
-    local chain_outbounds="[]"
-    if [[ -n "$needed_chain_nodes" && -f "$DB_FILE" ]]; then
-        for node_name in $needed_chain_nodes; do
-            local node_config=$(jq -r --arg n "$node_name" '.chain_proxy.nodes[] | select(.name == $n)' "$DB_FILE" 2>/dev/null)
-            if [[ -n "$node_config" ]]; then
-                local node_type=$(echo "$node_config" | jq -r '.type')
-                local server=$(echo "$node_config" | jq -r '.server')
-                local port=$(echo "$node_config" | jq -r '.port')
-                local username=$(echo "$node_config" | jq -r '.username // ""')
-                local password=$(echo "$node_config" | jq -r '.password // ""')
-                
-                if [[ "$node_type" == "socks" ]]; then
-                    local outbound="{\"tag\": \"chain-${node_name}-prefer-ipv4\", \"protocol\": \"socks\", \"settings\": {\"servers\": [{\"address\": \"$server\", \"port\": $port"
-                    if [[ -n "$username" && -n "$password" ]]; then
-                        outbound="$outbound, \"users\": [{\"user\": \"$username\", \"pass\": \"$password\"}]"
-                    fi
-                    outbound="$outbound}]}}"
-                    chain_outbounds=$(echo "$chain_outbounds" | jq --argjson ob "$outbound" '. + [$ob]')
-                fi
-            fi
-        done
-    fi
-    
-    # 从数据库读取负载均衡组配置
-    local xray_balancers="[]"
-    if [[ -n "$needed_balancer_groups" && -f "$DB_FILE" ]]; then
-        for group_name in $needed_balancer_groups; do
-            local group_config=$(jq -r --arg n "$group_name" '.balancer_groups[] | select(.name == $n)' "$DB_FILE" 2>/dev/null)
-            if [[ -n "$group_config" ]]; then
-                local strategy=$(echo "$group_config" | jq -r '.strategy // "random"')
-                local nodes=$(echo "$group_config" | jq -r '.nodes[]' 2>/dev/null)
-                
-                # 构建 selector 列表（每个节点对应一个 outbound tag）
-                local selectors="[]"
-                for node in $nodes; do
-                    selectors=$(echo "$selectors" | jq --arg s "proxy-${node}" '. + [$s]')
-                    # 确保这些节点也被添加到 chain_outbounds
-                    needed_chain_nodes="$needed_chain_nodes $node"
-                done
-                
-                # 构建 balancer
-                local balancer="{\"tag\": \"$group_name\", \"selector\": $selectors, \"strategy\": {\"type\": \"$strategy\"}}"
-                xray_balancers=$(echo "$xray_balancers" | jq --argjson b "$balancer" '. + [$b]')
-            fi
-        done
-        
-        # 重新生成需要的链式代理节点 outbounds
-        chain_outbounds="[]"
-        for node_name in $needed_chain_nodes; do
-            # 检查是否已添加
-            local exists=$(echo "$chain_outbounds" | jq --arg t "chain-${node_name}-prefer-ipv4" '[.[] | select(.tag == $t)] | length')
-            [[ "$exists" != "0" ]] && continue
-            
-            local node_config=$(jq -r --arg n "$node_name" '.chain_proxy.nodes[] | select(.name == $n)' "$DB_FILE" 2>/dev/null)
-            if [[ -n "$node_config" ]]; then
-                local node_type=$(echo "$node_config" | jq -r '.type')
-                local server=$(echo "$node_config" | jq -r '.server')
-                local port=$(echo "$node_config" | jq -r '.port')
-                local username=$(echo "$node_config" | jq -r '.username // ""')
-                local password=$(echo "$node_config" | jq -r '.password // ""')
-                
-                if [[ "$node_type" == "socks" ]]; then
-                    local outbound="{\"tag\": \"chain-${node_name}-prefer-ipv4\", \"protocol\": \"socks\", \"settings\": {\"servers\": [{\"address\": \"$server\", \"port\": $port"
-                    if [[ -n "$username" && -n "$password" ]]; then
-                        outbound="$outbound, \"users\": [{\"user\": \"$username\", \"pass\": \"$password\"}]"
-                    fi
-                    outbound="$outbound}]}}"
-                    chain_outbounds=$(echo "$chain_outbounds" | jq --argjson ob "$outbound" '. + [$ob]')
-                fi
-            fi
-        done
-    fi
-    
-    # 合并 outboundTag 规则和 balancerTag 规则
-    local all_user_rules=$(echo "$xray_user_rules" | jq --argjson br "$xray_balancer_rules" '. + $br')
-    
-    # 更新配置文件
-    if [[ -n "$users_json" ]]; then
-        local tmp=$(mktemp)
-        
-        # 使用 jq 更新配置
-        if jq --argjson clients "$users_json" \
-              --argjson user_rules "$all_user_rules" \
-              --argjson chain_obs "$chain_outbounds" \
-              --argjson balancers "$xray_balancers" '
-            # 更新 clients (通过 protocol 查找 VLESS inbound，避免索引问题)
-            (.inbounds[] | select(.protocol == "vless")).settings.clients = $clients |
-            
-            # 确保 routing 结构存在
-            if .routing == null then .routing = {"domainStrategy": "AsIs", "rules": []} else . end |
-            if .routing.rules == null then .routing.rules = [] else . end |
-            
-            # 确保 api 和 stats 存在（用于流量统计）
-            if .api == null then .api = {"tag": "api", "services": ["StatsService"]} else . end |
-            if .stats == null then .stats = {} else . end |
-            if .policy == null then .policy = {"system": {"statsInboundUplink": true, "statsInboundDownlink": true}, "levels": {"0": {"statsUserUplink": true, "statsUserDownlink": true}}} else . end |
-            if .policy.system == null then .policy.system = {"statsInboundUplink": true, "statsInboundDownlink": true} else . end |
-            if .policy.levels == null then .policy.levels = {"0": {"statsUserUplink": true, "statsUserDownlink": true}} else . end |
-            if .policy.levels["0"] == null then .policy.levels["0"] = {"statsUserUplink": true, "statsUserDownlink": true} else . end |
-            .policy.system.statsInboundUplink = true |
-            .policy.system.statsInboundDownlink = true |
-            .policy.levels["0"].statsUserUplink = true |
-            .policy.levels["0"].statsUserDownlink = true |
-            
-            # 确保有 API inbound（监听 127.0.0.1:10085）
-            if ([.inbounds[] | select(.tag == "api")] | length) == 0 then
-                .inbounds += [{"tag": "api", "listen": "127.0.0.1", "port": 10085, "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}}]
-            else . end |
-            
-            # 确保有 API outbound
-            if ([.outbounds[] | select(.tag == "api")] | length) == 0 then
-                .outbounds += [{"tag": "api", "protocol": "blackhole", "settings": {}}]
-            else . end |
-            
-            # 添加链式代理 outbounds（先移除旧的 proxy-* outbounds）
-            .outbounds = ([.outbounds[] | select(.tag | startswith("proxy-") | not)] + $chain_obs) |
-            
-            # 添加/更新负载均衡器
-            if ($balancers | length) > 0 then
-                .routing.balancers = $balancers
-            else . end |
-            
-            # 确保 routing 中有 API 规则
-            if ([.routing.rules[]? | select(.inboundTag != null and (.inboundTag | contains(["api"])))] | length) == 0 then
-                .routing.rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}] + (.routing.rules // [])
-            else . end |
-            
-            # 更新用户级路由规则
-            # 用户级规则优先于全局规则：API规则 > 用户规则 > 其他规则
-            .routing.rules = (
-                # 1. API 规则必须在最前
-                [.routing.rules[]? | select(.inboundTag != null and (.inboundTag | contains(["api"])))] +
-                # 2. 用户级路由规则（高优先级）
-                $user_rules +
-                # 3. 其他规则（全局规则等）
-                [.routing.rules[]? | select(
-                    (.user == null or (.user | type) != "array") and
-                    (.inboundTag == null or (.inboundTag | contains(["api"])) | not)
-                )]
-            )
-        ' "$config_file" > "$tmp" 2>/dev/null; then
-            mv "$tmp" "$config_file"
-        else
-            rm -f "$tmp"
-            # 如果完整更新失败，至少尝试更新 clients
-            tmp=$(mktemp)
-            if jq --argjson clients "$users_json" '(.inbounds[] | select(.protocol == "vless")).settings.clients = $clients' "$config_file" > "$tmp" 2>/dev/null; then
-                mv "$tmp" "$config_file"
-            else
-                rm -f "$tmp"
-            fi
-        fi
-    fi
-    
-    _info "用户信息已保存到数据库"
-    
-    # 重载服务使配置生效
-    if [[ "$DISTRO" == "alpine" ]]; then
-        rc-service "$service_name" restart 2>/dev/null || true
-    elif systemctl is-active --quiet "$service_name" 2>/dev/null; then
-        systemctl reload "$service_name" 2>/dev/null || systemctl restart "$service_name" 2>/dev/null
-    fi
+    _snell_managed "$proto" && return 0
+    _rebuild_core_config "$core"
 }
 
 # 选择可绑定 Telegram 的受管用户；只有数据库 users 数组中的账号可绑定。
@@ -31234,6 +30733,7 @@ _snell_delete_user() {
 }
 
 _snell_add_user() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _snell_add_user "$@"; return $?; fi
     local proto="$1" name port psk quota days expiry="" id template row managed=false
     if ! command -v nft >/dev/null 2>&1; then
         _info "安装 Snell 用户流量统计依赖 nftables..."
@@ -31470,17 +30970,14 @@ case "${1:-}" in
         warnings=$(send_expire_warnings 3)
         echo "  发送 $warnings 条过期提醒" >> "$CFG/expire.log"
         # 禁用过期用户
-        if [[ "${2:-}" == "--notify" ]]; then
-            disabled=$(check_and_disable_expired_users --notify)
-        else
-            disabled=$(check_and_disable_expired_users)
-        fi
+        expire_rc=0
+        disabled=$(check_and_disable_expired_users "${2:-}") || expire_rc=$?
         echo "  禁用 $disabled 个过期用户" >> "$CFG/expire.log"
         # 输出结果到终端
         echo "  即将过期提醒: $warnings 条"
         echo "  禁用过期用户: $disabled 个"
         echo "完成。日志: $CFG/expire.log"
-        exit 0
+        exit "$expire_rc"
         ;;
     --setup-expire-cron)
         # 安装过期检查定时任务

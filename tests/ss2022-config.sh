@@ -49,10 +49,9 @@ jq -e '
 before=$(sha256sum "$xray_output_file" | awk '{print $1}')
 jq '.xray.ss2022[1].users |= map(.enabled=false)' "$DB_FILE" > "$fixture/disabled.json"
 mv "$fixture/disabled.json" "$DB_FILE"
-if add_xray_inbound_v2 ss2022_port_24199; then
-    echo 'SS2022 accepted an empty active clients list' >&2
-    exit 1
-fi
+rc=0
+add_xray_inbound_v2 ss2022_port_24199 || rc=$?
+[[ "$rc" == 2 ]]
 after=$(sha256sum "$xray_output_file" | awk '{print $1}')
 [[ "$before" == "$after" ]]
 master256=$(printf '0123456789abcdef0123456789abcdef' | base64 | tr -d '\n')

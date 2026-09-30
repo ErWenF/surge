@@ -77,7 +77,7 @@ install_shortcut() {
 validate_port() {
     local port="$1"
     # 拒绝非纯数字、前导零（避免 bash 八进制歧义）、空串
-    if [[ ! "$port" =~ ^[0-9]+$ ]] || [[ "$port" =~ ^0[0-9] ]]; then
+    if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || [[ "$port" =~ ^0[0-9] ]]; then
         return 1
     fi
     if (( port < 1 || port > 65535 )); then
@@ -345,6 +345,9 @@ NFTCONF
     # 如果转发配置文件不存在，创建初始结构
     if [[ ! -f "${CONF_FILE}" ]]; then
         write_conf_file || return 1
+        # Initial creation is loaded by MAIN_CONF, not a pending menu edit.
+        [[ -z "${NFT_CONF_BACKUP:-}" ]] || rm -f "$NFT_CONF_BACKUP"
+        NFT_CONF_BACKUP=''
     fi
 }
 
@@ -377,7 +380,8 @@ write_conf_file() {
     fi
 
     # 先写入临时文件，成功后原子替换，避免写到一半断电导致配置损坏
-    local tmp_file="${CONF_FILE}.tmp.$$"
+    local tmp_file batch
+    tmp_file=$(mktemp "${CONF_FILE}.tmp.XXXXXX") || return 1
 
     cat > "${tmp_file}" <<EOF
 #!/usr/sbin/nft -f
@@ -390,6 +394,7 @@ table ip ${TABLE_NAME} {
     chain prerouting {
         type nat hook prerouting priority -100; policy accept;
 EOF
+    [[ $? == 0 ]] || { rm -f "$tmp_file"; return 1; }
 
     local rule lport dip dport
     for rule in "${RULES[@]}"; do
@@ -400,6 +405,7 @@ EOF
         tcp dport ${lport} dnat to ${dip}:${dport}
         udp dport ${lport} dnat to ${dip}:${dport}
 EOF
+        [[ $? == 0 ]] || { rm -f "$tmp_file"; return 1; }
     done
 
     cat >> "${tmp_file}" <<EOF
@@ -409,6 +415,7 @@ EOF
     chain postrouting {
         type nat hook postrouting priority 100; policy accept;
 EOF
+    [[ $? == 0 ]] || { rm -f "$tmp_file"; return 1; }
 
     for rule in "${RULES[@]}"; do
         IFS='|' read -r lport dip dport <<< "$rule"
@@ -418,12 +425,31 @@ EOF
         ip daddr ${dip} tcp dport ${dport} ct status dnat snat to \$LOCAL_IP
         ip daddr ${dip} udp dport ${dport} ct status dnat snat to \$LOCAL_IP
 EOF
+        [[ $? == 0 ]] || { rm -f "$tmp_file"; return 1; }
     done
 
     cat >> "${tmp_file}" <<EOF
     }
 }
 EOF
+    [[ $? == 0 ]] || { rm -f "$tmp_file"; return 1; }
+
+    batch=$(mktemp "${CONF_FILE}.batch.XXXXXX") || { rm -f "$tmp_file"; return 1; }
+    if ! _nft_config_batch "$tmp_file" "$batch" || ! nft -c -f "$batch"; then
+        rm -f "$tmp_file" "$batch"
+        err "候选转发配置校验失败，保留原规则和配置。"
+        return 1
+    fi
+    rm -f "$batch"
+    # Keep the pre-change file until the runtime transaction succeeds.
+    if [[ -z "${NFT_CONF_BACKUP:-}" ]]; then
+        NFT_CONF_BACKUP=$(mktemp "${CONF_FILE}.previous.XXXXXX") || { rm -f "$tmp_file"; return 1; }
+        NFT_CONF_EXISTED=false
+        if [[ -f "$CONF_FILE" ]]; then
+            cp -p "$CONF_FILE" "$NFT_CONF_BACKUP" || { rm -f "$tmp_file" "$NFT_CONF_BACKUP"; NFT_CONF_BACKUP=''; return 1; }
+            NFT_CONF_EXISTED=true
+        fi
+    fi
 
     # 原子替换
     mv -f "${tmp_file}" "${CONF_FILE}" 2>/dev/null || {
@@ -433,14 +459,39 @@ EOF
     }
 }
 
+# nft -f executes this entire batch atomically; other tables are untouched.
+_nft_config_batch() {
+    local source="$1" batch="$2"
+    : > "$batch" || return 1
+    if nft list table ip "$TABLE_NAME" >/dev/null 2>&1; then
+        printf 'delete table ip %s\n' "$TABLE_NAME" >> "$batch" || return 1
+    fi
+    cat "$source" >> "$batch"
+}
+
 # ============== 重新加载规则 ==============
 reload_rules() {
-    nft flush table ip "${TABLE_NAME}" 2>/dev/null || true
-    nft delete table ip "${TABLE_NAME}" 2>/dev/null || true
-    if ! nft -f "${CONF_FILE}"; then
+    local batch failed=0
+    batch=$(mktemp "${CONF_FILE}.batch.XXXXXX") || failed=1
+    if [[ "$failed" == 0 ]]; then
+        _nft_config_batch "$CONF_FILE" "$batch" && nft -c -f "$batch" && nft -f "$batch" || failed=1
+        rm -f "$batch"
+    fi
+    if [[ "$failed" != 0 ]]; then
+        if [[ -n "${NFT_CONF_BACKUP:-}" ]]; then
+            if [[ "$NFT_CONF_EXISTED" == true ]]; then
+                mv -f "$NFT_CONF_BACKUP" "$CONF_FILE" || { err "配置回滚失败，备份: $NFT_CONF_BACKUP"; return 1; }
+            else
+                rm -f "$CONF_FILE" || return 1
+                rm -f "$NFT_CONF_BACKUP"
+            fi
+            NFT_CONF_BACKUP=''
+        fi
         err "加载配置文件失败，请检查 ${CONF_FILE}"
         return 1
     fi
+    [[ -z "${NFT_CONF_BACKUP:-}" ]] || rm -f "$NFT_CONF_BACKUP"
+    NFT_CONF_BACKUP=''
     return 0
 }
 
@@ -986,15 +1037,14 @@ do_add() {
         return
     fi
 
+    # 先启动服务加载旧配置，再用事务应用候选规则。
+    ensure_nftables_service || true
     # 备份并写入
     backup_conf
     RULES+=("${lport}|${dip}|${dport}")
     if ! write_conf_file; then
         return
     fi
-
-    # 先确保系统服务已启用；若服务刚启动，它会从持久化配置加载最新规则。
-    ensure_nftables_service || true
 
     if reload_rules; then
         firewall_open_port "$lport" "$dip" "$dport"
@@ -1107,12 +1157,9 @@ do_clear_all() {
 
     backup_conf
 
-    # 先清理所有防火墙规则（清空场景用 force，无需检查共享）
+    # Save the ports; close firewall permissions only after nft commits.
+    local -a old_rules=("${RULES[@]}")
     local rule lport dip dport
-    for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport dip dport <<< "$rule"
-        firewall_close_port "$lport" "$dip" "$dport" "force"
-    done
 
     RULES=()
     if ! write_conf_file; then
@@ -1120,6 +1167,10 @@ do_clear_all() {
     fi
 
     if reload_rules; then
+        for rule in "${old_rules[@]}"; do
+            IFS='|' read -r lport dip dport <<< "$rule"
+            firewall_close_port "$lport" "$dip" "$dport" "force"
+        done
         info "所有转发规则已清空。"
         log_action "清空所有转发规则"
     else

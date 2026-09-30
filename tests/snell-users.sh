@@ -12,7 +12,7 @@ load_function() {
     body=$(awk -v fn="$1" 'index($0, fn "() {") == 1 {on=1} on {print} on && $0 == "}" {exit}' "$script")
     eval "$body"
 }
-for fn in _is_snell_users_protocol _snell_managed _snell_any_managed _snell_rows _snell_migrate _snell_sync_traffic _snell_prepare_user _snell_user_share _snell_group_service _snell_live_stats _db_apply db_list_users db_get_user_field gen_snell_surge_line db_set_user_tg_binding db_find_user_by_tg_chat; do
+for fn in _is_snell_users_protocol _snell_managed _snell_any_managed _snell_rows _snell_migrate _snell_account_traffic _snell_sync_traffic _snell_prepare_user _snell_user_share _snell_group_service _snell_live_stats _db_apply db_list_users db_get_user_field gen_snell_surge_line db_set_user_tg_binding db_find_user_by_tg_chat; do
     load_function "$fn"
 done
 _db_lock_acquire() { :; }

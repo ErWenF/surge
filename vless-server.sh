@@ -36,7 +36,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.7.4 [服务端]
+#  多协议代理一键部署脚本 v3.7.5 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 默认处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.4"
+readonly VERSION="3.7.5"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -994,6 +994,7 @@ _user_change_apply() {
             ($expected - [$after[0].inbounds[]?.tag]) | length == 0
         ' >/dev/null 2>&1 || failed='候选配置缺少原有入站'
     fi
+    [[ -z "$failed" && "$reload" == validate ]] && return 0
     if [[ -z "$failed" ]]; then
         staged=$(mktemp "${config}.new.XXXXXX") || failed='配置暂存失败'
     fi
@@ -1237,9 +1238,9 @@ db_get_user_field() {
         if $cfg == null then
             empty
         elif ($cfg | type) == "array" then
-            [$cfg[].users // [] | .[] | select(.name == $n)] | .[0][$f] // empty
+            [$cfg[].users // [] | .[] | select(.name == $n)] | .[0][$f] | select(. != null)
         else
-            ($cfg.users // [] | map(select(.name == $n)) | .[0][$f]) // empty
+            ($cfg.users // [] | map(select(.name == $n)) | .[0][$f]) | select(. != null)
         end
     ' "$DB_FILE" 2>/dev/null
 }
@@ -1478,6 +1479,14 @@ db_set_user_traffic() {
 # 重置用户流量
 # 用法: db_reset_user_traffic "xray" "vless" "用户名"
 db_reset_user_traffic() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock db_reset_user_traffic "$@"; return $?; fi
+    # Move the cumulative checkpoint to the reset boundary without enforcing
+    # other users' quotas or starting stopped services.
+    if _snell_managed "$2"; then
+        _snell_account_traffic "$2" || return 1
+    else
+        _flush_core_traffic "$1" || return 1
+    fi
     db_set_user_traffic "$1" "$2" "$3" 0
 }
 
@@ -1508,6 +1517,14 @@ db_set_user_enabled() {
     if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock db_set_user_enabled "$@"; return $?; fi
     local core="$1" proto="$2" name="$3" enabled="$4" reason="${5:-manual}" backup=''
     [[ ! -f "$DB_FILE" ]] && return 1
+    [[ "$enabled" == true || "$enabled" == false ]] || return 1
+    local snell=false
+    if _snell_managed "$proto"; then
+        snell=true
+        _snell_account_traffic "$proto" || return 1
+    else
+        _flush_core_traffic "$core" || return 1
+    fi
     if [[ "$enabled" == true ]]; then
         local current_user
         current_user=$(db_get_user "$core" "$proto" "$name")
@@ -1520,8 +1537,9 @@ db_set_user_enabled() {
         fi
     fi
     
-    if ! _snell_managed "$proto"; then
-        _flush_core_traffic "$core" || return 1
+    if [[ "$snell" == true ]]; then
+        backup=$(_snell_user_change_begin "$proto" "$name") || return 1
+    else
         backup=$(_user_change_begin "$core") || return 1
     fi
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg reason "$reason" --argjson e "$enabled" '
@@ -1534,8 +1552,11 @@ db_set_user_enabled() {
     ' || return 1
     
     # 自动重建配置
-    if _snell_managed "$proto"; then
-        _snell_apply_users "$proto" "$name"
+    if [[ "$snell" == true ]]; then
+        if _snell_apply_users "$proto" "$name"; then return 0; fi
+        _snell_user_change_restore "$backup" || _err "Snell 状态回滚失败: $backup"
+        _err "Snell 用户状态应用失败，已尝试恢复；备份: $backup"
+        return 1
     else
         _user_change_apply "$core" "$backup"
     fi
@@ -1955,7 +1976,12 @@ install_expire_check_cron() {
     fi
     
     [[ -n "$(get_bash_interpreter)" ]] || { _err "未找到 bash，无法安装过期检查 cron"; return 1; }
-    install_cron_entry "check-expire" "$cron_cmd" && { _ok "已安装过期检查 cron (每天 3:00)"; echo -e "  ${D}日志: $CFG/expire.log${NC}"; } || _err "安装失败"
+    if ! install_cron_entry "check-expire" "$cron_cmd"; then
+        _err "安装失败"
+        return 1
+    fi
+    _ok "已安装过期检查 cron (每天 3:00)"
+    echo -e "  ${D}日志: $CFG/expire.log${NC}"
 }
 
 # 确保过期检查 cron 已安装（设置到期日期时自动调用）
@@ -16789,9 +16815,9 @@ configure_routing_rules() {
             3)
                 read -rp "  确认清空所有分流规则? [y/N]: " confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    db_clear_routing_rules
-                    _regenerate_proxy_configs
-                    _ok "已清空所有分流规则"
+                    if _apply_routing_change db_clear_routing_rules; then
+                        _ok "已清空所有分流规则"
+                    fi
                 fi
                 _pause
                 ;;
@@ -16932,10 +16958,9 @@ _add_routing_rule() {
     fi
 
     # 保存规则
-    if [[ "$rule_type" == "custom" ]]; then
-        db_add_routing_rule "$rule_type" "$outbound" "$custom_domains" "$ip_version"
-    else
-        db_add_routing_rule "$rule_type" "$outbound" "" "$ip_version"
+    if ! _apply_routing_change db_add_routing_rule "$rule_type" "$outbound" "$custom_domains" "$ip_version"; then
+        _pause
+        return 1
     fi
     
     local rule_name="${ROUTING_PRESET_NAMES[$rule_type]:-$rule_type}"
@@ -16955,9 +16980,6 @@ _add_routing_rule() {
     
     _ok "已添加规则: ${rule_name} → ${outbound_name}${ip_version_mark}"
     
-    # 更新配置
-    _info "更新代理配置..."
-    _regenerate_proxy_configs
     _ok "配置已更新"
     _pause
 }
@@ -17021,11 +17043,79 @@ _del_routing_rule() {
     
     if [[ "$del_choice" =~ ^[0-9]+$ ]] && [[ "$del_choice" -ge 1 && "$del_choice" -le ${#rule_ids[@]} ]]; then
         local del_id="${rule_ids[$((del_choice-1))]}"
-        db_del_routing_rule "$del_id"
-        _regenerate_proxy_configs
-        _ok "已删除规则"
+        if _apply_routing_change db_del_routing_rule "$del_id"; then
+            _ok "已删除规则"
+        else
+            _pause
+            return 1
+        fi
     fi
     _pause
+}
+
+# Save the database before mutation and validate both cores before restarting.
+_apply_routing_change() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _apply_routing_change "$@"; return $?; fi
+    case "$1" in db_add_routing_rule|db_del_routing_rule|db_clear_routing_rules) ;; *) return 1 ;; esac
+    local core backup core_backup config service staged failed='' rollback_failed=0
+    local -a cores=() backups=() touched=()
+    [[ -z "$(get_xray_protocols)" ]] || cores+=(xray)
+    [[ -z "$(get_singbox_protocols)" ]] || cores+=(singbox)
+    for core in "${cores[@]}"; do _flush_core_traffic "$core" || return 1; done
+    mkdir -p "$CFG/backups/user-changes" || return 1
+    backup=$(mktemp -d "$CFG/backups/user-changes/routing.XXXXXX") || return 1
+    cp -p "$DB_FILE" "$backup/db.json" || return 1
+    for core in "${cores[@]}"; do
+        core_backup=$(_user_change_begin "$core") || return 1
+        backups+=("$core_backup")
+    done
+    "$@" || failed='分流规则写入失败'
+    local i
+    for i in "${!cores[@]}"; do
+        [[ -z "$failed" ]] || break
+        _user_change_apply "${cores[$i]}" "${backups[$i]}" validate || failed='核心配置校验失败'
+    done
+    for i in "${!cores[@]}"; do
+        [[ -z "$failed" ]] || break
+        config="$CFG/config.json"
+        [[ "${cores[$i]}" != singbox ]] || config="$CFG/singbox.json"
+        staged=$(mktemp "${config}.new.XXXXXX") || { failed='核心配置暂存失败'; break; }
+        if ! cp -p "${backups[$i]}/candidate.json" "$staged" || ! mv "$staged" "$config"; then
+            rm -f "$staged"
+            failed='核心配置写入失败'
+        fi
+    done
+    for i in "${!cores[@]}"; do
+        [[ -z "$failed" ]] || break
+        [[ -f "${backups[$i]}/running" ]] || continue
+        service=vless-reality
+        [[ "${cores[$i]}" != singbox ]] || service=vless-singbox
+        if ! svc status "$service"; then failed='原核心已停止'; break; fi
+        touched+=("$i")
+        svc restart "$service" || { failed='核心重启失败'; break; }
+        sleep "${USER_CHANGE_HEALTH_DELAY:-1}"
+        svc status "$service" || failed='核心健康检查失败'
+    done
+    [[ -z "$failed" ]] && return 0
+    _restore_db_backup "$backup/db.json" || rollback_failed=1
+    for i in "${!cores[@]}"; do
+        config="$CFG/config.json"
+        [[ "${cores[$i]}" != singbox ]] || config="$CFG/singbox.json"
+        if [[ -f "${backups[$i]}/active.json" ]]; then
+            cp -p "${backups[$i]}/active.json" "$config" || rollback_failed=1
+        else
+            rm -f "$config" || rollback_failed=1
+        fi
+    done
+    for i in "${touched[@]}"; do
+        service=vless-reality
+        [[ "${cores[$i]}" != singbox ]] || service=vless-singbox
+        svc restart "$service" || rollback_failed=1
+        svc status "$service" || rollback_failed=1
+    done
+    [[ "$rollback_failed" == 0 ]] || _err "分流状态回滚失败，请检查备份: $backup"
+    _err "$failed，已尝试恢复原状态；备份: $backup"
+    return 1
 }
 
 # 重新生成代理配置的辅助函数
@@ -18321,8 +18411,10 @@ parse_subscription() {
     [[ -z "$content" ]] && { _err "获取订阅失败"; return 1; }
     
     # 尝试 base64 解码
-    local decoded=$(echo "$content" | base64 -d 2>/dev/null)
-    [[ -n "$decoded" ]] && content="$decoded"
+    local decoded
+    if decoded=$(printf '%s' "$content" | base64 -d 2>/dev/null) && [[ "$decoded" == *"://"* ]]; then
+        content="$decoded"
+    fi
     
     # 按行解析
     local count=0
@@ -18333,7 +18425,7 @@ parse_subscription() {
         local node=$(parse_proxy_link "$line")
         if [[ -n "$node" ]]; then
             echo "$node"
-            ((count++))
+            ((++count))
         fi
     done <<< "$content"
     
@@ -24049,6 +24141,25 @@ get_link_name() {
     echo "$name"
 }
 
+# Keep the same conversion for intermediate and final Clash VLESS nodes.
+_clash_vless_share_link() {
+    local name="$1" uuid="$2" server="$3" port="$4" network="${5:-tcp}" tls="$6"
+    local sni="$7" flow="$8" path="$9" host="${10}" pbk="${11}" sid="${12}" link
+    _is_valid_port "$port" && [[ -n "$uuid" ]] || return 1
+    link="vless://${uuid}@$(_fmt_hostport "$server" "$port")?encryption=none&type=$network"
+    [[ -z "$flow" ]] || link+="&flow=$(urlencode "$flow")"
+    if [[ "$tls" == true && -n "$pbk" ]]; then
+        link+="&security=reality&fp=chrome&pbk=$(urlencode "$pbk")&sid=$(urlencode "$sid")"
+    elif [[ "$tls" == true ]]; then
+        link+="&security=tls"
+    else
+        link+="&security=none"
+    fi
+    [[ -z "$sni" ]] || link+="&sni=$(urlencode "$sni")"
+    [[ "$network" != ws ]] || link+="&path=$(urlencode "$path")&host=$(urlencode "$host")"
+    printf '%s#%s\n' "$link" "$(urlencode "$name")"
+}
+
 # 拉取订阅内容
 fetch_subscription() {
     local url="$1"
@@ -24068,8 +24179,8 @@ fetch_subscription() {
     [[ -z "$content" ]] && return 1
     
     # 尝试 Base64 解码
-    local decoded=$(echo "$content" | base64 -d 2>/dev/null)
-    if [[ -n "$decoded" && "$decoded" == *"://"* ]]; then
+    local decoded
+    if decoded=$(printf '%s' "$content" | base64 -d 2>/dev/null) && [[ "$decoded" == *"://"* ]]; then
         echo "$decoded"
         return 0
     fi
@@ -24103,12 +24214,10 @@ fetch_subscription() {
                 if [[ -n "$name" && -n "$type" && -n "$server" && -n "$port" ]]; then
                     case "$type" in
                         vless)
-                            local link="vless://${uuid}@${server}:${port}?encryption=none"
-                            [[ -n "$flow" ]] && link+="&flow=$flow"
-                            [[ "$tls" == "true" ]] && link+="&security=reality&type=${network:-tcp}&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid" || link+="&security=none&type=${network:-tcp}"
-                            [[ "$network" == "ws" ]] && link+="&type=ws&path=$(urlencode "$path")&host=$host"
-                            link+="#$(urlencode "$name")"
-                            links+="$link"$'\n'
+                            local link
+                            if link=$(_clash_vless_share_link "$name" "$uuid" "$server" "$port" "$network" "$tls" "$sni" "$flow" "$path" "$host" "$pbk" "$sid"); then
+                                links+="$link"$'\n'
+                            fi
                             ;;
                         vmess)
                             local vmess_json="{\"v\":\"2\",\"ps\":\"$name\",\"add\":\"$server\",\"port\":\"$port\",\"id\":\"$uuid\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"${network:-tcp}\",\"type\":\"none\",\"host\":\"$host\",\"path\":\"$path\",\"tls\":\"$([[ "$tls" == "true" ]] && echo "tls" || echo "")\",\"sni\":\"$sni\"}"
@@ -24159,11 +24268,10 @@ fetch_subscription() {
         if [[ -n "$name" && -n "$type" && -n "$server" && -n "$port" ]]; then
             case "$type" in
                 vless)
-                    local link="vless://${uuid}@${server}:${port}?encryption=none"
-                    [[ -n "$flow" ]] && link+="&flow=$flow"
-                    [[ "$tls" == "true" ]] && link+="&security=reality&type=${network:-tcp}&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid" || link+="&security=none&type=${network:-tcp}"
-                    link+="#$(urlencode "$name")"
-                    links+="$link"$'\n'
+                    local link
+                    if link=$(_clash_vless_share_link "$name" "$uuid" "$server" "$port" "$network" "$tls" "$sni" "$flow" "$path" "$host" "$pbk" "$sid"); then
+                        links+="$link"$'\n'
+                    fi
                     ;;
                 vmess)
                     local vmess_json="{\"v\":\"2\",\"ps\":\"$name\",\"add\":\"$server\",\"port\":\"$port\",\"id\":\"$uuid\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"${network:-tcp}\",\"type\":\"none\",\"host\":\"$host\",\"path\":\"$path\",\"tls\":\"$([[ "$tls" == "true" ]] && echo "tls" || echo "")\",\"sni\":\"$sni\"}"
@@ -24797,7 +24905,7 @@ reset_sub_uuid() {
 
 _is_valid_port() {
     local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 ))
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 ))
 }
 
 _is_valid_ipv4_literal() {
@@ -24807,7 +24915,7 @@ _is_valid_ipv4_literal() {
     IFS='.' read -r -a parts <<<"$value"
     [[ ${#parts[@]} -eq 4 ]] || return 1
     for octet in "${parts[@]}"; do
-        [[ "$octet" =~ ^[0-9]+$ ]] && (( 10#$octet <= 255 )) || return 1
+        [[ "$octet" =~ ^[0-9]{1,3}$ ]] && (( 10#$octet <= 255 )) || return 1
     done
 }
 
@@ -24820,6 +24928,7 @@ _is_valid_ipv6_literal() {
         [[ "$without_first" != *::* ]] || return 1
         left="${value%%::*}"
         right="${value#*::}"
+        [[ "$left" != :* && "$left" != *: && "$right" != :* && "$right" != *: ]] || return 1
         [[ -z "$left" ]] || IFS=':' read -r -a left_parts <<<"$left"
         [[ -z "$right" ]] || IFS=':' read -r -a right_parts <<<"$right"
         (( ${#left_parts[@]} + ${#right_parts[@]} < 8 )) || return 1
@@ -24853,21 +24962,16 @@ _is_valid_dns_name() {
 }
 
 _is_valid_domain_or_ip() {
-    local value="$1" octet
+    local value="$1"
     [[ -z "$value" ]] && return 0
     if [[ "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        local parts=()
-        IFS='.' read -r -a parts <<<"$value"
-        [[ ${#parts[@]} -eq 4 ]] || return 1
-        for octet in "${parts[@]}"; do
-            [[ "$octet" =~ ^[0-9]+$ ]] && (( 10#$octet <= 255 )) || return 1
-        done
-        return 0
+        _is_valid_ipv4_literal "$value"
+        return $?
     fi
     if [[ "$value" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
         return 0
     fi
-    [[ "$value" == *:* && "$value" != *:::* && "$value" =~ ^[0-9a-fA-F:]+$ ]]
+    _is_valid_ipv6_literal "$value"
 }
 
 _is_valid_subscription_url() {
@@ -24878,49 +24982,62 @@ _is_valid_subscription_url() {
 }
 
 _write_sub_info() {
-    local uuid_value="$1" port_value="$2" domain_value="$3" https_value="$4"
+    local uuid_value="$1" port_value="$2" domain_value="$3" https_value="$4" staged
     [[ "$uuid_value" =~ ^[0-9a-fA-F-]{16,64}$ ]] || return 1
     _is_valid_port "$port_value" || return 1
     _is_valid_domain_or_ip "$domain_value" || return 1
     [[ "$https_value" == "true" || "$https_value" == "false" ]] || return 1
-    {
-        printf 'sub_uuid=%s\n' "$uuid_value"
-        printf 'sub_port=%s\n' "$port_value"
-        printf 'sub_domain=%s\n' "$domain_value"
-        printf 'sub_https=%s\n' "$https_value"
-    } >"$CFG/sub.info"
-    chmod 600 "$CFG/sub.info"
+    staged=$(mktemp "$CFG/sub.info.XXXXXX") || return 1
+    if ! {
+        printf 'sub_uuid=%s\nsub_port=%s\nsub_domain=%s\nsub_https=%s\n' \
+            "$uuid_value" "$port_value" "$domain_value" "$https_value"
+    } >"$staged" || ! chmod 600 "$staged" || ! mv -f "$staged" "$CFG/sub.info"; then
+        rm -f "$staged"
+        return 1
+    fi
 }
 
 # 仅解析白名单字段，不执行 sub.info 中的 shell 代码。
 _load_sub_info() {
     local file="${1:-$CFG/sub.info}" line key value
+    local candidate_uuid='' candidate_port='' candidate_domain='' candidate_https=''
+    local -A seen=()
     [[ -f "$file" ]] || return 1
     while IFS= read -r line || [[ -n "$line" ]]; do
         key=${line%%=*}
         value=${line#*=}
         case "$key" in
+            sub_uuid|sub_port|sub_domain|sub_https)
+                [[ "$line" == *=* && -z "${seen[$key]:-}" ]] || return 1
+                seen[$key]=1 ;;
+        esac
+        case "$key" in
             sub_uuid)
                 [[ "$value" =~ ^[0-9a-fA-F-]{16,64}$ ]] || return 1
-                printf -v sub_uuid '%s' "$value"
+                candidate_uuid="$value"
                 ;;
             sub_port)
                 _is_valid_port "$value" || return 1
-                printf -v sub_port '%s' "$value"
+                candidate_port="$value"
                 ;;
             sub_domain)
                 _is_valid_domain_or_ip "$value" || return 1
-                printf -v sub_domain '%s' "$value"
+                candidate_domain="$value"
                 ;;
             sub_https)
                 [[ "$value" == "true" || "$value" == "false" ]] || return 1
-                printf -v sub_https '%s' "$value"
+                candidate_https="$value"
                 ;;
             ""|\#*) ;;
             *) return 1 ;;
         esac
     done <"$file"
-    [[ -n "${sub_uuid:-}" && -n "${sub_port:-}" && -n "${sub_https:-}" ]]
+    [[ -n "${seen[sub_uuid]:-}" && -n "${seen[sub_port]:-}" &&
+       -n "${seen[sub_domain]:-}" && -n "${seen[sub_https]:-}" ]] || return 1
+    printf -v sub_uuid '%s' "$candidate_uuid"
+    printf -v sub_port '%s' "$candidate_port"
+    printf -v sub_domain '%s' "$candidate_domain"
+    printf -v sub_https '%s' "$candidate_https"
 }
 
 # 生成 V2Ray/通用 Base64 订阅内容
@@ -25425,23 +25542,50 @@ EOF
 
 # 生成订阅文件
 generate_sub_files() {
-    local sub_uuid=$(get_sub_uuid)
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock generate_sub_files "$@"; return $?; fi
+    local sub_uuid stage file failed=0
+    sub_uuid=$(get_sub_uuid) || return 1
+    [[ "$sub_uuid" =~ ^[A-Za-z0-9-]+$ ]] || return 1
     local sub_dir="$CFG/subscription/$sub_uuid"
-    mkdir -p "$sub_dir"
-    chmod 711 "$CFG" "$CFG/subscription" "$sub_dir"
-    
+    mkdir -p "$sub_dir" || return 1
+    stage=$(mktemp -d "$CFG/subscription/.generate.XXXXXX") || return 1
     _info "生成订阅文件..."
-    
-    # V2Ray/通用订阅
-    gen_v2ray_sub > "$sub_dir/base64"
-    
-    # Clash 订阅
-    gen_clash_sub > "$sub_dir/clash.yaml"
-    
-    # Surge 订阅
-    gen_surge_sub > "$sub_dir/surge.conf"
-    
-    chmod 644 "$sub_dir"/*
+    if ! (set -o pipefail; gen_v2ray_sub) > "$stage/base64" ||
+       ! gen_clash_sub > "$stage/clash.yaml" ||
+       ! gen_surge_sub > "$stage/surge.conf"; then
+        rm -rf "$stage"
+        _err "订阅生成失败，保留原文件"
+        return 1
+    fi
+    local -a published=()
+    for file in base64 clash.yaml surge.conf; do
+        chmod 644 "$stage/$file" || { failed=1; break; }
+        [[ ! -e "$sub_dir/$file" ]] || cp -p "$sub_dir/$file" "$stage/$file.previous" || { failed=1; break; }
+    done
+    if [[ "$failed" == 0 ]]; then
+        chmod 711 "$CFG" "$CFG/subscription" "$sub_dir" || failed=1
+    fi
+    if [[ "$failed" == 0 ]]; then
+        for file in base64 clash.yaml surge.conf; do
+            mv -f "$stage/$file" "$sub_dir/$file" || { failed=1; break; }
+            published+=("$file")
+        done
+    fi
+    if [[ "$failed" != 0 ]]; then
+        local rollback_failed=0
+        for file in "${published[@]}"; do
+            if [[ -f "$stage/$file.previous" ]]; then
+                mv -f "$stage/$file.previous" "$sub_dir/$file" || rollback_failed=1
+            else
+                rm -f "$sub_dir/$file" || rollback_failed=1
+            fi
+        done
+        if [[ "$rollback_failed" == 0 ]]; then rm -rf "$stage"
+        else _err "订阅回滚失败，备份保留在: $stage"; fi
+        _err "订阅发布失败"
+        return 1
+    fi
+    rm -rf "$stage"
     _ok "订阅文件已生成"
 }
 
@@ -25450,7 +25594,7 @@ setup_nginx_sub() {
     local sub_uuid=$(get_sub_uuid)
     local sub_port="${1:-8443}" domain="${2:-}" use_https="${3:-true}"
 
-    generate_sub_files
+    generate_sub_files || return 1
     local sub_dir="$CFG/subscription/$sub_uuid"
     local fake_conf="/etc/nginx/conf.d/vless-fake.conf"
     [[ -d "/etc/nginx/http.d" ]] && fake_conf="/etc/nginx/http.d/vless-fake.conf"
@@ -25626,7 +25770,7 @@ manage_subscription() {
         if [[ -f "$CFG/sub.info" ]]; then
             case $choice in
                 1) show_sub_links; _pause ;;
-                2) generate_sub_files; _ok "订阅内容已更新"; _pause ;;
+                2) generate_sub_files && _ok "订阅内容已更新"; _pause ;;
                 3) manage_external_nodes ;;
                 4) setup_subscription_interactive ;;
                 5) 
@@ -25749,7 +25893,7 @@ setup_subscription_interactive() {
     [[ "$https_choice" =~ ^[nN]$ ]] && use_https="false"
     
     # 生成订阅文件
-    generate_sub_files
+    generate_sub_files || return 1
     
     # 获取订阅 UUID
     local sub_uuid=$(get_sub_uuid)
@@ -30602,8 +30746,13 @@ _snell_apply_users() {
         _snell_write_service "$proto" "$id" || return 1
         if _snell_prepare_user "$proto" "$id"; then
             svc enable "$service" || return 1
+            svc is-enabled "$service" || return 1
             if svc status "$service"; then
-                [[ "$changed" == false ]] || svc restart "$service" || failed=1
+                if [[ "$changed" == true ]]; then
+                    svc restart "$service" || failed=1
+                    sleep 1
+                    svc status "$service" || failed=1
+                fi
             else
                 svc start "$service" || failed=1
                 sleep 1
@@ -30612,8 +30761,10 @@ _snell_apply_users() {
         else
             local prepare_status=$?
             [[ "$prepare_status" == 2 ]] || { _err "用户 $id 计数规则准备失败"; return 1; }
-            svc stop "$service" || true
-            svc disable "$service" || true
+            svc stop "$service" || { _err "Snell 用户实例停止失败: $service"; return 1; }
+            if svc status "$service"; then _err "Snell 用户实例仍在运行: $service"; return 1; fi
+            svc disable "$service" || { _err "Snell 用户实例取消自启失败: $service"; return 1; }
+            if svc is-enabled "$service"; then _err "Snell 用户实例仍启用自启: $service"; return 1; fi
         fi
     done <<< "$(_snell_rows "$proto")"
     return "$failed"
@@ -30634,13 +30785,71 @@ _snell_group_service() {
     return "$result"
 }
 
-_snell_sync_traffic() {
+_snell_user_change_begin() {
+    local proto="$1" name="$2" row id backup unit service
+    row=$(_snell_rows "$proto" | jq -esc --arg n "$name" '[.[] | select(.users[0].name == $n)] | if length == 1 then .[0] else error("ambiguous user") end') || return 1
+    id=$(jq -r .snell_id <<< "$row")
+    [[ "$id" =~ ^[0-9a-f]{24}$ && -f "$CFG/snell-users/$id.conf" ]] || return 1
+    mkdir -p "$CFG/backups/user-changes" || return 1
+    backup=$(mktemp -d "$CFG/backups/user-changes/snell.XXXXXX") || return 1
+    service="vless-snellu-$id"
+    unit="/etc/systemd/system/$service.service"
+    [[ "$DISTRO" != alpine ]] || unit="/etc/init.d/$service"
+    cp -p "$DB_FILE" "$backup/db.json" && cp -p "$CFG/snell-users/$id.conf" "$backup/active.conf" || return 1
+    [[ ! -f "$unit" ]] || cp -p "$unit" "$backup/unit" || return 1
+    printf '%s\n' "$id" > "$backup/id" || return 1
+    svc status "$service" >/dev/null 2>&1 && touch "$backup/running"
+    svc is-enabled "$service" >/dev/null 2>&1 && touch "$backup/enabled"
+    printf '%s\n' "$backup"
+}
+
+_snell_user_change_restore() {
+    local backup="$1" id service unit failed=0 unit_changed=false
+    id=$(cat "$backup/id") || return 1
+    [[ "$id" =~ ^[0-9a-f]{24}$ ]] || return 1
+    service="vless-snellu-$id"
+    unit="/etc/systemd/system/$service.service"
+    [[ "$DISTRO" != alpine ]] || unit="/etc/init.d/$service"
+    _restore_db_backup "$backup/db.json" || return 1
+    cp -p "$backup/active.conf" "$CFG/snell-users/$id.conf" || failed=1
+    if [[ -f "$backup/unit" ]]; then
+        if ! cmp -s "$backup/unit" "$unit"; then
+            cp -p "$backup/unit" "$unit" || failed=1
+            unit_changed=true
+        fi
+    elif [[ -f "$unit" ]]; then
+        rm -f "$unit" || failed=1
+        unit_changed=true
+    fi
+    if [[ "$unit_changed" == true && "$DISTRO" != alpine ]]; then systemctl daemon-reload || failed=1; fi
+    if [[ -f "$backup/enabled" ]]; then
+        svc enable "$service" || failed=1
+        svc is-enabled "$service" || failed=1
+    else
+        svc disable "$service" || failed=1
+        if svc is-enabled "$service"; then failed=1; fi
+    fi
+    if [[ -f "$backup/running" ]]; then
+        svc status "$service" >/dev/null 2>&1 || svc start "$service" || failed=1
+        svc status "$service" >/dev/null 2>&1 || failed=1
+    else
+        if svc status "$service" >/dev/null 2>&1; then svc stop "$service" || failed=1; fi
+        if svc status "$service" >/dev/null 2>&1; then failed=1; fi
+    fi
+    return "$failed"
+}
+
+# Read counters only: callers can establish a reset/change boundary without
+# recursively applying quotas or changing another user's service state.
+_snell_account_traffic() {
     local proto row id snapshot up down generation
+    local only_proto="${1:-}"
     _snell_any_managed || return 0
     _snell_nft_ready || return 1
     snapshot=$(nft -j list table inet vless_snell_users) || return 1
     jq -e '.nftables | type == "array"' <<< "$snapshot" >/dev/null || return 1
     for proto in snell snell-v5 snell-v6; do
+        [[ -z "$only_proto" || "$only_proto" == "$proto" ]] || continue
         _snell_managed "$proto" || continue
         while IFS= read -r row; do
             id=$(jq -r .snell_id <<< "$row")
@@ -30659,6 +30868,14 @@ _snell_sync_traffic() {
                         .counter_up = $up | .counter_down = $down | .counter_generation = $g
                     ) else . end)' || return 1
         done <<< "$(_snell_rows "$proto")"
+    done
+}
+
+_snell_sync_traffic() {
+    local proto row
+    _snell_account_traffic || return 1
+    for proto in snell snell-v5 snell-v6; do
+        _snell_managed "$proto" || continue
         while IFS= read -r row; do
             local name used quota enabled expire
             name=$(jq -r '.users[0].name' <<< "$row")
@@ -30984,7 +31201,7 @@ case "${1:-}" in
         check_root
         init_db
         install_expire_check_cron
-        exit 0
+        exit $?
         ;;
     --help|-h)
         echo "用法: $0 [选项]"

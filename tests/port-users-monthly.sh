@@ -16,7 +16,7 @@ for fn in _ss2022_key_len _ss2022_valid_key _ss2022_share_password gen_xray_ss20
     _db_lock_acquire _db_lock_release _with_db_lock _restore_db_backup \
     _traffic_snapshot _xray_traffic_counters _commit_traffic_snapshots \
     _user_management_supported _user_change_begin _user_change_apply db_add_user db_del_user \
-    db_set_user_enabled db_get_user db_get_user_field db_get_users_stats db_list_users \
+    db_set_user_enabled db_get_user db_get_user_field db_get_user_alert_state db_set_user_alert_state db_get_users_stats db_list_users \
     gen_xray_vless_clients gen_xray_vmess_clients gen_xray_trojan_clients \
     reset_monthly_user_traffic check_monthly_traffic_reset \
     _sync_all_user_traffic_unlocked; do
@@ -142,6 +142,7 @@ jq -e '.xray.ss2022[0].users[0] | .enabled == false and .used == 0' "$DB_FILE" >
 jq -e '.xray.ss2022[1].users[0] | .enabled == false and .used == 0' "$DB_FILE" >/dev/null
 [[ $(cat "$fixture/snell-applies") == 'snell-v6|snell-quota' ]]
 [[ $(cat "$TRAFFIC_MONTHLY_RESET_LAST_FILE") == $(date +%Y-%m) ]]
+
 [[ ! -f "$fixture/starts" ]]
 
 _db_apply '.xray.trojan[1].users |= map(if .name == "quota" then .enabled=false | .disabled_reason="quota" | .used=35 else . end) | .xray["snell-v6"][0].users[0] |= (.enabled=false | .disabled_reason="quota" | .used=35)'
@@ -170,6 +171,15 @@ rm -f "$TRAFFIC_MONTHLY_RESET_LAST_FILE"
 _sync_all_user_traffic_unlocked true
 [[ $(jq -r '.xray.trojan[1].users[] | select(.name == "alice") | .used' "$DB_FILE") == 0 ]]
 [[ $(cat "$TRAFFIC_MONTHLY_RESET_LAST_FILE") == $(date +%Y-%m) ]]
+
+# Exercise the real alert-state helpers, including duplicate suppression.
+tg_send_quota_alert() { echo "$1" >> "$fixture/quota-alerts"; }
+_db_apply '.xray.trojan[1].users |= map(if .name == "alice" then .quota=100 | .used=80 | .enabled=true | del(.last_alert_percent) else . end)'
+_sync_all_user_traffic_unlocked false
+[[ $(db_get_user_alert_state xray trojan alice last_alert_percent) == 80 ]]
+_sync_all_user_traffic_unlocked false
+[[ $(cat "$fixture/quota-alerts") == alice ]]
+echo 'PASS real alert-state helpers persist the threshold and suppress duplicate notifications'
 
 _db_apply '.xray.ss2022={port:33335,password:"MDEyMzQ1Njc4OWFiY2RlZg==",method:"2022-blake3-aes-128-gcm"}'
 rm -f "$CFG/config.json" "$fixture/vless-reality.running"

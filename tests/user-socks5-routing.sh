@@ -8,7 +8,7 @@ DB_FILE="$fixture/db.json"
 load_function() {
     eval "$(awk -v fn="$1" 'index($0, fn "() {") == 1 {on=1} on {print} on && $0 == "}" {exit}' "$repo/vless-server.sh")"
 }
-for fn in _select_user_socks5_routing _select_user_routing _is_valid_domain_or_ip _is_valid_port db_chain_node_exists db_add_chain_node db_get_chain_node gen_xray_chain_outbound gen_singbox_chain_outbound db_set_user_routing db_get_user_routing; do
+for fn in _select_user_socks5_routing _select_user_routing _is_valid_domain_or_ip _is_valid_ipv4_literal _is_valid_ipv6_literal _is_valid_port db_chain_node_exists db_add_chain_node db_get_chain_node gen_xray_chain_outbound gen_singbox_chain_outbound db_set_user_routing db_get_user_routing; do
     load_function "$fn"
 done
 _db_apply() { jq "$@" "$DB_FILE" > "$fixture/new.json" && mv "$fixture/new.json" "$DB_FILE"; }

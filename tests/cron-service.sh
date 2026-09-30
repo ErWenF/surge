@@ -10,7 +10,7 @@ DISTRO=debian
 load_function() {
     eval "$(awk -v fn="$1" 'index($0, fn "() {") == 1 {on=1} on {print} on && $0 == "}" {exit}' "$repo/vless-server.sh")"
 }
-for fn in ensure_cron_service_running setup_traffic_cron setup_tg_user_bot_cron; do load_function "$fn"; done
+for fn in ensure_cron_service_running setup_traffic_cron setup_tg_user_bot_cron install_expire_check_cron; do load_function "$fn"; done
 
 cron_service_is_active() { [[ -f "$fixture/active" ]]; }
 cron() { touch "$fixture/active"; }
@@ -48,3 +48,13 @@ cron() { touch "$fixture/active"; }
 setup_tg_user_bot_cron true
 [[ -f "$fixture/entry" ]]
 echo 'PASS direct cron fallback and no half-enabled scheduled jobs'
+
+install_cron_entry() { return 1; }
+if install_expire_check_cron; then echo 'FAIL expire cron masked installation failure'; exit 1; fi
+install_cron_entry() { :; }
+install_expire_check_cron
+echo 'PASS expire cron installation propagates failure'
+printf 'check_root() { :; }\ninit_db() { :; }\ninstall_expire_check_cron() { return 1; }\n' > "$fixture/cli.sh"
+awk '/^# 命令行参数处理$/ {on=1} on {print}' "$repo/vless-server.sh" >> "$fixture/cli.sh"
+if bash "$fixture/cli.sh" --setup-expire-cron; then exit 1; fi
+echo 'PASS expire cron CLI exits nonzero on installation failure'

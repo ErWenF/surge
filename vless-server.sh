@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.7"
+readonly VERSION="3.7.8"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -30399,16 +30399,26 @@ perform_script_update() {
     
     _init_version_cache
     local tmp_file="" remote_ver=""
-    remote_ver=$(_get_latest_script_version "true" "false")
-    if [[ -z "$remote_ver" ]]; then
-        _err "无法获取远程版本信息"
+    # An explicit check must bypass the UI cache and use the exact verified file
+    # that will be installed. Failed network/blob checks cannot imply "latest".
+    tmp_file=$(_fetch_script_tmp 10 60)
+    if [[ -z "$tmp_file" || ! -f "$tmp_file" ]]; then
+        _err "无法下载或校验远程脚本，请检查 GitHub 网络连接；当前脚本未更改"
         return 1
     fi
+    remote_ver=$(_extract_script_version "$tmp_file")
+    if [[ ! "$remote_ver" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
+        rm -f "$tmp_file"
+        _err "下载脚本缺少有效版本标识，已拒绝更新"
+        return 1
+    fi
+    _save_version_cache "$SCRIPT_REPO" "$remote_ver" "$SCRIPT_VERSION_CACHE_FILE" || true
     
     echo -e "  最新版本: ${C}v${remote_ver}${NC}"
     
     # 比较版本 - 只有远程版本更新时才提示更新
     if ! _version_gt "$remote_ver" "$VERSION"; then
+        rm -f "$tmp_file"
         _ok "已是最新版本"
         return 0
     fi
@@ -30416,26 +30426,11 @@ perform_script_update() {
     _line
     read -rp "  发现新版本，是否更新? [Y/n]: " confirm
     if [[ "$confirm" =~ ^[nN]$ ]]; then
+        rm -f "$tmp_file"
         return 0
     fi
     
     _info "更新中..."
-    tmp_file=$(_fetch_script_tmp 10)
-    if [[ -z "$tmp_file" || ! -f "$tmp_file" ]]; then
-        _err "下载失败，请检查网络连接"
-        return 1
-    fi
-    local downloaded_ver
-    downloaded_ver=$(_extract_script_version "$tmp_file")
-    if [[ -z "$downloaded_ver" || ! "$downloaded_ver" =~ ^[0-9A-Za-z._-]+$ ]]; then
-        rm -f "$tmp_file"
-        _err "下载脚本缺少有效版本标识，已拒绝更新"
-        return 1
-    fi
-    if [[ -n "$downloaded_ver" && "$downloaded_ver" != "$remote_ver" ]]; then
-        remote_ver="$downloaded_ver"
-        echo "$remote_ver" > "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null
-    fi
     
     # 获取当前脚本路径
     local script_path=$(readlink -f "$0")

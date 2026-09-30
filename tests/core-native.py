@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify generated SS2022 configurations, live accounting and port routing."""
 import importlib.util
+import datetime
 import json
 import os
 import socket
@@ -190,6 +191,36 @@ def main(binary, singbox):
             operation("singbox-route", trojan_a, "default")
             traffic(trojan_a, "native-a", protocol="trojan")
             print("PASS real Sing-box Trojan TCP/UDP, per-port disable/re-enable, unavailable relay fails closed and sibling remains usable")
+
+            # Independent cycles restore actual authentication after quota suspension.
+            operation("cycle-disable", "xray", "ss2022", "default-a")
+            operation("cycle-disable", "singbox", "trojan", f"default-{trojan_a}")
+            traffic(a, user_a, False)
+            traffic(trojan_a, "native-a", False, protocol="trojan")
+            state = database()
+            anchor = (datetime.date.today() - datetime.timedelta(days=30)).isoformat()
+            for user in (state["xray"]["ss2022"][0]["users"][0], state["singbox"]["trojan"][0]["users"][0]):
+                user["traffic_reset"] = {"days": 30, "anchor": anchor, "last_period": 0}
+                user["quota"] = 1_000_000
+                user["used"] = 1_000_001
+            untouched = state["xray"]["ss2022"][1]["users"][0].copy()
+            (cfg / "db.json").write_text(json.dumps(state))
+            operation("cycles")
+            state = database()
+            for user in (state["xray"]["ss2022"][0]["users"][0], state["singbox"]["trojan"][0]["users"][0]):
+                assert user["enabled"] and user["used"] == 0 and user["traffic_reset"]["last_period"] == 1
+            assert state["xray"]["ss2022"][1]["users"][0] == untouched
+            before = (cfg / "db.json").read_bytes()
+            operation("cycles")
+            assert (cfg / "db.json").read_bytes() == before
+            traffic(a, user_a)
+            traffic(trojan_a, "native-a", protocol="trojan")
+            traffic(b, user_b)
+            traffic(trojan_b, "native-b", protocol="trojan")
+            operation("sync")
+            assert database()["xray"]["ss2022"][0]["users"][0]["used"] > 0
+            assert database()["singbox"]["trojan"][0]["users"][0]["used"] > 0
+            print("PASS native 30-day cycles: Xray/Sing-box quota recovery, unchanged sibling, idempotence and renewed TCP/UDP accounting")
         finally:
             for service in ("vless-reality", "vless-singbox"):
                 pidfile = root / f"{service}.pid"

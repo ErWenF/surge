@@ -37,6 +37,7 @@ _singbox_stats_config_ready
 echo 'PASS detects omitted VLESS/Trojan stats users in existing configuration'
 _ensure_singbox_default_users() { :; }
 check_monthly_traffic_reset() { :; }
+check_user_traffic_cycles() { :; }
 _snell_sync_traffic() { :; }
 check_daily_report() { :; }
 _pgrep() { [[ "$1" == sing-box ]]; }

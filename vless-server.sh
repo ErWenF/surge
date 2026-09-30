@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.6"
+readonly VERSION="3.7.7"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -922,7 +922,7 @@ gen_xray_socks_accounts() {
 # enabled: 是否启用
 
 # 添加用户到协议 (支持多端口数组格式)
-# 用法: db_add_user core protocol name credential [quota_gb] [expire_date] [port] [routing] [allow_migration]
+# 用法: db_add_user core protocol name credential [quota_gb] [expire_date] [port] [routing] [allow_migration] [reset_days]
 _user_management_supported() {
     case "$1:$2" in
         xray:vless|xray:vless-*|xray:vmess-ws|xray:trojan|xray:trojan-ws|xray:ss2022|singbox:vless|singbox:trojan|singbox:hy2|singbox:tuic|singbox:anytls) return 0 ;;
@@ -967,6 +967,8 @@ _user_change_apply() {
     local core="$1" backup="$2" config service binary candidate staged failed='' restarted=false
     local reload="${3:-true}" removed_ports="${4:-[]}"
     local check_port="${5:-}"
+    local extra_traffic_backups=()
+    [[ -z "${6:-}" ]] || extra_traffic_backups+=("$6")
     case "$core" in
         xray) config="$CFG/config.json"; service=vless-reality; binary="${XRAY_BIN:-/usr/local/bin/xray}" ;;
         singbox) config="$CFG/singbox.json"; service=vless-singbox; binary="${SINGBOX_BIN:-/usr/local/bin/sing-box}" ;;
@@ -1014,7 +1016,7 @@ _user_change_apply() {
         fi
         if [[ -z "$failed" && -f "$backup/running" ]]; then
             # Capture again after slow generation/validation, immediately before switching.
-            _flush_core_traffic "$core" "$backup/active.json" "$backup/db.json" || failed='切换前流量收尾失败'
+            _flush_core_traffic "$core" "$backup/active.json" "$backup/db.json" "${extra_traffic_backups[@]}" || failed='切换前流量收尾失败'
         fi
         if [[ -z "$failed" ]]; then
             restarted=true
@@ -1057,6 +1059,8 @@ _user_change_apply() {
 db_add_user() {
     if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock db_add_user "$@"; return $?; fi
     local core="$1" proto="$2" name="$3" uuid="$4" quota_gb="${5:-0}" expire_date="${6:-}" port="${7:-}" routing="${8:-}" allow_migration="${9:-false}" backup
+    local reset_days="${10:-0}" cycle='{}'
+    [[ "$reset_days" == 0 || "$reset_days" == 30 ]] || return 1
     [[ ! -f "$DB_FILE" ]] && return 1
     [[ "$name" != default && "$name" != default-* ]] || { _err "default 为系统保留用户名"; return 1; }
     
@@ -1141,13 +1145,17 @@ db_add_user() {
     fi
     
     local created=$(date '+%Y-%m-%d')
+    if [[ "$reset_days" == 30 ]]; then
+        _ensure_cycle_traffic_sync || return 1
+        cycle=$(jq -nc --arg anchor "$created" '{traffic_reset:{days:30,anchor:$anchor,last_period:0}}') || return 1
+    fi
     
     # 添加用户 (支持多端口数组，包含 expire_date)
     _flush_core_traffic "$core" || return 1
     backup=$(_user_change_begin "$core") || return 1
     if [[ "$ss2022" == true ]]; then
         _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg u "$uuid" --arg d "$default_key" \
-            --arg port "$port" --arg r "$routing" --argjson q "$quota" --arg cr "$created" --arg exp "$expire_date" '
+            --arg port "$port" --arg r "$routing" --argjson q "$quota" --arg cr "$created" --arg exp "$expire_date" --argjson cycle "$cycle" '
             def add_ss_user:
                 (if .multi_user == true then . else
                     .multi_user = true |
@@ -1156,14 +1164,14 @@ db_add_user() {
                             uuid:$d,quota:0,used:0,enabled:true,created:$cr,expire_date:""}]
                     else [.users[0] | .name = ("default-" + $port) | .uuid = $d] end)
                 end) |
-                .users += [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp,routing:$r}];
+                .users += [({name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp,routing:$r} + $cycle)];
             if (.[$c][$p] | type) == "array" then
                 .[$c][$p] |= map(if (.port | tostring) == $port then add_ss_user else . end)
             else .[$c][$p] |= add_ss_user end
         ' || return 1
     else
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg u "$uuid" --arg port "$port" --arg r "$routing" \
-       --argjson q "$quota" --arg cr "$created" --arg exp "$expire_date" '
+       --argjson q "$quota" --arg cr "$created" --arg exp "$expire_date" --argjson cycle "$cycle" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
             .[$c][$p] |= map(
@@ -1173,12 +1181,12 @@ db_add_user() {
                     .users = [{name:("default-" + $row_port),uuid:(.uuid // .password),quota:0,used:0,enabled:true,created:$cr,expire_date:""}]
                 else . end |
                 if $row_port == $port then
-                    .users += [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp,routing:$r}]
+                    .users += [({name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp,routing:$r} + $cycle)]
                 else . end)
         else
             .[$c][$p].users = ((if ((.[$c][$p].users // []) | length) == 0 then
                 [{name:"default",uuid:(.[$c][$p].uuid // .[$c][$p].password),quota:0,used:0,enabled:true,created:$cr,expire_date:""}]
-            else .[$c][$p].users end) + [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp,routing:$r}])
+            else .[$c][$p].users end) + [({name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,expire_date:$exp,routing:$r} + $cycle)])
         end
     ' || return 1
     fi
@@ -3188,6 +3196,8 @@ _sync_all_user_traffic_unlocked() {
     
     [[ ! -f "$DB_FILE" ]] && return 1
     _ensure_singbox_default_users || return 1
+    # Reset due cycles before quota enforcement, avoiding a stop/resume at the boundary.
+    [[ "$reset" != true ]] || check_user_traffic_cycles || { mark_traffic_sync_result "cycle_reset_error" 0; return 1; }
     
     _snell_sync_traffic || { mark_traffic_sync_result "snell_error" 0; return 1; }
     
@@ -3750,49 +3760,137 @@ set_traffic_monthly_reset_day() {
     echo "$1" > "$TRAFFIC_MONTHLY_RESET_DAY_FILE"
 }
 
+_traffic_cycle_period() {
+    # Use server-local calendar dates; UTC conversion avoids DST-dependent day lengths.
+    jq -ner --arg anchor "$1" --arg today "${2:-$(date +%F)}" '
+        def epoch:
+            . as $day | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")) |
+            (. + "T00:00:00Z" | fromdateiso8601) as $sec |
+            if ($sec | strftime("%Y-%m-%d")) == $day then $sec else error("invalid date") end;
+        ($anchor | epoch) as $start | ($today | epoch) as $today_sec |
+        if $today_sec >= $start then (($today_sec - $start) / 2592000 | floor) else error("future opening date") end'
+}
+
+_ensure_cycle_traffic_sync() {
+    # Reuse an existing working task and its interval without rewriting it.
+    if traffic_cron_entry_exists && cron_service_is_active; then return 0; fi
+    setup_traffic_cron "$(get_traffic_interval)" true
+}
+
+db_set_user_traffic_cycle() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock db_set_user_traffic_cycle "$@"; return $?; fi
+    local core="$1" proto="$2" name="$3" days="$4" anchor="${5:-}" period=0 user count backup
+    [[ "$days" == 0 || "$days" == 30 ]] || return 1
+    if ! _user_management_supported "$core" "$proto" && ! { [[ "$core" == xray ]] && _snell_managed "$proto"; }; then
+        _err "此协议不支持独立用户流量周期"; return 1
+    fi
+    count=$(jq -r --arg c "$core" --arg p "$proto" --arg n "$name" '
+        [.[$c][$p] | (if type == "array" then .[] else . end) | .users[]? | select(.name == $n)] | length' "$DB_FILE") || return 1
+    [[ "$count" == 1 ]] || { _err "用户不存在或用户名对应多个入站，请先确认用户"; return 1; }
+    user=$(db_get_user "$core" "$proto" "$name") || return 1
+    if [[ "$days" == 30 ]]; then
+        [[ -n "$anchor" ]] || anchor=$(jq -r '.created // empty' <<< "$user")
+        period=$(_traffic_cycle_period "$anchor" 2>/dev/null) || { _err "请提供有效的开通日期 (YYYY-MM-DD)，不能晚于今天"; return 1; }
+        _ensure_cycle_traffic_sync || return 1
+        # Re-enabling the same cycle must not postpone an already due reset.
+        if jq -e --arg anchor "$anchor" '.traffic_reset.days == 30 and .traffic_reset.anchor == $anchor' <<< "$user" >/dev/null; then return 0; fi
+    fi
+    mkdir -p "$CFG/backups/user-changes" || return 1
+    backup=$(mktemp "$CFG/backups/user-changes/cycle.XXXXXX") || return 1
+    cp -p "$DB_FILE" "$backup" && chmod 600 "$backup" || return 1
+    # Existing traffic is preserved: enroll into the current period, reset at its next boundary.
+    _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg anchor "$anchor" --argjson days "$days" --argjson period "$period" '
+        def update_cycle:
+            if .name != $n then .
+            elif $days == 0 then del(.traffic_reset)
+            else .traffic_reset = {days:30,anchor:$anchor,last_period:$period} end;
+        .[$c][$p] |= (if type == "array" then map(.users |= map(update_cycle)) else .users |= map(update_cycle) end)'
+}
+
+_traffic_reset_plan() {
+    jq -ec --arg mode "$1" --arg today "$2" '
+        def epoch:
+            . as $day | select(type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")) |
+            (. + "T00:00:00Z" | fromdateiso8601) as $sec |
+            select(($sec | strftime("%Y-%m-%d")) == $day) | $sec;
+        ($today | epoch) as $now |
+        [ ["xray", "singbox"][] as $core |
+          (.[$core] // {} | to_entries[]) as $entry |
+          ($entry.value | if type == "array" then to_entries[] | {index:.key,row:.value} else {index:null,row:.} end) as $slot |
+          ($slot.row.users // [] | to_entries[]) as $user |
+          ($user.value | if .traffic_reset.days == 30 then
+              (try (.traffic_reset.anchor | epoch) catch null) as $start |
+              .traffic_reset.last_period as $last |
+              if $start != null and $start <= $now and ($last | type) == "number" then
+                  if $last >= 0 and $last == ($last | floor) then (($now - $start) / 2592000 | floor) else null end
+              else null end
+           else null end) as $period |
+          select(if $mode == "monthly" then $user.value.traffic_reset.days != 30
+                 else $period != null and $period > $user.value.traffic_reset.last_period end) |
+          {path:([$core,$entry.key] + (if $slot.index == null then [] else [$slot.index] end) + ["users",$user.key]),
+           core:$core,proto:$entry.key,name:$user.value.name,period:$period,
+           resume:($user.value.enabled == false and $user.value.disabled_reason == "quota" and
+               (($user.value.expire_date // "") == "" or $user.value.expire_date >= $today) and
+               (if $core == "xray" then
+                   (if ($entry.key | startswith("snell")) then $slot.row.snell_id != null
+                    else $entry.key != "ss-legacy" and ($entry.key != "ss2022" or $slot.row.multi_user == true) end)
+                else $entry.key != "ss2022" and $entry.key != "ss-legacy" end))} ]' "$DB_FILE"
+}
+
+check_user_traffic_cycles() {
+    _reset_scheduled_user_traffic cycle
+}
+
 reset_monthly_user_traffic() {
-    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock reset_monthly_user_traffic "$@"; return $?; fi
+    _reset_scheduled_user_traffic monthly
+}
+
+_reset_scheduled_user_traffic() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _reset_scheduled_user_traffic "$@"; return $?; fi
+    local mode="$1" plan
+    [[ "$mode" == monthly || "$mode" == cycle ]] || return 1
     [[ ! -f "$DB_FILE" ]] && return 0
     local month_key today restore_xray restore_singbox snell_restore monthly_backup
     local xray_backup='' singbox_backup='' xray_applied=false singbox_applied=false snell_applied=false failed=''
-    local proto name
-    _flush_core_traffic xray && _flush_core_traffic singbox || return 1
+    local proto name snell_backups='' snell_backup
     month_key=$(date +%Y-%m)
     today=$(date +%F)
-    restore_xray=$(jq --arg today "$today" '[.xray // {} | to_entries[] | select(.key | startswith("snell") | not) | select(.key != "ss-legacy") | .key as $p | .value | (if type == "array" then .[] else . end) | select($p != "ss2022" or .multi_user == true) | .users[]? | select(.enabled == false and .disabled_reason == "quota" and ((.expire_date // "") == "" or .expire_date >= $today))] | length' "$DB_FILE") || return 1
-    restore_singbox=$(jq --arg today "$today" '[.singbox // {} | to_entries[] | select(.key != "ss2022" and .key != "ss-legacy") | .value | (if type == "array" then .[] else . end) | .users[]? | select(.enabled == false and .disabled_reason == "quota" and ((.expire_date // "") == "" or .expire_date >= $today))] | length' "$DB_FILE") || return 1
-    snell_restore=$(jq -r --arg today "$today" '
-        .xray // {} | to_entries[] | select(.key | startswith("snell")) |
-        .key as $proto | .value | (if type == "array" then .[] else empty end) |
-        select(.snell_id != null) | .users[]? |
-        select(.enabled == false and .disabled_reason == "quota" and ((.expire_date // "") == "" or .expire_date >= $today)) |
-        [$proto, .name] | @tsv' "$DB_FILE") || return 1
+    plan=$(_traffic_reset_plan "$mode" "$today") || return 1
+    [[ "$mode" != cycle || "$plan" != '[]' ]] || return 0
+    _flush_core_traffic xray && _flush_core_traffic singbox || return 1
+    if [[ "$mode" == cycle ]]; then
+        # Capture Snell checkpoints without enforcing quotas or touching other instances.
+        while IFS= read -r proto; do
+            [[ -z "$proto" ]] || _snell_account_traffic "$proto" || return 1
+        done < <(jq -r '[.[] | select(.core == "xray" and (.proto | startswith("snell"))) | .proto] | unique[]' <<< "$plan")
+    fi
+    restore_xray=$(jq '[.[] | select(.resume and .core == "xray" and (.proto | startswith("snell") | not))] | length' <<< "$plan") || return 1
+    restore_singbox=$(jq '[.[] | select(.resume and .core == "singbox")] | length' <<< "$plan") || return 1
+    snell_restore=$(jq -r '.[] | select(.resume and .core == "xray" and (.proto | startswith("snell"))) | [.proto,.name] | @tsv' <<< "$plan") || return 1
     mkdir -p "$CFG/backups/user-changes" || return 1
-    monthly_backup=$(mktemp "$CFG/backups/user-changes/monthly.XXXXXX") || return 1
+    monthly_backup=$(mktemp "$CFG/backups/user-changes/$mode.XXXXXX") || return 1
     cp -p "$DB_FILE" "$monthly_backup" && chmod 600 "$monthly_backup" || return 1
     if (( restore_xray > 0 )); then xray_backup=$(_user_change_begin xray) || return 1; fi
     if (( restore_singbox > 0 )); then singbox_backup=$(_user_change_begin singbox) || return 1; fi
-    _db_apply --arg today "$today" '
-        def reset_users($resume):
-            if .users then .users |= map(
-                .used = 0 |
-                (if $resume and .enabled == false and .disabled_reason == "quota" and
-                    ((.expire_date // "") == "" or .expire_date >= $today)
-                then .enabled = true | .disabled_reason = "" else . end) |
-                del(.last_alert_percent, .quota_exceeded_notified)
-            ) else . end;
-        .xray = ((.xray // {}) | with_entries(.key as $p | .value |=
-            (if type == "array" then map(reset_users(((($p | startswith("snell") | not) and $p != "ss-legacy" and ($p != "ss2022" or .multi_user == true)) or .snell_id != null)))
-             else reset_users((($p | startswith("snell") | not) and $p != "ss-legacy" and ($p != "ss2022" or .multi_user == true))) end))) |
-        .singbox = ((.singbox // {}) | with_entries(.key as $p | .value |=
-            (if type == "array" then map(reset_users($p != "ss2022" and $p != "ss-legacy"))
-             else reset_users($p != "ss2022" and $p != "ss-legacy") end)))
+    if [[ "$mode" == cycle ]]; then
+        while IFS=$'\t' read -r proto name; do
+            [[ -n "$proto" ]] || continue
+            snell_backup=$(_snell_user_change_begin "$proto" "$name") || return 1
+            snell_backups+="$snell_backup"$'\n'
+        done <<< "$snell_restore"
+    fi
+    _db_apply --arg mode "$mode" --argjson plan "$plan" '
+        reduce $plan[] as $item (. ;
+            setpath($item.path; (getpath($item.path) | .used = 0 |
+                (if $item.resume then .enabled = true | .disabled_reason = "" else . end) |
+                (if $mode == "cycle" then .traffic_reset.last_period = $item.period else . end) |
+                del(.last_alert_percent, .quota_exceeded_notified))))
     ' || return 1
     if [[ -n "$xray_backup" ]]; then
-        if _user_change_apply xray "$xray_backup"; then xray_applied=true; else failed='Xray 恢复失败'; fi
+        if _user_change_apply xray "$xray_backup" true '[]' '' "$monthly_backup"; then xray_applied=true; else failed='Xray 恢复失败'; fi
     fi
     if [[ -z "$failed" && -n "$singbox_backup" ]]; then
-        if _user_change_apply singbox "$singbox_backup"; then singbox_applied=true; else failed='Sing-box 恢复失败'; fi
+        if _user_change_apply singbox "$singbox_backup" true '[]' '' "$monthly_backup"; then singbox_applied=true; else failed='Sing-box 恢复失败'; fi
     fi
     if [[ -z "$failed" ]]; then
         while IFS=$'\t' read -r proto name; do
@@ -3801,7 +3899,7 @@ reset_monthly_user_traffic() {
             _snell_apply_users "$proto" "$name" || { failed='Snell 恢复失败'; break; }
         done <<< "$snell_restore"
     fi
-    if [[ -z "$failed" ]]; then
+    if [[ -z "$failed" && "$mode" == monthly ]]; then
         printf '%s\n' "$month_key" > "$TRAFFIC_MONTHLY_RESET_LAST_FILE" || failed='月重置状态写入失败'
     fi
     if [[ -n "$failed" ]]; then
@@ -3815,14 +3913,27 @@ reset_monthly_user_traffic() {
             [[ ! -f "$singbox_backup/running" ]] || svc restart vless-singbox >/dev/null 2>&1 || _err "Sing-box 月重置服务回滚失败: $singbox_backup"
         fi
         if [[ "$snell_applied" == true ]]; then
-            while IFS=$'\t' read -r proto name; do
-                [[ -n "$proto" ]] && _snell_apply_users "$proto" "$name" || true
-            done <<< "$snell_restore"
+            if [[ "$mode" == cycle ]]; then
+                while IFS= read -r snell_backup; do
+                    [[ -n "$snell_backup" ]] || continue
+                    if ! cp -p "$monthly_backup" "$snell_backup/db.json" || ! _snell_user_change_restore "$snell_backup"; then
+                        _err "Snell 周期重置回滚失败: $snell_backup"
+                    fi
+                done <<< "$snell_backups"
+            else
+                while IFS=$'\t' read -r proto name; do
+                    [[ -n "$proto" ]] && _snell_apply_users "$proto" "$name" || true
+                done <<< "$snell_restore"
+            fi
         fi
         _err "$failed，已尝试恢复；数据库备份: $monthly_backup"
         return 1
     fi
-    _ok "已按月重置用户流量，人工停用及到期用户保持停用"
+    if [[ "$mode" == monthly ]]; then
+        _ok "已按月重置用户流量，独立周期用户、人工停用及到期状态保持不变"
+    else
+        _ok "已重置到期的 30 天用户流量周期，人工停用及到期用户保持停用"
+    fi
 }
 
 check_monthly_traffic_reset() {
@@ -27674,7 +27785,7 @@ _show_users_list() {
         return
     fi
     
-    printf "  ${W}%-10s %-9s %-9s %-7s %-4s %-10s${NC}\n" "用户名" "已用" "配额" "使用率" "状态" "到期"
+    printf "  ${W}%-10s %-9s %-9s %-7s %-4s %-10s %s${NC}\n" "用户名" "已用" "配额" "使用率" "状态" "到期" "流量周期"
     _line
     
     local user_list=()
@@ -27721,7 +27832,9 @@ _show_users_list() {
         
         [[ "$enabled" != "true" ]] && status_icon="${R}○${NC}"
         
-        printf "  %-10s %-9s %-9s %-7s %b  %b\n" "$name" "$used_fmt" "$quota_fmt" "$percent" "$status_icon" "$expire_fmt"
+        local cycle_display
+        cycle_display=$(_traffic_cycle_display "$(db_get_user "$core" "$proto" "$name")")
+        printf "  %-10s %-9s %-9s %-7s %b  %b  %s\n" "$name" "$used_fmt" "$quota_fmt" "$percent" "$status_icon" "$expire_fmt" "$cycle_display"
     done <<< "$stats"
     
     _line
@@ -28304,6 +28417,11 @@ _add_user() {
         fi
     fi
     
+    # 新用户可单独选择周期；留空保持原来的全局设置。
+    local reset_days=0 cycle_choice
+    read -rp "  按开通日起每 30 天重置流量? [y/N]: " cycle_choice
+    [[ ! "$cycle_choice" =~ ^[yY]$ ]] || reset_days=30
+
     # 确认
     local routing_display=$(_format_user_routing "$user_routing")
     echo ""
@@ -28314,13 +28432,14 @@ _add_user() {
     echo -e "  配额: ${G}${quota_gb:-无限制} GB${NC}"
     echo -e "  到期: ${G}$expire_display${NC}"
     echo -e "  路由: ${G}$routing_display${NC}"
+    if [[ "$reset_days" == 30 ]]; then echo -e "  流量周期: ${G}开通日起每 30 天${NC}"; else echo -e "  流量周期: ${D}沿用全局设置${NC}"; fi
     _line
     
     read -rp "  确认添加? [Y/n]: " confirm
     [[ "$confirm" =~ ^[nN]$ ]] && return
     
     # 添加到数据库 (包含 expire_date)
-    if db_add_user "$core" "$proto" "$name" "$uuid" "$quota_gb" "$expire_date" "$selected_port" "$user_routing" "$allow_migration"; then
+    if db_add_user "$core" "$proto" "$name" "$uuid" "$quota_gb" "$expire_date" "$selected_port" "$user_routing" "$allow_migration" "$reset_days"; then
         _ok "用户 $name 添加成功"
         _ok "配置已更新"
     else
@@ -28439,6 +28558,65 @@ _set_user_quota() {
         fi
         _err "无效选择"
     done
+}
+
+_traffic_cycle_display() {
+    jq -r '
+        if .traffic_reset.days != 30 then "沿用全局设置"
+        else try (
+            (.traffic_reset.anchor + "T00:00:00Z" | fromdateiso8601) as $start |
+            ($start + (.traffic_reset.last_period + 1) * 2592000 | strftime("%Y-%m-%d")) as $next |
+            "30天 / 下次 " + $next) catch "30天 / 周期数据异常" end' <<< "$1"
+}
+
+_configure_user_traffic_cycle() {
+    local core="$1" proto="$2" users user choice name anchor mode confirm i=1
+    local user_array=()
+    users=$(db_list_users "$core" "$proto")
+    [[ -n "$users" ]] || { _err "没有用户"; return 1; }
+    _line
+    echo -e "  ${W}设置用户流量周期${NC}"
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        user=$(db_get_user "$core" "$proto" "$name")
+        _item "$i" "$name ($(_traffic_cycle_display "$user"))"
+        user_array+=("$name")
+        i=$((i + 1))
+    done <<< "$users"
+    _item 0 "返回"
+    read -rp "  选择用户: " choice
+    [[ "$choice" != 0 ]] || return 0
+    [[ "$choice" =~ ^[0-9]{1,4}$ ]] && (( 10#$choice >= 1 && 10#$choice < i )) || { _err "无效选择"; return 1; }
+    name="${user_array[$((10#$choice - 1))]}"
+    user=$(db_get_user "$core" "$proto" "$name")
+    _item 1 "从开通日起，每 30 天独立重置"
+    _item 2 "沿用全局设置（取消独立周期）"
+    _item 0 "返回"
+    read -rp "  选择模式: " mode
+    case "$mode" in
+        1)
+            anchor=$(jq -r '.traffic_reset.anchor // .created // empty' <<< "$user")
+            echo -e "  ${D}不会立即清零已有流量；下一个开通日 + 30×N 天时重置。${NC}"
+            echo -e "  ${D}旧用户没有开通记录时，请填写实际开通日期。${NC}"
+            local opening_date
+            read -rp "  开通日期 YYYY-MM-DD [${anchor:-请填写}]: " opening_date
+            anchor="${opening_date:-$anchor}"
+            _traffic_cycle_period "$anchor" >/dev/null 2>&1 || { _err "开通日期无效或晚于今天"; return 1; }
+            read -rp "  确认给 $name 启用 30 天周期（保留当前流量）? [y/N]: " confirm
+            [[ "$confirm" =~ ^[yY]$ ]] || return 0
+            db_set_user_traffic_cycle "$core" "$proto" "$name" 30 "$anchor" || return 1
+            ;;
+        2)
+            _warn "取消后，该用户重新受现有全局每月重置设置控制"
+            read -rp "  确认取消 $name 的独立周期? [y/N]: " confirm
+            [[ "$confirm" =~ ^[yY]$ ]] || return 0
+            db_set_user_traffic_cycle "$core" "$proto" "$name" 0 || return 1
+            ;;
+        0) return 0 ;;
+        *) _err "无效选择"; return 1 ;;
+    esac
+    _ok "$name 的流量周期已更新，当前已用流量和节点配置未更改"
+    _info "$(_traffic_cycle_display "$(db_get_user "$core" "$proto" "$name")")"
 }
 
 # 重置用户流量
@@ -29474,6 +29652,7 @@ manage_users() {
         _item "5" "重置用户流量"
         _item "6" "启用/禁用用户"
         _item "e" "设置到期日期"
+        _item "c" "设置用户流量周期 (独立 30 天)"
         _item "r" "修改用户路由"
         _item "s" "查看用户分享链接"
         _item "p" "Snell 用户实例设置 (端口/密钥/DNS/模式)"
@@ -29527,6 +29706,12 @@ manage_users() {
             e|E)
                 if _select_protocol_for_users; then
                     _set_user_expire_date "$SELECTED_CORE" "$SELECTED_PROTO"
+                    _pause
+                fi
+                ;;
+            c|C)
+                if _select_protocol_for_users; then
+                    _configure_user_traffic_cycle "$SELECTED_CORE" "$SELECTED_PROTO"
                     _pause
                 fi
                 ;;
@@ -30931,6 +31116,7 @@ _snell_delete_user() {
 
 _snell_add_user() {
     local proto="$1" name port psk quota days expiry="" id template row managed=false
+    local reset_days=0 cycle_choice
     if ! command -v nft >/dev/null 2>&1; then
         _info "安装 Snell 用户流量统计依赖 nftables..."
         case "$DISTRO" in
@@ -30955,22 +31141,31 @@ _snell_add_user() {
     fi
     _info "$name / $proto / 端口 $port / 配额 ${quota}GB / 到期 ${expiry:-永不过期}"
     _warn "流量按客户端端口网络字节统计，含协议开销；配额每分钟检查"
+    read -rp "  按开通日起每 30 天重置流量? [y/N]: " cycle_choice
+    [[ ! "$cycle_choice" =~ ^[yY]$ ]] || reset_days=30
     read -rp "  确认创建独立用户实例? [y/N]: " confirm
     [[ "$confirm" =~ ^[yY]$ ]] || return 0
     # Input and dependency preparation do not hold the accounting/database lock.
     create_shortcut || return 1
-    _snell_add_user_commit "$proto" "$name" "$port" "$psk" "$quota" "$expiry"
+    _snell_add_user_commit "$proto" "$name" "$port" "$psk" "$quota" "$expiry" "$reset_days"
 }
 
 _snell_add_user_commit() {
     if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _snell_add_user_commit "$@"; return $?; fi
     local proto="$1" name="$2" port="$3" psk="$4" quota="$5" expiry="$6" id template row managed=false
+    local reset_days="${7:-0}" created cycle='{}'
+    [[ "$reset_days" == 0 || "$reset_days" == 30 ]] || return 1
     [[ "$name" =~ ^[A-Za-z0-9_-]{1,32}$ && "$name" != default && "$quota" =~ ^[0-9]{1,6}$ ]] || return 1
     _is_valid_port "$port" && [[ "$psk" =~ ^[A-Za-z0-9_+/=-]+$ ]] || return 1
     [[ -z "$(db_get_user xray "$proto" "$name")" ]] || { _err "用户名已被其他操作占用"; return 1; }
     [[ -z "$(is_internal_port_occupied "$port")" ]] || { _err "端口已被其他操作占用"; return 1; }
     if command -v ss >/dev/null && ss -H -lntu "( sport = :$port )" 2>/dev/null | grep -q .; then
         _err "端口已被系统占用"; return 1
+    fi
+    created=$(date +%F)
+    if [[ "$reset_days" == 30 ]]; then
+        _ensure_cycle_traffic_sync || return 1
+        cycle=$(jq -nc --arg anchor "$created" '{traffic_reset:{days:30,anchor:$anchor,last_period:0}}') || return 1
     fi
     _snell_nft_ready || return 1
     _snell_managed "$proto" && managed=true
@@ -30996,9 +31191,9 @@ _snell_add_user_commit() {
     awk -v listen="$(_fmt_hostport "$(_listen_addr)" "$port")" '
         /^[[:space:]]*listen[[:space:]]*=/ {print "listen = " listen; next} {print}
     ' "$CFG/snell-users/$(jq -r .snell_id <<< "$template").conf" > "$CFG/snell-users/$id.conf" || return 1
-    row=$(jq -c --arg id "$id" --arg name "$name" --arg psk "$psk" --arg exp "$expiry" --argjson port "$port" --argjson quota "$((10#$quota * 1073741824))" '
+    row=$(jq -c --arg id "$id" --arg name "$name" --arg psk "$psk" --arg exp "$expiry" --arg created "$created" --argjson cycle "$cycle" --argjson port "$port" --argjson quota "$((10#$quota * 1073741824))" '
         .port=$port | .psk=$psk | .snell_id=$id |
-        .users=[{id:$id,name:$name,uuid:$psk,used:0,quota:$quota,enabled:true,expire_date:$exp}]' <<< "$template") || return 1
+        .users=[({id:$id,name:$name,uuid:$psk,used:0,quota:$quota,enabled:true,created:$created,expire_date:$exp} + $cycle)]' <<< "$template") || return 1
     _db_apply --arg p "$proto" --argjson row "$row" '.xray[$p] += [$row]' || return 1
     if ! _snell_apply_users "$proto" "$name"; then
         _snell_delete_user "$proto" "$name"

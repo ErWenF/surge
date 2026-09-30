@@ -58,6 +58,8 @@ case "${1:-}" in
     disable) db_set_user_enabled xray ss2022 "$2" false ;;
     enable) db_set_user_enabled xray ss2022 "$2" true ;;
     sync) sync_all_user_traffic true ;;
+    cycles) check_user_traffic_cycles ;;
+    cycle-disable) db_set_user_enabled "$2" "$3" "$4" false quota ;;
     flush) _with_db_lock _flush_core_traffic xray ;;
     route) apply_port_routing_change xray ss2022 "$2" "$3" ;;
     singbox-check) generate_singbox_config ;;

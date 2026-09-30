@@ -22,6 +22,7 @@ svc() {
         enable) touch "$fixture/enabled" ;;
         disable) rm -f "$fixture/enabled" ;;
         start)
+            [[ ! -f "$fixture/fail-cycle-start" ]] || return 1
             "$SNELL_TEST_BIN" -c "$CFG/snell-users/$id.conf" > "$fixture/snell.log" 2>&1 &
             printf '%s\n' "$!" > "$fixture/pid"
             ;;
@@ -68,3 +69,27 @@ for runtime in stopped running; do
     svc stop "$service"
 done
 echo 'PASS native Snell edit preserves stopped/running state and restores port/process/nft rules after failure in isolated namespace'
+
+# Actual Snell process/nft checkpoint recovery at a user's independent boundary.
+anchor=$(date -d '-30 days' +%F)
+_db_apply --arg anchor "$anchor" '.xray["snell-v5"][0].users[0] |=
+    (.used=101 | .quota=100 | .enabled=false | .disabled_reason="quota" |
+     .traffic_reset={days:30,anchor:$anchor,last_period:0})'
+cp "$CFG/snell-users/$id.conf" "$fixture/cycle-before.conf"
+touch "$fixture/fail-cycle-start"
+if check_user_traffic_cycles; then exit 1; fi
+! svc status "$service"
+! svc is-enabled "$service"
+jq -e '.xray["snell-v5"][0].users[0] | .enabled == false and .traffic_reset.last_period == 0' "$DB_FILE" >/dev/null
+cmp "$CFG/snell-users/$id.conf" "$fixture/cycle-before.conf"
+rm "$fixture/fail-cycle-start"
+check_user_traffic_cycles
+svc status "$service"
+svc is-enabled "$service"
+ss -H -lnt '( sport = :32152 )' | grep -q .
+jq -e '.xray["snell-v5"][0].users[0] | .enabled == true and .used == 0 and .traffic_reset.last_period == 1' "$DB_FILE" >/dev/null
+cp "$DB_FILE" "$fixture/cycle-after.json"
+check_user_traffic_cycles
+cmp "$DB_FILE" "$fixture/cycle-after.json"
+svc stop "$service"
+echo 'PASS native Snell 30-day cycle restores quota user, retries failed start without advancing period and preserves configuration'

@@ -18,7 +18,7 @@ for fn in _ss2022_key_len _ss2022_valid_key _ss2022_share_password gen_xray_ss20
     _user_management_supported _user_change_begin _user_change_apply db_add_user db_del_user \
     db_set_user_enabled db_get_user db_get_user_field db_get_user_alert_state db_set_user_alert_state db_get_users_stats db_list_users \
     gen_xray_vless_clients gen_xray_vmess_clients gen_xray_trojan_clients \
-    reset_monthly_user_traffic check_monthly_traffic_reset \
+    _traffic_reset_plan _reset_scheduled_user_traffic check_user_traffic_cycles reset_monthly_user_traffic check_monthly_traffic_reset \
     _quota_alert_thresholds _sync_all_user_traffic_unlocked; do
     load_function "$fn"
 done

@@ -815,64 +815,32 @@ function onCellular() {
  * IP /24 判断
  * ======================================================= */
 
-function sameC24(
-  a,
-  b
-) {
-
-  if (
-    !a ||
-    !b
-  ) {
-    return false;
+function sameC24(a, b) {
+    if (!a || !b) return false;
+    a = String(a); b = String(b);
+    function ipv4(value) {
+      var parts = value.replace(/\/24$/, '').split('.');
+      if (parts.length !== 4 || !parts.every(function (part) {
+        return /^(0|[1-9][0-9]{0,2})$/.test(part) && Number(part) <= 255;
+      })) return null;
+      return parts;
+    }
+    var pa = ipv4(a), pb = ipv4(b);
+    if (pa && pb) {
+      if (a === b) return true;
+      return (a.slice(-3) === '/24' || b.slice(-3) === '/24') &&
+        pa[0] === pb[0] && pa[1] === pb[1] && pa[2] === pb[2];
+    }
+    // IPv6 exact matches remain supported; reject malformed strings/CIDRs.
+    if (a !== b || !/^[0-9a-f:]+$/i.test(a) || a.indexOf(':') < 0) return false;
+    var halves = a.split('::');
+    if (halves.length > 2) return false;
+    var groups = halves.map(function (half) { return half ? half.split(':') : []; });
+    var count = groups.reduce(function (n, group) { return n + group.length; }, 0);
+    return groups.every(function (group) { return group.every(function (part) {
+      return /^[0-9a-f]{1,4}$/i.test(part);
+    }); }) && (halves.length === 2 ? count < 8 : count === 8);
   }
-
-
-  a = String(a);
-  b = String(b);
-
-
-  if (
-    a === b
-  ) {
-    return true;
-  }
-
-
-  /*
-   * 两边都是精确 IP，
-   * 且不相等，则直接 false。
-   */
-
-  if (
-    a.slice(-3) !== "/24" &&
-    b.slice(-3) !== "/24"
-  ) {
-
-    return false;
-  }
-
-
-  var pa =
-    a
-      .replace("/24", "")
-      .split(".");
-
-
-  var pb =
-    b
-      .replace("/24", "")
-      .split(".");
-
-
-  return (
-    pa.length === 4 &&
-    pb.length === 4 &&
-    pa[0] === pb[0] &&
-    pa[1] === pb[1] &&
-    pa[2] === pb[2]
-  );
-}
 
 
 /* =========================================================

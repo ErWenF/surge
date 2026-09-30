@@ -11,7 +11,7 @@ for fn in _version_gt _get_latest_script_version _get_previous_stable_script_rel
     load_function "$fn"
 done
 
-grep -q '^readonly VERSION="3.7.5"$' "$repo/vless-server.sh"
+grep -Eq '^readonly VERSION="[0-9]+\.[0-9]+\.[0-9]+"$' "$repo/vless-server.sh"
 grep -q '^readonly SCRIPT_REPO="ErWenF/surge"$' "$repo/vless-server.sh"
 grep -q '^readonly SCRIPT_SOURCE_REPO="ErWenF/surge"$' "$repo/vless-server.sh"
 SCRIPT_REPO=ErWenF/surge

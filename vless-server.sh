@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.5"
+readonly VERSION="3.7.6"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -202,6 +202,10 @@ init_db() {
     mkdir -p "$CFG" || return 1
     # 允许 Nginx 按随机订阅路径穿越目录，但禁止普通用户列出目录内容。
     chmod 711 "$CFG" 2>/dev/null || true
+    local private_config
+    for private_config in "$CFG/config.json" "$CFG/singbox.json"; do
+        [[ ! -f "$private_config" ]] || chmod 600 "$private_config" || return 1
+    done
     _db_lock_acquire || return 1
     if [[ -f "$DB_FILE" ]]; then
         chmod 600 "$DB_FILE" 2>/dev/null || true
@@ -999,7 +1003,7 @@ _user_change_apply() {
         staged=$(mktemp "${config}.new.XXXXXX") || failed='配置暂存失败'
     fi
     if [[ -z "$failed" ]]; then
-        cp -p "$candidate" "$staged" && mv "$staged" "$config" || failed='配置写入失败'
+        cp "$candidate" "$staged" && chmod 600 "$staged" && mv "$staged" "$config" || failed='配置写入失败'
         [[ -z "$failed" ]] || rm -f "$staged"
     fi
     if [[ -z "$failed" && ( "$reload" == start || ( "$reload" == true && -f "$backup/running" ) ) ]]; then
@@ -1007,6 +1011,10 @@ _user_change_apply() {
         if [[ -f "$backup/running" ]]; then
             action=restart
             svc status "$service" >/dev/null 2>&1 || failed='原核心已停止'
+        fi
+        if [[ -z "$failed" && -f "$backup/running" ]]; then
+            # Capture again after slow generation/validation, immediately before switching.
+            _flush_core_traffic "$core" "$backup/active.json" "$backup/db.json" || failed='切换前流量收尾失败'
         fi
         if [[ -z "$failed" ]]; then
             restarted=true
@@ -3109,7 +3117,7 @@ _xray_traffic_counters() {
 }
 
 _commit_traffic_snapshots() {
-    _db_apply --slurpfile snapshots "$1" '
+    local filter='
         def account($core; $proto; $delta):
             if .users then .users |= map(
                 (if $core == "xray" then (.name + "@" + $proto) else ($proto + "-" + .name) end) as $key |
@@ -3121,14 +3129,26 @@ _commit_traffic_snapshots() {
                 (if type == "array" then map(account($s.core; $p; $s.deltas)) else account($s.core; $p; $s.deltas) end))) |
             .meta.traffic_snapshots[$s.core] = {epoch:$s.epoch,counters:$s.counters})
     '
+    if [[ -n "${2:-}" ]]; then
+        local staged
+        staged=$(mktemp "${2}.stats.XXXXXX") || return 1
+        if ! jq --slurpfile snapshots "$1" "$filter" "$2" > "$staged" ||
+           ! chmod 600 "$staged" || ! mv "$staged" "$2"; then
+            rm -f "$staged"; return 1
+        fi
+    else
+        _db_apply --slurpfile snapshots "$1" "$filter"
+    fi
 }
 
 _flush_core_traffic() {
-    local core="$1" config service raw snapshot tmp rc epoch
+    local core="$1" config_override="${2:-}" config service raw snapshot tmp rc epoch backup
+    shift
+    [[ $# -eq 0 ]] || shift
     case "$core" in
-        xray) config="$CFG/config.json"; service=vless-reality
+        xray) config="${config_override:-$CFG/config.json}"; service=vless-reality
             jq -e '.api.services | index("StatsService") != null' "$config" >/dev/null 2>&1 || return 0 ;;
-        singbox) config="$CFG/singbox.json"; service=vless-singbox
+        singbox) config="${config_override:-$CFG/singbox.json}"; service=vless-singbox
             jq -e '.experimental.v2ray_api.stats.enabled == true' "$config" >/dev/null 2>&1 || return 0 ;;
         *) return 1 ;;
     esac
@@ -3140,10 +3160,26 @@ _flush_core_traffic() {
     else raw=$(singbox_api_query 'user>>>' false) || return 1; fi
     snapshot=$(_traffic_snapshot "$core" "$raw" "$epoch") || return 1
     tmp=$(mktemp) || return 1
-    printf '%s\n' "$snapshot" > "$tmp" && _commit_traffic_snapshots "$tmp"
+    printf '%s\n' "$snapshot" > "$tmp" || { rm -f "$tmp"; return 1; }
+    # Update rollback checkpoints first, so failed application retains billed bytes.
+    for backup in "$@"; do
+        _commit_traffic_snapshots "$tmp" "$backup" || { rm -f "$tmp"; return 1; }
+    done
+    _commit_traffic_snapshots "$tmp"
     rc=$?
     rm -f "$tmp"
     return "$rc"
+}
+
+_quota_alert_thresholds() {
+    local first threshold
+    first=$(tg_get_config notify_quota_percent)
+    [[ "$first" =~ ^[0-9]{1,2}$ ]] && (( 10#$first >= 1 && 10#$first <= 99 )) || first=80
+    first=$((10#$first))
+    printf '%s\n' "$first"
+    for threshold in 90 95; do
+        (( threshold <= first )) || printf '%s\n' "$threshold"
+    done
 }
 
 # Read cumulative counters; accounting and its checkpoint commit atomically.
@@ -3224,11 +3260,10 @@ _sync_all_user_traffic_unlocked() {
     fi
     
     local updated=0
-    local notify_percent=$(tg_get_config "notify_quota_percent")
-    notify_percent=${notify_percent:-80}
-    
-    # 定义告警阈值档位（依次检查，每档只发一次）
-    local -a alert_thresholds=(80 90 95)
+    # 首个档位来自用户设置，其后的 90/95 档位只保留更高的阈值。
+    local -a alert_thresholds=()
+    mapfile -t alert_thresholds < <(_quota_alert_thresholds)
+    local notify_percent="${alert_thresholds[0]}"
     
     # 遍历所有 Xray 协议
     for proto in $(db_list_protocols "xray"); do
@@ -3556,26 +3591,68 @@ ensure_cron_service_running() {
     cron_service_is_active
 }
 
-install_cron_entry() {
-    local tag="$1" cron_cmd="$2"
-    command -v crontab >/dev/null 2>&1 || { _err "crontab 不存在，无法写入定时任务"; return 1; }
-    [[ -n "$cron_cmd" ]] || { _err "定时任务命令为空"; return 1; }
+_with_named_lock() {
+    local task="$1" owner_var="TASK_${1^^}_LOCK_OWNER"
+    shift
+    [[ "$task" =~ ^[a-z0-9_]+$ ]] || return 1
+    if [[ "${!owner_var:-}" == "$BASHPID" ]]; then "$@"; return $?; fi
+    (
+        local lock="$CFG/.${task}.lock" task_fd lock_dir attempt holder
+        mkdir -p "$CFG" || return 1
+        if command -v flock >/dev/null 2>&1; then
+            exec {task_fd}>"$lock" || return 1
+            flock -x -w 30 "$task_fd" || { _err "等待 $task 锁超时"; return 1; }
+        else
+            lock_dir="${lock}.d"
+            for ((attempt=0; attempt<600; attempt++)); do
+                if mkdir "$lock_dir" 2>/dev/null; then break; fi
+                holder=$(cat "$lock_dir/pid" 2>/dev/null || true)
+                if [[ "$holder" =~ ^[0-9]+$ ]] && ! kill -0 "$holder" 2>/dev/null; then
+                    rm -f "$lock_dir/pid"; rmdir "$lock_dir" 2>/dev/null || true
+                fi
+                sleep 0.05
+            done
+            (( attempt < 600 )) || { _err "等待 $task 锁超时"; return 1; }
+            trap 'rm -f "$lock_dir/pid"; rmdir "$lock_dir" 2>/dev/null || true' EXIT
+            printf '%s\n' "$BASHPID" > "$lock_dir/pid" || return 1
+        fi
+        local "$owner_var=$BASHPID"
+        "$@"
+    )
+}
 
-    local current
-    current=$(crontab -l 2>/dev/null || true)
-    if printf '%s\n' "$current" | grep -q "$tag"; then
-        current=$(printf '%s\n' "$current" | grep -v "$tag")
+_change_cron_entry() {
+    local tag="$1" cron_cmd="${2:-}" current errors user staged
+    [[ "$tag" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+    command -v crontab >/dev/null 2>&1 || { _err "crontab 不存在"; return 1; }
+    errors=$(mktemp "$CFG/.cron-error.XXXXXX") || return 1
+    if ! current=$(LC_ALL=C crontab -l 2>"$errors"); then
+        user=$(id -un) || { rm -f "$errors"; return 1; }
+        if ! grep -Fxq -e "no crontab for $user" -e "crontab: no crontab for $user" \
+            -e "crontab: can't open '$user': No such file or directory" "$errors"; then
+            _err "读取 crontab 失败，保留已有任务"
+            rm -f "$errors"
+            return 1
+        fi
+        current=''
     fi
-    printf '%s\n%s\n' "$current" "$cron_cmd" | awk 'NF' | crontab -
+    rm -f "$errors"
+    staged=$(mktemp "$CFG/.cron-new.XXXXXX") || return 1
+    # 只处理本脚本明确的行尾标记，不匹配命令/备注中的同名子串。
+    printf '%s\n' "$current" | awk -v tag="$tag" '$0 !~ ("#[[:space:]]*" tag "[[:space:]]*$")' > "$staged" || { rm -f "$staged"; return 1; }
+    [[ -z "$cron_cmd" ]] || printf '%s\n' "$cron_cmd" >> "$staged"
+    if ! awk 'NF' "$staged" | crontab -; then rm -f "$staged"; return 1; fi
+    rm -f "$staged"
+}
+
+install_cron_entry() {
+    [[ -n "${2:-}" ]] || { _err "定时任务命令为空"; return 1; }
+    _with_named_lock cron _change_cron_entry "$1" "$2"
 }
 
 remove_cron_entry() {
-    local tag="$1"
     command -v crontab >/dev/null 2>&1 || return 0
-    local current
-    current=$(crontab -l 2>/dev/null || true)
-    printf '%s
-' "$current" | grep -v "$tag" | crontab -
+    _with_named_lock cron _change_cron_entry "$1"
 }
 
 # 创建流量统计定时任务
@@ -9271,103 +9348,66 @@ _get_cached_prerelease_with_fallback() {
 
 # 保存版本号到缓存
 _save_version_cache() {
-    local repo="$1"
-    local version="$2"
-    local cache_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')"
-    echo "$version" > "$cache_file" 2>/dev/null || true
+    local repo="$1" version="$2" staged cache_file
+    cache_file="${3:-$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')}"
+    [[ -n "$version" && "$version" != *$'\n'* && "$version" != *$'\r'* ]] || return 1
+    mkdir -p "$VERSION_CACHE_DIR" || return 1
+    staged=$(mktemp "${cache_file}.new.XXXXXX") || return 1
+    if ! printf '%s\n' "$version" > "$staged" || ! mv "$staged" "$cache_file"; then
+        rm -f "$staged"; return 1
+    fi
 }
 
-# 后台异步更新版本缓存
-_update_version_cache_async() {
-    local repo="$1"
-    local cache_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')"
-    local unavailable_file="${cache_file}_unavailable"
-    if _is_cache_fresh "$cache_file"; then
-        return 0
+_refresh_version_caches() {
+    local repo="$1" lock_id cache_file prerelease_cache checked response code releases stable prerelease
+    [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+    lock_id=$(printf '%s' "$repo" | cksum | awk '{print $1}')
+    if [[ "${VERSION_REFRESH_OWNER:-}" != "$BASHPID" ]]; then
+        _with_named_lock "versions_$lock_id" _refresh_version_caches_locked "$repo"
+        return $?
     fi
-    if [[ "$repo" == "surge-networks/snell" ]]; then
-        (
-            local version
-            version=$(_get_snell_versions_from_kb 1 | head -n 1)
-            rm -f "$unavailable_file" 2>/dev/null || true
-            [[ -n "$version" ]] && _save_version_cache "$repo" "$version"
-        ) &
-        return 0
-    fi
-    (
-        local version
-        local response http_code body
-        response=$(curl -sL --connect-timeout 5 --max-time 10 -w "\n%{http_code}" "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null)
-        http_code=$(printf '%s' "$response" | tail -n 1)
-        body=$(printf '%s' "$response" | sed '$d')
-        if [[ "$http_code" == "404" ]]; then
-            echo "not_found" > "$unavailable_file" 2>/dev/null || true
+    cache_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')"
+    prerelease_cache="${cache_file}_prerelease"
+    checked="${cache_file}_checked"
+    # A successful list lookup also caches the absence of a prerelease.
+    _is_cache_fresh "$checked" && return 0
+    if _is_cache_fresh "$cache_file" && _is_cache_fresh "$prerelease_cache"; then return 0; fi
+    if [[ "$repo" == surge-networks/snell ]]; then
+        stable=$(_get_snell_versions_from_kb 1 | head -n 1)
+        [[ -n "$stable" ]] || return 1
+        _save_version_cache "$repo" "$stable" && _save_version_cache "$repo" 无 "$prerelease_cache" || return 1
+    else
+        response=$(curl -sL --connect-timeout 5 --max-time 10 -w "\n%{http_code}" \
+            "https://api.github.com/repos/$repo/releases?per_page=$GITHUB_API_PER_PAGE") || return 1
+        code=$(printf '%s' "$response" | tail -n 1)
+        releases=$(printf '%s' "$response" | sed '$d')
+        if [[ "$code" == 404 ]]; then
+            _save_version_cache "$repo" not_found "${cache_file}_unavailable"
             return 0
         fi
-        version=$(printf '%s' "$body" | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
-        if [[ -n "$version" ]]; then
-            rm -f "$unavailable_file" 2>/dev/null || true
-            _save_version_cache "$repo" "$version"
+        [[ "$code" == 200 ]] && jq -e 'type == "array"' <<< "$releases" >/dev/null || return 1
+        stable=$(jq -r '[.[] | select(.prerelease == false and .draft != true)][0].tag_name // empty' <<< "$releases" | sed 's/^v//')
+        prerelease=$(jq -r '[.[] | select(.prerelease == true and .draft != true)][0].tag_name // empty' <<< "$releases" | sed 's/^v//')
+        if [[ -z "$stable" ]]; then
+            response=$(curl -fsSL --connect-timeout 5 --max-time 10 "https://api.github.com/repos/$repo/releases/latest") || return 1
+            stable=$(jq -er '.tag_name | strings | select(length > 0)' <<< "$response" | sed 's/^v//') || return 1
         fi
-    ) &
+        _save_version_cache "$repo" "$stable" || return 1
+        [[ -z "$prerelease" ]] || _save_version_cache "$repo" "$prerelease" "$prerelease_cache" || return 1
+    fi
+    rm -f "${cache_file}_unavailable"
+    _save_version_cache "$repo" checked "$checked"
 }
 
-# 后台异步更新测试版版本缓存
-_update_prerelease_cache_async() {
-    local repo="$1"
-    local cache_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')_prerelease"
-    local unavailable_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')_unavailable"
-    if _is_cache_fresh "$cache_file"; then
-        return 0
-    fi
-    if [[ "$repo" == "surge-networks/snell" ]]; then
-        echo "无" > "$cache_file" 2>/dev/null || true
-        rm -f "$unavailable_file" 2>/dev/null || true
-        return 0
-    fi
-    (
-        local version
-        local response http_code body
-        response=$(curl -sL --connect-timeout 5 --max-time 10 -w "\n%{http_code}" "https://api.github.com/repos/$repo/releases?per_page=$GITHUB_API_PER_PAGE" 2>/dev/null)
-        http_code=$(printf '%s' "$response" | tail -n 1)
-        body=$(printf '%s' "$response" | sed '$d')
-        if [[ "$http_code" == "404" ]]; then
-            echo "not_found" > "$unavailable_file" 2>/dev/null || true
-            return 0
-        fi
-        version=$(printf '%s' "$body" | jq -r '[.[] | select(.prerelease == true)][0].tag_name // empty' 2>/dev/null | sed 's/^v//')
-        if [[ -n "$version" ]]; then
-            rm -f "$unavailable_file" 2>/dev/null || true
-            echo "$version" > "$cache_file" 2>/dev/null || true
-        fi
-    ) &
+_refresh_version_caches_locked() {
+    local VERSION_REFRESH_OWNER="$BASHPID"
+    _refresh_version_caches "$1"
 }
 
-# 后台异步更新所有版本缓存（稳定版+测试版，一次请求）
-_update_all_versions_async() {
-    local repo="$1"
-    local stable_cache="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')"
-    local prerelease_cache="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')_prerelease"
-    if _is_cache_fresh "$stable_cache" && _is_cache_fresh "$prerelease_cache"; then
-        return 0
-    fi
-    (
-        # 一次请求获取最近10个版本（足够覆盖最新稳定版和测试版）
-        local releases
-        releases=$(curl -sL --connect-timeout 5 --max-time 10 "https://api.github.com/repos/$repo/releases?per_page=10" 2>/dev/null)
-        if [[ -n "$releases" ]]; then
-            # 提取稳定版（第一个非prerelease）
-            local stable_version
-            stable_version=$(echo "$releases" | jq -r '[.[] | select(.prerelease == false)][0].tag_name // empty' 2>/dev/null | sed 's/^v//')
-            [[ -n "$stable_version" ]] && echo "$stable_version" > "$stable_cache" 2>/dev/null
-
-            # 提取测试版（第一个prerelease）
-            local prerelease_version
-            prerelease_version=$(echo "$releases" | jq -r '[.[] | select(.prerelease == true)][0].tag_name // empty' 2>/dev/null | sed 's/^v//')
-            [[ -n "$prerelease_version" ]] && echo "$prerelease_version" > "$prerelease_cache" 2>/dev/null
-        fi
-    ) &
-}
+# All background entry points share the request lock and atomic writer.
+_update_version_cache_async() { (_refresh_version_caches "$1") & }
+_update_prerelease_cache_async() { (_refresh_version_caches "$1") & }
+_update_all_versions_async() { (_refresh_version_caches "$1") & }
 
 # 获取 GitHub 最新版本号 (带缓存)
 _get_latest_version() {
@@ -12239,12 +12279,17 @@ _render_singbox_config() {
             }')
     fi
 
-    # 合并配置并写入文件
-    echo "$base_config" | jq \
-        --argjson ibs "$inbounds" \
-        '.inbounds = $ibs' > "$singbox_output_file"
-
-    _apply_port_routing_config singbox "$singbox_output_file" || return 1
+    # 私有临时文件完成渲染和分流后再发布，避免凭据暴露和半份配置。
+    local rendered
+    rendered=$(mktemp "${singbox_output_file}.render.XXXXXX") || return 1
+    if ! echo "$base_config" | jq --argjson ibs "$inbounds" '.inbounds = $ibs' > "$rendered" ||
+       ! _apply_port_routing_config singbox "$rendered" ||
+       ! jq empty "$rendered" 2>/dev/null ||
+       ! chmod 600 "$rendered" || ! mv "$rendered" "$singbox_output_file"; then
+        rm -f "$rendered"
+        _err "Sing-box 配置生成或发布失败"
+        return 1
+    fi
     
     # 验证配置
     if ! jq empty "$singbox_output_file" 2>/dev/null; then
@@ -14168,45 +14213,42 @@ ensure_singbox_runtime_consistency() {
 }
 
 stop_services() {
-    local stopped_services=()
+    local stopped_services=() stop_failed=0
     
     is_service_active() {
         local svc_name="$1"
-        if [[ "$DISTRO" == "alpine" ]]; then
-            rc-service "$svc_name" status &>/dev/null
+        svc status "$svc_name" >/dev/null 2>&1
+    }
+
+    _stop_active_service() {
+        local service_name="$1"
+        is_service_active "$service_name" || return 0
+        if svc stop "$service_name" && ! is_service_active "$service_name"; then
+            stopped_services+=("$service_name")
         else
-            systemctl is-active --quiet "$svc_name" 2>/dev/null
+            _err "服务未能停止: $service_name"
+            stop_failed=1
         fi
     }
     
     # 停止 Watchdog
-    if is_service_active vless-watchdog; then
-        svc stop vless-watchdog 2>/dev/null && stopped_services+=("vless-watchdog")
-    fi
+    _stop_active_service vless-watchdog
     
     # 停止 Xray 服务
-    if is_service_active vless-reality; then
-        svc stop vless-reality 2>/dev/null && stopped_services+=("vless-reality")
-    fi
+    _stop_active_service vless-reality
     
     # 停止 Sing-box 服务 (Hy2/TUIC)
-    if is_service_active vless-singbox; then
-        svc stop vless-singbox 2>/dev/null && stopped_services+=("vless-singbox")
-    fi
+    _stop_active_service vless-singbox
     
     # 停止独立进程协议服务 (Snell 等)
     for proto in $STANDALONE_PROTOCOLS; do
         local service_name="vless-${proto}"
-        if is_service_active "$service_name"; then
-            svc stop "$service_name" 2>/dev/null && stopped_services+=("$service_name")
-        fi
+        _stop_active_service "$service_name"
     done
     
     # 停止 ShadowTLS 组合协议的后端服务
     for backend_svc in vless-snell-shadowtls-backend vless-snell-v5-shadowtls-backend vless-ss2022-shadowtls-backend; do
-        if is_service_active "$backend_svc"; then
-            svc stop "$backend_svc" 2>/dev/null && stopped_services+=("$backend_svc")
-        fi
+        _stop_active_service "$backend_svc"
     done
     
     # 清理 Hysteria2 端口跳跃 NAT 规则
@@ -14217,6 +14259,7 @@ stop_services() {
     else
         echo "  ▸ 没有运行中的服务需要停止"
     fi
+    return "$stop_failed"
 }
 
 # 自动更新系统脚本 (启动时检测)
@@ -17080,7 +17123,7 @@ _apply_routing_change() {
         config="$CFG/config.json"
         [[ "${cores[$i]}" != singbox ]] || config="$CFG/singbox.json"
         staged=$(mktemp "${config}.new.XXXXXX") || { failed='核心配置暂存失败'; break; }
-        if ! cp -p "${backups[$i]}/candidate.json" "$staged" || ! mv "$staged" "$config"; then
+        if ! cp "${backups[$i]}/candidate.json" "$staged" || ! chmod 600 "$staged" || ! mv "$staged" "$config"; then
             rm -f "$staged"
             failed='核心配置写入失败'
         fi
@@ -17091,6 +17134,7 @@ _apply_routing_change() {
         service=vless-reality
         [[ "${cores[$i]}" != singbox ]] || service=vless-singbox
         if ! svc status "$service"; then failed='原核心已停止'; break; fi
+        _flush_core_traffic "${cores[$i]}" "${backups[$i]}/active.json" "$backup/db.json" "${backups[$i]}/db.json" || { failed='切换前流量收尾失败'; break; }
         touched+=("$i")
         svc restart "$service" || { failed='核心重启失败'; break; }
         sleep "${USER_CHANGE_HEALTH_DELAY:-1}"
@@ -18417,19 +18461,25 @@ parse_subscription() {
     fi
     
     # 按行解析
-    local count=0
+    local count=0 skipped_links=0 skipped_content=0 node
     while IFS= read -r line; do
         line=$(echo "$line" | tr -d '\r')
         [[ -z "$line" || "$line" == "#"* ]] && continue
         
-        local node=$(parse_proxy_link "$line")
-        if [[ -n "$node" ]]; then
+        if node=$(parse_proxy_link "$line") && [[ -n "$node" ]]; then
             echo "$node"
             ((++count))
+        elif [[ "$line" == *"://"* ]]; then
+            skipped_links=$((skipped_links + 1))
+        else
+            skipped_content=$((skipped_content + 1))
         fi
     done <<< "$content"
     
-    [[ $count -eq 0 ]] && { _err "未解析到有效节点"; return 1; }
+    if (( skipped_links + skipped_content > 0 )); then
+        _warn "跳过 $((skipped_links + skipped_content)) 行：不支持或格式无效的分享链接 $skipped_links 行，非分享链接内容 $skipped_content 行"
+    fi
+    [[ $count -eq 0 ]] && { _err "未解析到有效节点；此入口读取逐行分享链接，不解析 Clash YAML"; return 1; }
     _ok "解析到 $count 个节点"
 }
 
@@ -23693,11 +23743,7 @@ show_status() {
     }
     
     # 显示协议概要（统一使用列表格式）
-    if [[ $protocol_count -eq 1 ]]; then
-        echo -e "  协议: ${C}已安装 (${protocol_count}个)${NC}"
-    else
-        echo -e "  协议: ${C}已安装 (${protocol_count}个)${NC}"
-    fi
+    echo -e "  协议: ${C}已安装 (${protocol_count}个)${NC}"
 
     # 统一列表显示所有协议和端口
     for proto in $installed; do
@@ -24883,6 +24929,7 @@ manage_external_nodes() {
 
 # 获取或生成订阅 UUID
 get_sub_uuid() {
+    if [[ -n "${SUB_UUID_OVERRIDE:-}" ]]; then printf '%s\n' "$SUB_UUID_OVERRIDE"; return; fi
     local uuid_file="$CFG/sub_uuid"
     if [[ -f "$uuid_file" ]]; then
         cat "$uuid_file"
@@ -24983,6 +25030,7 @@ _is_valid_subscription_url() {
 
 _write_sub_info() {
     local uuid_value="$1" port_value="$2" domain_value="$3" https_value="$4" staged
+    local output="${5:-$CFG/sub.info}"
     [[ "$uuid_value" =~ ^[0-9a-fA-F-]{16,64}$ ]] || return 1
     _is_valid_port "$port_value" || return 1
     _is_valid_domain_or_ip "$domain_value" || return 1
@@ -24991,7 +25039,7 @@ _write_sub_info() {
     if ! {
         printf 'sub_uuid=%s\nsub_port=%s\nsub_domain=%s\nsub_https=%s\n' \
             "$uuid_value" "$port_value" "$domain_value" "$https_value"
-    } >"$staged" || ! chmod 600 "$staged" || ! mv -f "$staged" "$CFG/sub.info"; then
+    } >"$staged" || ! chmod 600 "$staged" || ! mv -f "$staged" "$output"; then
         rm -f "$staged"
         return 1
     fi
@@ -25590,106 +25638,221 @@ generate_sub_files() {
 }
 
 # 配置 Nginx 订阅服务
-setup_nginx_sub() {
-    local sub_uuid=$(get_sub_uuid)
-    local sub_port="${1:-8443}" domain="${2:-}" use_https="${3:-true}"
+# Both subscription entry points share one validated, reversible publication path.
+_subscription_reload_nginx() {
+    # Do not use svc reload here: its fallback restarts unrelated websites.
+    if [[ "$DISTRO" == alpine ]]; then rc-service nginx reload
+    else systemctl reload nginx; fi
+}
 
-    generate_sub_files || return 1
-    local sub_dir="$CFG/subscription/$sub_uuid"
-    local fake_conf="/etc/nginx/conf.d/vless-fake.conf"
-    [[ -d "/etc/nginx/http.d" ]] && fake_conf="/etc/nginx/http.d/vless-fake.conf"
+_subscription_probe() {
+    local uuid="$1" port="$2" https="$3" domain="$4" output="$5" scheme=http attempt
+    [[ "$https" != true ]] || scheme=https
+    command -v curl >/dev/null 2>&1 || { _err "缺少 curl，无法验证订阅入口"; return 1; }
+    for attempt in 1 2 3; do
+        # TLS verification is skipped only for this loopback health probe; the
+        # subscription may intentionally use a self-signed certificate.
+        if curl --noproxy '*' --insecure -fsS --connect-timeout 2 --max-time 5 \
+            -H "Host: ${domain:-localhost}" "$scheme://127.0.0.1:$port/sub/$uuid/surge" -o "$output" 2>/dev/null &&
+            cmp -s "$output" "$CFG/subscription/$uuid/surge.conf"; then return 0; fi
+        sleep .2
+    done
+    return 1
+}
 
-    # 检查现有配置：已存在且路由正确则直接复用
-    if [[ -f "$fake_conf" ]] &&
-       grep -q "listen.*$sub_port" "$fake_conf" 2>/dev/null &&
-       grep -q "location.*sub.*alias.*subscription" "$fake_conf" 2>/dev/null; then
-        _ok "Nginx 已配置订阅服务: 端口 $sub_port"
-        return 0
-    fi
+_subscription_restore_files() {
+    local backup="$1" index=0 path failed=0
+    while IFS= read -r path; do
+        if [[ -e "$backup/files/$index" || -L "$backup/files/$index" ]]; then
+            if [[ "$path" == "${SUBSCRIPTION_HOSTS_FILE:-/etc/hosts}" ]]; then
+                # /etc/hosts may be a bind mount and must not be unlinked.
+                cat "$backup/files/$index" > "$path" || failed=1
+            else
+                rm -rf -- "$path" && cp -a -- "$backup/files/$index" "$path" || failed=1
+            fi
+        else
+            rm -rf -- "$path" || failed=1
+        fi
+        index=$((index + 1))
+    done < "$backup/paths"
+    return "$failed"
+}
 
-    local cert_file="$CFG/certs/server.crt" key_file="$CFG/certs/server.key"
-    # 根据系统选择正确的 nginx 配置目录
-    local nginx_conf_dir="/etc/nginx/conf.d"
-    [[ -d "/etc/nginx/http.d" ]] && nginx_conf_dir="/etc/nginx/http.d"
-    local nginx_conf="$nginx_conf_dir/vless-sub.conf"
-    rm -f "$nginx_conf" 2>/dev/null
-    mkdir -p "$nginx_conf_dir"
-
-    if [[ "$use_https" == "true" && ( ! -f "$cert_file" || ! -f "$key_file" ) ]]; then
-        _warn "证书不存在，生成自签名证书..."
-        gen_self_cert "${domain:-localhost}"
-    fi
-    if [[ "$use_https" == "true" && ( ! -f "$cert_file" || ! -f "$key_file" ) ]]; then
-        _warn "证书仍不存在，切换到 HTTP 模式..."
-        use_https="false"
-    fi
-
-    local ssl_listen="" ssl_block=""
-    if [[ "$use_https" == "true" ]]; then
-        ssl_listen=" ssl http2"
-        ssl_block=$(cat <<EOF
-    ssl_certificate $cert_file;
-    ssl_certificate_key $key_file;
+_subscription_render_nginx() {
+    local uuid="$1" port="$2" domain="$3" https="$4" cert="$5" key="$6" web_root="$7"
+    local ssl='' block=''
+    if [[ "$https" == true ]]; then
+        ssl=' ssl http2'
+        block="    ssl_certificate $cert;
+    ssl_certificate_key $key;
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-EOF
-)
+    ssl_ciphers HIGH:!aNULL:!MD5;"
     fi
-
-    cat > "$nginx_conf" << EOF
+    cat <<EOF
 server {
-    listen $sub_port$ssl_listen;
-    listen [::]:$sub_port$ssl_listen;
+    listen $port$ssl;
+    listen [::]:$port$ssl;
     server_name ${domain:-_};
-$ssl_block
-    # 订阅路径 (alias 直指文件，避免 try_files 误判)
-    location /sub/$sub_uuid/ {
-        alias $sub_dir/;
-        default_type text/plain;
-        add_header Content-Type 'text/plain; charset=utf-8';
-    }
-
-    location /sub/$sub_uuid/clash {
-        alias $sub_dir/clash.yaml;
-        default_type text/yaml;
-        add_header Content-Disposition 'attachment; filename="clash.yaml"';
-    }
-
-    location /sub/$sub_uuid/surge {
-        alias $sub_dir/surge.conf;
-        default_type text/plain;
-        add_header Content-Disposition 'attachment; filename="surge.conf"';
-    }
-
-    location /sub/$sub_uuid/v2ray {
-        alias $sub_dir/base64;
-        default_type text/plain;
-    }
-
-    # 伪装网页
-    root /var/www/html;
+$block
+    root $web_root;
     index index.html;
-
+    location = /sub/$uuid/v2ray { alias $CFG/subscription/$uuid/base64; default_type text/plain; }
+    location = /sub/$uuid/clash { alias $CFG/subscription/$uuid/clash.yaml; default_type text/yaml; }
+    location = /sub/$uuid/surge { alias $CFG/subscription/$uuid/surge.conf; default_type text/plain; }
     location / { try_files \$uri \$uri/ =404; }
-
-    # 隐藏 Nginx 版本
     server_tokens off;
 }
 EOF
+}
 
-    if nginx -t 2>/dev/null; then
-        if [[ "$DISTRO" == "alpine" ]]; then
-            rc-service nginx restart 2>/dev/null || nginx -s reload
-        else
-            systemctl reload nginx 2>/dev/null || nginx -s reload
-        fi
-        _ok "Nginx 配置完成"
-        return 0
+_subscription_change() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _subscription_change "$@"; return $?; fi
+    local action="$1" uuid="${2:-}" port="${3:-}" domain="${4:-}" https="${5:-false}" map_hosts="${6:-false}"
+    [[ "$action" == publish || "$action" == disable ]] || return 1
+    local nginx_root="${SUBSCRIPTION_NGINX_ROOT:-/etc/nginx}" web_root="${SUBSCRIPTION_WEB_ROOT:-/var/www/html}"
+    local hosts_file="${SUBSCRIPTION_HOSTS_FILE:-/etc/hosts}" conf_dir conf backup path index=0 old_uuid='' failed=''
+    local running=false enabled=false load_attempted=false hosts_changed=false cert="$CFG/certs/server.crt" key="$CFG/certs/server.key"
+    local sub_uuid='' sub_port='' sub_domain='' sub_https=''
+    if [[ -f "$CFG/sub.info" ]]; then
+        _load_sub_info || { _err "旧订阅信息无效，拒绝覆盖"; return 1; }
+        old_uuid="$sub_uuid"
+    elif [[ -f "$CFG/sub_uuid" ]]; then
+        old_uuid=$(cat "$CFG/sub_uuid") || return 1
+        [[ "$old_uuid" =~ ^[0-9a-fA-F-]{16,64}$ ]] || return 1
     fi
+    [[ "$action" != disable || -n "$old_uuid" ]] || return 0
+    mkdir -p "$CFG/backups/subscription" || return 1
+    backup=$(mktemp -d "$CFG/backups/subscription/change.XXXXXX") || return 1
+    chmod 700 "$backup" && mkdir "$backup/files" || return 1
+    if [[ "$action" == publish ]]; then
+        _write_sub_info "$uuid" "$port" "$domain" "$https" "$backup/new-info" || { _err "订阅参数无效"; return 1; }
+    fi
+    conf_dir="$nginx_root/conf.d"
+    [[ ! -d "$nginx_root/http.d" ]] || conf_dir="$nginx_root/http.d"
+    mkdir -p "$conf_dir" "$web_root" "$CFG/subscription" || return 1
+    conf="$conf_dir/vless-sub.conf"
+    local -a paths=("$nginx_root/conf.d/vless-sub.conf" "$nginx_root/http.d/vless-sub.conf" "$CFG/sub.info" "$CFG/sub_uuid")
+    [[ -z "$old_uuid" ]] || paths+=("$CFG/subscription/$old_uuid")
+    [[ "$action" != publish || "$uuid" == "$old_uuid" ]] || paths+=("$CFG/subscription/$uuid")
+    if [[ "$action" == publish && ! -f "$web_root/index.html" ]]; then paths+=("$web_root/index.html" "$CFG/.managed_web_index"); fi
+    if [[ "$map_hosts" == true ]] || { [[ -f "$hosts_file" ]] && grep -Eq '#[[:space:]]*vless-sub[[:space:]]*$' "$hosts_file"; }; then
+        hosts_changed=true
+        paths+=("$hosts_file")
+    fi
+    printf '%s\n' "${paths[@]}" > "$backup/paths" || return 1
+    for path in "${paths[@]}"; do
+        if [[ -e "$path" || -L "$path" ]]; then cp -a -- "$path" "$backup/files/$index" || return 1; fi
+        index=$((index + 1))
+    done
+    svc status nginx >/dev/null 2>&1 && running=true
+    svc is-enabled nginx >/dev/null 2>&1 && enabled=true
+    if [[ "$action" == publish ]]; then
+        if [[ "$https" == true && ( ! -f "$cert" || ! -f "$key" ) ]]; then
+            # A separate pair avoids replacing certificates used by node cores.
+            cert="$backup/subscription.crt"; key="$backup/subscription.key"
+            openssl req -x509 -nodes -days 3650 -newkey rsa:2048 -keyout "$key" -out "$cert" \
+                -subj "/CN=${domain:-localhost}" >/dev/null 2>&1 && chmod 600 "$key" || failed='订阅证书生成失败'
+        fi
+        [[ -n "$failed" ]] || SUB_UUID_OVERRIDE="$uuid" generate_sub_files || failed='订阅内容生成失败'
+        if [[ -z "$failed" ]]; then
+            for path in "$nginx_root/conf.d/vless-sub.conf" "$nginx_root/http.d/vless-sub.conf"; do
+                [[ "$path" == "$conf" ]] || rm -f "$path" || failed='旧订阅配置移除失败'
+            done
+            _subscription_render_nginx "$uuid" "$port" "$domain" "$https" "$cert" "$key" "$web_root" > "$backup/new-conf" &&
+                chmod 644 "$backup/new-conf" && cp "$backup/new-conf" "$conf" || failed='Nginx 配置写入失败'
+        fi
+        if [[ -z "$failed" && ! -f "$web_root/index.html" ]]; then
+        cat > "$web_root/index.html" << 'HTMLEOF' || failed='伪装页面写入失败'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; text-align: center; }
+        p { color: #666; line-height: 1.6; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Welcome to Our Website</h1>
+        <p>This is a simple website hosted on our server.</p>
+    </div>
+</body>
+</html>
+HTMLEOF
+            : > "$CFG/.managed_web_index" || failed='伪装页面标记写入失败'
+        fi
+        if [[ -z "$failed" ]]; then
+            cp "$backup/new-info" "$CFG/sub.info" && chmod 600 "$CFG/sub.info" &&
+                printf '%s\n' "$uuid" > "$CFG/sub_uuid" && chmod 600 "$CFG/sub_uuid" || failed='订阅元数据写入失败'
+        fi
+    else
+        rm -f "$nginx_root/conf.d/vless-sub.conf" "$nginx_root/http.d/vless-sub.conf" "$CFG/sub.info" || failed='订阅配置移除失败'
+    fi
+    if [[ -z "$failed" && "$hosts_changed" == true ]]; then
+        # Exact ownership marker, not a domain regex; preserve all other aliases.
+        awk '$0 !~ /#[[:space:]]*vless-sub[[:space:]]*$/' "$hosts_file" > "$backup/new-hosts" || failed='hosts 读取失败'
+        if [[ -z "$failed" && "$action" == publish && "$map_hosts" == true && -n "$domain" ]]; then
+            printf '127.0.0.1 %s # vless-sub\n' "$domain" >> "$backup/new-hosts" || failed='hosts 暂存失败'
+        fi
+        [[ -n "$failed" ]] || cat "$backup/new-hosts" > "$hosts_file" || failed='hosts 写入失败'
+    fi
+    if [[ -z "$failed" ]]; then
+        if ! nginx -t > "$backup/nginx-test.log" 2>&1; then
+            failed='Nginx 配置校验失败'
+        elif grep -q 'conflicting server name' "$backup/nginx-test.log"; then
+            failed='Nginx 站点名称和端口冲突，请选择其他端口或域名'
+        fi
+        [[ -z "$failed" ]] || cat "$backup/nginx-test.log" >&2
+    fi
+    if [[ -z "$failed" && "$running" == true ]]; then
+        load_attempted=true
+        _subscription_reload_nginx && svc status nginx >/dev/null 2>&1 || failed='Nginx 重载失败'
+    elif [[ -z "$failed" && "$action" == publish ]]; then
+        load_attempted=true
+        svc start nginx && svc status nginx >/dev/null 2>&1 || failed='Nginx 启动失败'
+        if [[ -z "$failed" && "$enabled" == false ]]; then
+            svc enable nginx && svc is-enabled nginx >/dev/null 2>&1 || failed='Nginx 自启设置失败'
+        fi
+    fi
+    if [[ -z "$failed" && "$action" == publish ]]; then
+        _subscription_probe "$uuid" "$port" "$https" "$domain" "$backup/probe-response" || failed='订阅入口响应验证失败'
+    fi
+    if [[ -n "$failed" ]]; then
+        _subscription_restore_files "$backup" || _err "订阅文件回滚失败: $backup"
+        if [[ "$load_attempted" == true ]]; then
+            if [[ "$running" == true ]]; then
+                _subscription_reload_nginx && svc status nginx >/dev/null 2>&1 || _err "Nginx 回滚加载失败: $backup"
+            else
+                svc stop nginx || _err "Nginx 停止回滚失败: $backup"
+                if svc status nginx >/dev/null 2>&1; then _err "Nginx 回滚后仍在运行"; fi
+            fi
+            if [[ "$enabled" == true ]]; then svc enable nginx || _err "Nginx 自启恢复失败"
+            else svc disable nginx || _err "Nginx 自启恢复失败"; fi
+        fi
+        _err "$failed，已尝试恢复；备份: $backup"
+        return 1
+    fi
+    if [[ "$action" == disable ]]; then
+        rm -rf -- "$CFG/subscription/$old_uuid" || _warn "旧订阅目录清理失败: $old_uuid"
+        _ok "订阅服务已停用，Nginx 原运行状态已保留"
+    else
+        if [[ -n "$old_uuid" && "$old_uuid" != "$uuid" ]]; then
+            rm -rf -- "$CFG/subscription/$old_uuid" || _warn "旧订阅目录清理失败: $old_uuid"
+        fi
+        _ok "订阅服务已配置"
+    fi
+}
 
-    _err "Nginx 配置错误"
-    rm -f "$nginx_conf"
-    return 1
+setup_nginx_sub() {
+    local uuid
+    if [[ -f "$CFG/sub_uuid" ]]; then uuid=$(cat "$CFG/sub_uuid") || return 1
+    else uuid=$(gen_uuid) || return 1; fi
+    _subscription_change publish "$uuid" "${1:-8443}" "${2:-}" "${3:-true}" false
 }
 
 
@@ -25773,39 +25936,8 @@ manage_subscription() {
                 2) generate_sub_files && _ok "订阅内容已更新"; _pause ;;
                 3) manage_external_nodes ;;
                 4) setup_subscription_interactive ;;
-                5) 
-                    # 获取订阅端口和域名信息
-                    local sub_port="" sub_domain=""
-                    if [[ -f "$CFG/sub.info" ]]; then
-                        _load_sub_info "$CFG/sub.info" || { _warn "订阅配置格式无效"; return 1; }
-                    fi
-                    
-                    # 删除配置文件
-                    rm -f /etc/nginx/conf.d/vless-sub.conf /etc/nginx/http.d/vless-sub.conf "$CFG/sub.info"
-                    rm -rf "$CFG/subscription"
-                    
-                    # 清理 hosts 记录
-                    if [[ -n "$sub_domain" ]]; then
-                        sed -i "/127.0.0.1 $sub_domain/d" /etc/hosts 2>/dev/null
-                        _info "已清理 /etc/hosts 中的域名记录"
-                    fi
-                    
-                    # 检查是否还有其他 nginx 配置，如果没有则停止 nginx
-                    local other_configs=$(ls /etc/nginx/conf.d/*.conf /etc/nginx/http.d/*.conf 2>/dev/null | wc -l)
-                    if [[ "$other_configs" -eq 0 ]]; then
-                        _info "没有其他 Nginx 配置，停止 Nginx 服务..."
-                        if [[ "$DISTRO" == "alpine" ]]; then
-                            rc-service nginx stop 2>/dev/null
-                        else
-                            systemctl stop nginx 2>/dev/null
-                        fi
-                        _ok "Nginx 服务已停止"
-                    else
-                        _info "检测到其他 Nginx 配置，仅重载配置..."
-                        nginx -s reload 2>/dev/null
-                    fi
-                    
-                    _ok "订阅服务已停用"
+                5)
+                    _subscription_change disable
                     _pause
                     ;;
                 0) return ;;
@@ -25826,21 +25958,15 @@ setup_subscription_interactive() {
     echo -e "  ${W}配置订阅服务${NC}"
     _line
     
-    # 询问是否重新生成 UUID
+    local sub_uuid='' regen_uuid=''
     if [[ -f "$CFG/sub_uuid" ]]; then
-        echo -e "  ${Y}检测到已有订阅 UUID${NC}"
+        sub_uuid=$(cat "$CFG/sub_uuid") || return 1
         read -rp "  是否重新生成 UUID? [y/N]: " regen_uuid
-        if [[ "$regen_uuid" =~ ^[yY]$ ]]; then
-            local old_uuid=$(cat "$CFG/sub_uuid")
-            reset_sub_uuid
-            local new_uuid=$(cat "$CFG/sub_uuid")
-            _ok "UUID 已更新: ${old_uuid:0:8}... → ${new_uuid:0:8}..."
-            # 清理旧的订阅目录
-            rm -rf "$CFG/subscription/$old_uuid" 2>/dev/null
-        fi
-        echo ""
+        [[ ! "$regen_uuid" =~ ^[yY]$ ]] || sub_uuid=$(gen_uuid) || return 1
+    else
+        sub_uuid=$(gen_uuid) || return 1
     fi
-    
+
     # 安装 Nginx
     if ! check_cmd nginx; then
         _info "需要安装 Nginx..."
@@ -25892,178 +26018,15 @@ setup_subscription_interactive() {
     read -rp "  启用 HTTPS? [Y/n]: " https_choice
     [[ "$https_choice" =~ ^[nN]$ ]] && use_https="false"
     
-    # 生成订阅文件
-    generate_sub_files || return 1
-    
-    # 获取订阅 UUID
-    local sub_uuid=$(get_sub_uuid)
-    local sub_dir="$CFG/subscription/$sub_uuid"
-    local connection_ipv4 connection_ipv6
-    IFS='|' read -r connection_ipv4 connection_ipv6 <<< "$(get_connection_addresses)"
-    local server_name="$sub_domain"
-    [[ -z "$server_name" ]] && server_name="${connection_ipv4:-$connection_ipv6}"
-    [[ -z "$server_name" ]] && server_name="localhost"
-    
-    # 配置 Nginx - 根据系统选择正确的配置目录
-    local nginx_conf_dir="/etc/nginx/conf.d"
-    [[ -d "/etc/nginx/http.d" ]] && nginx_conf_dir="/etc/nginx/http.d"
-    local nginx_conf="$nginx_conf_dir/vless-sub.conf"
-    mkdir -p "$nginx_conf_dir"
-    
-    # 删除可能冲突的旧配置 (包括 http.d 目录)
-    rm -f /etc/nginx/conf.d/vless-fake.conf /etc/nginx/http.d/vless-fake.conf 2>/dev/null
-    rm -f /etc/nginx/sites-enabled/vless-fake 2>/dev/null
-    
-    if [[ "$use_https" == "true" ]]; then
-        # HTTPS 模式：需要证书
-        local cert_file="$CFG/certs/server.crt"
-        local key_file="$CFG/certs/server.key"
-        
-        # 检查证书是否存在，不存在则生成自签名证书
-        if [[ ! -f "$cert_file" || ! -f "$key_file" ]]; then
-            _info "生成自签名证书..."
-            mkdir -p "$CFG/certs"
-            openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-                -keyout "$key_file" -out "$cert_file" \
-                -subj "/CN=$server_name" 2>/dev/null
-        fi
-        
-        cat > "$nginx_conf" << EOF
-server {
-    listen $sub_port ssl http2;
-    listen [::]:$sub_port ssl http2;
-    server_name $server_name;
-
-    ssl_certificate $cert_file;
-    ssl_certificate_key $key_file;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-
-    root /var/www/html;
-    index index.html;
-
-    # 订阅路径
-    location ~ ^/sub/([a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
-        default_type text/plain;
-        add_header Content-Type "text/plain; charset=utf-8";
-    }
-
-    location ~ ^/sub/([a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
-        default_type text/yaml;
-    }
-
-    location ~ ^/sub/([a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
-        default_type text/plain;
-    }
-
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-
-    server_tokens off;
-}
-EOF
-    else
-        # HTTP 模式
-        cat > "$nginx_conf" << EOF
-server {
-    listen $sub_port;
-    listen [::]:$sub_port;
-    server_name $server_name;
-
-    root /var/www/html;
-    index index.html;
-
-    # 订阅路径
-    location ~ ^/sub/([a-f0-9-]+)/v2ray\$ {
-        alias $CFG/subscription/\$1/base64;
-        default_type text/plain;
-        add_header Content-Type "text/plain; charset=utf-8";
-    }
-
-    location ~ ^/sub/([a-f0-9-]+)/clash\$ {
-        alias $CFG/subscription/\$1/clash.yaml;
-        default_type text/yaml;
-    }
-
-    location ~ ^/sub/([a-f0-9-]+)/surge\$ {
-        alias $CFG/subscription/\$1/surge.conf;
-        default_type text/plain;
-    }
-
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-
-    server_tokens off;
-}
-EOF
+    local map_hosts=false hosts_choice=''
+    if [[ -n "$sub_domain" ]]; then
+        read -rp "  添加本机 hosts 映射 (通常无需设置)? [y/N]: " hosts_choice
+        [[ ! "$hosts_choice" =~ ^[yY]$ ]] || map_hosts=true
     fi
-    
-    # 确保伪装网页存在
-    mkdir -p /var/www/html
-    if [[ ! -f "/var/www/html/index.html" ]]; then
-        cat > /var/www/html/index.html << 'HTMLEOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Welcome</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
-        .container { max-width: 800px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #333; text-align: center; }
-        p { color: #666; line-height: 1.6; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Welcome to Our Website</h1>
-        <p>This is a simple website hosted on our server.</p>
-    </div>
-</body>
-</html>
-HTMLEOF
-        : >"$CFG/.managed_web_index"
-    fi
-    
-    # 保存订阅配置
-    if ! _write_sub_info "$sub_uuid" "$sub_port" "$sub_domain" "$use_https"; then
-        _err "订阅配置参数无效，拒绝写入"
-        rm -f "$nginx_conf"
+    if ! _subscription_change publish "$sub_uuid" "$sub_port" "$sub_domain" "$use_https" "$map_hosts"; then
+        _pause
         return 1
     fi
-    
-    # 添加域名到 hosts（解决部分 VPS 环境下的本地回环问题）
-    if [[ -n "$sub_domain" ]]; then
-        if ! grep -q "127.0.0.1 $sub_domain" /etc/hosts 2>/dev/null; then
-            echo "127.0.0.1 $sub_domain" >> /etc/hosts
-            _info "已添加域名到 /etc/hosts（优化本地访问）"
-        fi
-    fi
-    
-    # 测试并重载 Nginx
-    if nginx -t 2>/dev/null; then
-        if [[ "$DISTRO" == "alpine" ]]; then
-            rc-update add nginx default 2>/dev/null
-            rc-service nginx restart 2>/dev/null
-        else
-            systemctl enable nginx 2>/dev/null
-            systemctl restart nginx 2>/dev/null
-        fi
-        _ok "订阅服务已配置"
-    else
-        _err "Nginx 配置错误"
-        nginx -t
-        rm -f "$nginx_conf"
-        _pause
-        return
-    fi
-    
     echo ""
     show_sub_links
     _pause
@@ -29704,11 +29667,11 @@ EOF
 
 realm_generate_config() {
     ensure_realm_dir
-    python3 - <<'PY2'
-import json
+    python3 - "$REALM_RULES_FILE" "$REALM_CONFIG_FILE" <<'PY2'
+import json, ipaddress, sys
 from pathlib import Path
-rules_path=Path('/etc/vless-reality/realm/rules.json')
-conf_path=Path('/etc/vless-reality/realm/config.toml')
+rules_path=Path(sys.argv[1])
+conf_path=Path(sys.argv[2])
 rules=json.loads(rules_path.read_text()) if rules_path.exists() else []
 lines=['[log]','level = "warn"','','[network]','no_tcp = false','use_udp = true','']
 for r in rules:
@@ -29716,17 +29679,21 @@ for r in rules:
         continue
     transport=r.get('transport','tcp')
     lines.append('[[endpoints]]')
-    lines.append(f'listen = "{r["listen_host"]}:{r["listen_port"]}"')
-    lines.append(f'remote = "{r["remote_host"]}:{r["remote_port"]}"')
-    if transport == 'udp':
-        lines.append('no_tcp = true')
-        lines.append('use_udp = true')
-    elif transport == 'tcp+udp':
-        lines.append('use_udp = true')
-    else:
-        lines.append('no_tcp = false')
+    def hostport(host, port):
+        host = str(host).strip('[]')
+        try:
+            if ipaddress.ip_address(host).version == 6:
+                host = '[' + host + ']'
+        except ValueError:
+            pass
+        return f'{host}:{int(port)}'
+    lines.append('listen = ' + json.dumps(hostport(r['listen_host'], r['listen_port'])))
+    lines.append('remote = ' + json.dumps(hostport(r['remote_host'], r['remote_port'])))
+    no_tcp = 'true' if transport == 'udp' else 'false'
+    use_udp = 'false' if transport == 'tcp' else 'true'
+    lines.append(f'network = {{ no_tcp = {no_tcp}, use_udp = {use_udp} }}')
     if r.get('remark'):
-        lines.append(f'# {r["remark"]}')
+        lines.append('# ' + str(r['remark']).replace('\n', ' ').replace('\r', ' '))
     lines.append('')
 conf_path.write_text('\n'.join(lines)+'\n')
 PY2
@@ -29771,7 +29738,8 @@ realm_get_traffic_bytes() {
     local port="$1" proto="$2" chain="VLESS_REALM_COUNTERS"
     command -v iptables >/dev/null 2>&1 || { echo 0; return 0; }
     iptables -nvx -L "$chain" 2>/dev/null | awk -v p="$port" -v proto="$proto" '
-        $0 ~ ("dpt:" p) {
+        { matched=0; for (i=1; i<=NF; i++) if ($i == "dpt:" p) matched=1 }
+        matched {
             for (i=1; i<=NF; i++) {
                 if ($i == proto) { sum += $2; break }
             }
@@ -30025,6 +29993,7 @@ realm_status_logs_menu() {
                         echo -e "    状态      : $( [[ "$enabled" == "true" ]] && echo 运行中 || echo 已禁用 )"
                         echo -e "    总流量    : $(format_bytes "$total_bytes")"
                         echo -e "    TCP / UDP : $(format_bytes "$tcp_bytes") / $(format_bytes "$udp_bytes")"
+                        echo -e "    统计起点  : 最近一次计数链重建 (修改转发规则会重置)"
                         echo -e "    Ping      : ${ping_value}"
                         echo -e "    监听端口  : ${listen_port}"
                         echo -e "    监听状态  : TCP ${tcp_state} / UDP ${udp_state}"
@@ -30724,7 +30693,7 @@ _snell_prepare_user() {
 
 _snell_apply_users() {
     local proto="$1" row id port psk file staged service failed=0
-    local only_name="${2:-}"
+    local only_name="${2:-}" apply_mode="${3:-normal}"
     _snell_managed "$proto" || return 1
     while IFS= read -r row; do
         [[ -z "$only_name" || "$(jq -r '.users[0].name' <<< "$row")" == "$only_name" ]] || continue
@@ -30744,6 +30713,7 @@ _snell_apply_users() {
         cmp -s "$file" "$staged" || changed=true
         chmod 600 "$staged" && mv "$staged" "$file" || return 1
         _snell_write_service "$proto" "$id" || return 1
+        [[ "$apply_mode" != configure ]] || continue
         if _snell_prepare_user "$proto" "$id"; then
             svc enable "$service" || return 1
             svc is-enabled "$service" || return 1
@@ -30778,6 +30748,10 @@ _snell_group_service() {
         case "$action" in
             start|restart|enable|reload)
                 _snell_prepare_user "$proto" "$id" || continue ;;
+            stop)
+                svc status "vless-snellu-$id" >/dev/null 2>&1 || continue ;;
+            disable)
+                svc is-enabled "vless-snellu-$id" >/dev/null 2>&1 || continue ;;
         esac
         if svc "$action" "vless-snellu-$id"; then active=0; else result=1; fi
     done <<< "$(_snell_rows "$proto")"
@@ -30892,10 +30866,16 @@ _snell_sync_traffic() {
                 else
                     send_tg_expired_notice "$name" "$proto" "$expire" xray
                 fi
-            elif [[ "$enabled" == true ]] && (( quota > 0 )) && (( used * 100 / quota >= 80 )); then
-                if [[ "$(db_get_user_alert_state xray "$proto" "$name" last_alert_percent)" != 80 ]]; then
+            elif [[ "$enabled" == true ]] && (( quota > 0 )); then
+                local last_alert threshold current_threshold=0 percent=$((used * 100 / quota))
+                last_alert=$(db_get_user_alert_state xray "$proto" "$name" last_alert_percent)
+                [[ "$last_alert" =~ ^[0-9]{1,3}$ ]] || last_alert=0
+                while IFS= read -r threshold; do
+                    if (( percent >= threshold && 10#$last_alert < threshold )); then current_threshold=$threshold; fi
+                done < <(_quota_alert_thresholds)
+                if (( current_threshold > 0 )); then
                     tg_send_quota_alert "$name" "$proto" "$used" "$quota" "$((used * 100 / quota))" xray
-                    db_set_user_alert_state xray "$proto" "$name" last_alert_percent 80
+                    db_set_user_alert_state xray "$proto" "$name" last_alert_percent "$current_threshold"
                 fi
             fi
         done <<< "$(_snell_rows "$proto")"
@@ -30950,7 +30930,6 @@ _snell_delete_user() {
 }
 
 _snell_add_user() {
-    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _snell_add_user "$@"; return $?; fi
     local proto="$1" name port psk quota days expiry="" id template row managed=false
     if ! command -v nft >/dev/null 2>&1; then
         _info "安装 Snell 用户流量统计依赖 nftables..."
@@ -30961,7 +30940,6 @@ _snell_add_user() {
             *) _err "请先安装 nftables"; return 1 ;;
         esac
     fi
-    _snell_nft_ready || return 1
     read -rp "  Snell 用户名 (字母/数字/_/-): " name
     [[ "$name" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || { _err "用户名无效"; return 1; }
     [[ "$name" != default ]] || { _err "default 为原始用户保留名称"; return 1; }
@@ -30979,9 +30957,23 @@ _snell_add_user() {
     _warn "流量按客户端端口网络字节统计，含协议开销；配额每分钟检查"
     read -rp "  确认创建独立用户实例? [y/N]: " confirm
     [[ "$confirm" =~ ^[yY]$ ]] || return 0
-    _snell_managed "$proto" && managed=true
-    # 必须先安装当前脚本，保证服务开机准备命令存在。
+    # Input and dependency preparation do not hold the accounting/database lock.
     create_shortcut || return 1
+    _snell_add_user_commit "$proto" "$name" "$port" "$psk" "$quota" "$expiry"
+}
+
+_snell_add_user_commit() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _snell_add_user_commit "$@"; return $?; fi
+    local proto="$1" name="$2" port="$3" psk="$4" quota="$5" expiry="$6" id template row managed=false
+    [[ "$name" =~ ^[A-Za-z0-9_-]{1,32}$ && "$name" != default && "$quota" =~ ^[0-9]{1,6}$ ]] || return 1
+    _is_valid_port "$port" && [[ "$psk" =~ ^[A-Za-z0-9_+/=-]+$ ]] || return 1
+    [[ -z "$(db_get_user xray "$proto" "$name")" ]] || { _err "用户名已被其他操作占用"; return 1; }
+    [[ -z "$(is_internal_port_occupied "$port")" ]] || { _err "端口已被其他操作占用"; return 1; }
+    if command -v ss >/dev/null && ss -H -lntu "( sport = :$port )" 2>/dev/null | grep -q .; then
+        _err "端口已被系统占用"; return 1
+    fi
+    _snell_nft_ready || return 1
+    _snell_managed "$proto" && managed=true
     _snell_migrate "$proto" || return 1
     if [[ "$managed" == false ]]; then
         # 原服务与新 default 实例使用相同端口，迁移时仅短暂重启。
@@ -31095,44 +31087,75 @@ _snell_edit_user() {
         read -rp "  模式 default/unshaped (留空保留): " mode
         [[ -z "$mode" || "$mode" == default || "$mode" == unshaped ]] || return 1
     fi
-    read -rp "  保存并重启该用户实例? [y/N]: " confirm
+    read -rp "  保存配置 (仅原本运行的实例会重启)? [y/N]: " confirm
     [[ "$confirm" =~ ^[yY]$ ]] || return 0
-    sync_all_user_traffic true || return 1
-    oldfile=$(mktemp "$CFG/snell-users/$id.backup.XXXXXX") || return 1
-    cp "$CFG/snell-users/$id.conf" "$oldfile" && chmod 600 "$oldfile" || return 1
+    _snell_edit_user_commit "$proto" "$name" "$row" "$port" "$psk" "$dns" "$mode"
+}
+
+_snell_edit_user_commit() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock _snell_edit_user_commit "$@"; return $?; fi
+    local proto="$1" name="$2" original="$3" port="$4" psk="$5" dns="$6" mode="$7"
+    local row id service backup staged failed='' touched=false old_port
+    _snell_managed "$proto" || return 1
+    row=$(_snell_rows "$proto" | jq -esc --arg n "$name" '[.[] | select(.users[0].name == $n)] | if length == 1 then .[0] else error("user missing") end') || return 1
+    if ! jq -en --argjson old "$original" --argjson now "$row" '($old | del(.users)) == ($now | del(.users))' >/dev/null; then
+        _err "用户连接参数已被其他操作修改，请重新打开编辑"; return 1
+    fi
+    id=$(jq -r .snell_id <<< "$row")
+    [[ "$id" =~ ^[0-9a-f]{24}$ && "$psk" =~ ^[A-Za-z0-9_+/=-]+$ ]] || return 1
+    _is_valid_port "$port" || return 1
+    [[ "$dns" == system ]] || _is_valid_dns_server_list "$dns" || return 1
+    [[ -z "$mode" || "$mode" == default || "$mode" == unshaped ]] || return 1
+    old_port=$(jq -r .port <<< "$row")
+    if [[ "$port" != "$old_port" ]]; then
+        [[ -z "$(is_internal_port_occupied "$port")" ]] || { _err "新端口已被占用"; return 1; }
+        if command -v ss >/dev/null && ss -H -lntu "( sport = :$port )" 2>/dev/null | grep -q .; then
+            _err "新端口已被系统占用"; return 1
+        fi
+    fi
+    _snell_account_traffic "$proto" || return 1
+    backup=$(_snell_user_change_begin "$proto" "$name") || return 1
+    service="vless-snellu-$id"
     staged=$(mktemp "$CFG/snell-users/$id.edit.XXXXXX") || return 1
-    awk -v listen="$(_fmt_hostport "$(_listen_addr)" "$port")" -v psk="$psk" -v dns="$dns" -v mode="$mode" '
+    if ! awk -v listen="$(_fmt_hostport "$(_listen_addr)" "$port")" -v psk="$psk" -v dns="$dns" -v mode="$mode" '
         /^[[:space:]]*listen[[:space:]]*=/ {print "listen = " listen; next}
         /^[[:space:]]*psk[[:space:]]*=/ {print "psk = " psk; next}
         /^[[:space:]]*dns[[:space:]]*=/ && dns != "" {next}
         /^[[:space:]]*mode[[:space:]]*=/ && mode != "" {next}
         {print}
         END {if (dns != "" && dns != "system") print "dns = " dns; if (mode != "") print "mode = " mode}
-    ' "$oldfile" > "$staged"
-    chmod 600 "$staged"
-    if svc status "vless-snellu-$id"; then
-        svc stop "vless-snellu-$id" || { rm -f "$staged"; _err "无法停止用户实例"; return 1; }
+    ' "$backup/active.conf" > "$staged" || ! chmod 600 "$staged"; then
+        rm -f "$staged"; return 1
     fi
-    if _snell_update_counter_port "$id" "$port" &&
-       _db_apply --arg p "$proto" --arg id "$id" --arg psk "$psk" --arg mode "$mode" --arg dns "$dns" --argjson port "$port" '
-        .xray[$p] |= map(if .snell_id == $id then .port=$port | .psk=$psk | .users[0].uuid=$psk |
-            (if $mode != "" then .mode=$mode else . end) |
-            (if $dns != "" then .dns=(if $dns=="system" then "" else $dns end) else . end)
-            else . end)' &&
-       mv "$staged" "$CFG/snell-users/$id.conf" && _snell_apply_users "$proto" "$name"; then
-        _ok "用户 $name 配置已更新 (端口 $port)，请更新客户端节点"
+    if [[ -f "$backup/running" ]]; then
+        touched=true
+        if ! svc stop "$service" || svc status "$service" >/dev/null 2>&1; then failed='无法停止用户实例'; fi
+    fi
+    if [[ -z "$failed" ]] && ! {
+        _snell_update_counter_port "$id" "$port" &&
+        _db_apply --arg p "$proto" --arg id "$id" --arg psk "$psk" --arg mode "$mode" --arg dns "$dns" --argjson port "$port" '
+            .xray[$p] |= map(if .snell_id == $id then .port=$port | .psk=$psk | .users[0].uuid=$psk |
+                (if $mode != "" then .mode=$mode else . end) |
+                (if $dns != "" then .dns=(if $dns=="system" then "" else $dns end) else . end)
+                else . end)' &&
+        mv "$staged" "$CFG/snell-users/$id.conf" && _snell_apply_users "$proto" "$name" configure
+    }; then failed='用户配置应用失败'; fi
+    if [[ -z "$failed" && -f "$backup/running" ]]; then
+        _snell_prepare_user "$proto" "$id" && svc start "$service" || failed='用户实例恢复运行失败'
+        sleep "${USER_CHANGE_HEALTH_DELAY:-1}"
+        svc status "$service" >/dev/null 2>&1 || failed='用户实例健康检查失败'
+    fi
+    if [[ -z "$failed" ]]; then
+        _ok "用户 $name 配置已更新，原运行和自启状态已保留，请更新客户端节点"
         _snell_user_share "$proto" "$name" "$port"
         return 0
     fi
-    # 只还原本用户的连接参数，保留同步后的统计与 TG 数据。
-    _db_apply --arg p "$proto" --arg id "$id" --argjson old "$row" '
-        .xray[$p] |= map(if .snell_id == $id then .users as $users |
-            $old | .users=$users | .users[0].uuid=$old.psk else . end)'
-    cp "$oldfile" "$CFG/snell-users/$id.conf"
-    _snell_update_counter_port "$id" "$(jq -r .port <<< "$row")" || true
-    _snell_apply_users "$proto" "$name" || true
+    # Named counters are preserved across port changes; restore the old rule and state.
+    [[ "$touched" != true ]] || svc stop "$service" || _err "回滚前停止失败: $service"
+    _snell_update_counter_port "$id" "$old_port" || _err "计数端口回滚失败"
+    _snell_user_change_restore "$backup" || _err "用户状态回滚失败: $backup"
     rm -f "$staged"
-    _err "修改失败，已尝试恢复原配置；备份: $oldfile"
+    _err "$failed，已尝试恢复；备份: $backup"
     return 1
 }
 

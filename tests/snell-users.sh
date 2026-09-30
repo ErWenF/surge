@@ -12,7 +12,7 @@ load_function() {
     body=$(awk -v fn="$1" 'index($0, fn "() {") == 1 {on=1} on {print} on && $0 == "}" {exit}' "$script")
     eval "$body"
 }
-for fn in _is_snell_users_protocol _snell_managed _snell_any_managed _snell_rows _snell_migrate _snell_account_traffic _snell_sync_traffic _snell_prepare_user _snell_user_share _snell_group_service _snell_live_stats _db_apply db_list_users db_get_user_field gen_snell_surge_line db_set_user_tg_binding db_find_user_by_tg_chat; do
+for fn in _quota_alert_thresholds _is_snell_users_protocol _snell_managed _snell_any_managed _snell_rows _snell_migrate _snell_account_traffic _snell_sync_traffic _snell_prepare_user _snell_user_share _snell_group_service _snell_live_stats _db_apply db_list_users db_get_user_field gen_snell_surge_line db_set_user_tg_binding db_find_user_by_tg_chat; do
     load_function "$fn"
 done
 _db_lock_acquire() { :; }
@@ -23,6 +23,7 @@ _snell_nft_ready() { :; }
 _snell_counter_prepare() { :; }
 get_connection_addresses() { echo '203.0.113.1|2001:db8::1'; }
 _is_valid_port() { [[ "$1" -gt 0 && "$1" -lt 65536 ]]; }
+tg_get_config() { echo 80; }
 tg_send_over_quota() { echo quota >> "$CFG/events"; }
 send_tg_expired_notice() { echo expired >> "$CFG/events"; }
 tg_send_quota_alert() { echo alert >> "$CFG/events"; }

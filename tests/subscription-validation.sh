@@ -62,7 +62,13 @@ parse_subscription https://fixture.example/sub > "$fixture/plain.json"
 fixture_content=$(printf '%s' "$plain_link" | base64 -w 0)
 parse_subscription https://fixture.example/sub > "$fixture/base64.json"
 cmp "$fixture/plain.json" "$fixture/base64.json"
+fixture_content="$plain_link"$'\nunsupported://redacted\nnot-a-link\n'
+parse_subscription https://fixture.example/sub > "$fixture/mixed.json" 2> "$fixture/import-status"
+cmp "$fixture/plain.json" "$fixture/mixed.json"
+grep -q '跳过 2 行' "$fixture/import-status"
+grep -q '分享链接 1 行.*非分享链接内容 1 行' "$fixture/import-status"
 # Partially decodable input must not be accepted as a complete Base64 payload.
+fixture_content=$(printf '%s' "$plain_link" | base64 -w 0)
 fixture_content+='%'
 if fetch_subscription https://fixture.example/sub > "$fixture/bad-decode"; then exit 1; fi
 echo 'PASS plain/Base64 subscription parity and rejection of partial decoding'

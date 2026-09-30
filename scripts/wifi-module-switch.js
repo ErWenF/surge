@@ -1,132 +1,63 @@
-/**
- * Surge WiFi 自动模块切换
- *
- * 模块参数格式：
- * mozi|weeland|mozi-5G
- *
- * 命中指定 WiFi：
- *   关闭「po0 防火墙自动加白」
- *
- * 未命中：
- *   开启「po0 防火墙自动加白」
- */
-
-const MODULE_NAME = "po0 防火墙自动加白";
-
-// ==============================
-// 读取模块传入的 WiFi 参数
-// ==============================
-
-const argument =
-  typeof $argument === "string"
-    ? $argument
-    : "";
-
-// 使用 | 分割多个 WiFi
-const TARGET_WIFIS = argument
-  .split("|")
-  .filter(item => item.length > 0);
-
-
-// ==============================
-// 获取当前 WiFi
-// ==============================
-
-const wifi = $network.wifi;
-
-const ssid =
-  wifi && wifi.ssid
-    ? wifi.ssid
-    : null;
-
-
-// ==============================
-// 判断当前 WiFi 是否命中
-// ==============================
-
-const isTargetWiFi =
-  ssid !== null &&
-  TARGET_WIFIS.indexOf(ssid) !== -1;
-
-
-// ==============================
-// 模块状态
-// ==============================
-
-// 命中指定 WiFi
-// → 关闭模块
-//
-// 其他 WiFi / 4G / 5G
-// → 开启模块
-
-const shouldEnable = !isTargetWiFi;
-
-
-// ==============================
-// 日志
-// ==============================
-
-console.log("========== WiFi 模块切换 ==========");
-
-console.log(
-  "设定 WiFi：" +
-  JSON.stringify(TARGET_WIFIS)
-);
-
-console.log(
-  "当前网络：" +
-  (ssid || "蜂窝网络 / 无 WiFi")
-);
-
-console.log(
-  "WiFi 匹配：" +
-  (isTargetWiFi ? "是" : "否")
-);
-
-console.log(
-  MODULE_NAME +
-  " → " +
-  (shouldEnable ? "开启" : "关闭")
-);
-
-
-// ==============================
-// 调用 Surge API
-// ==============================
-
-const body = {};
-
-body[MODULE_NAME] = shouldEnable;
-
-$httpAPI(
-  "POST",
-  "/v1/modules",
-  body,
-  function(result) {
-
-    console.log(
-      "API 返回：" +
-      JSON.stringify(result)
-    );
-
-    if (isTargetWiFi) {
-
-      console.log(
-        "已连接 " +
-        ssid +
-        " → 关闭模块：" +
-        MODULE_NAME
-      );
-
-    } else {
-
-      console.log(
-        "未连接指定 WiFi → 开启模块：" +
-        MODULE_NAME
-      );
-
-    }
-
+/** Surge WiFi module switch. Legacy SSID1|SSID2 arguments remain supported. */
+(function () {
+  'use strict';
+  var finished = false, timer;
+  function finish(message) {
+    if (finished) return;
+    finished = true;
+    if (timer && typeof clearTimeout === 'function') clearTimeout(timer);
+    console.log(message);
     $done();
   }
-);
+  var argument = typeof $argument === 'string' ? $argument : '';
+  var moduleName = 'po0 防火墙自动加白', wifiList = argument;
+  try {
+    if (/^(wifi_list|module_name)=/.test(argument)) {
+      // Module placeholders are substituted literally, not URL encoded.
+      var split = argument.lastIndexOf('&module_name=');
+      if (argument.indexOf('wifi_list=') === 0) {
+        wifiList = argument.slice(10, split >= 0 ? split : argument.length);
+        if (split >= 0) moduleName = argument.slice(split + 13) || moduleName;
+      } else {
+        wifiList = '';
+        moduleName = argument.slice(12) || moduleName;
+      }
+    }
+  } catch (_) { finish('WiFi 模块参数格式错误'); return; }
+  var targetWiFis = wifiList.split('|').filter(function (item) { return item.length > 0; });
+  var wifi = typeof $network === 'object' && $network && $network.wifi;
+  var ssid = wifi && wifi.ssid ? wifi.ssid : null;
+  var shouldEnable = !(ssid !== null && targetWiFis.indexOf(ssid) !== -1);
+  console.log('当前网络：' + (ssid || '蜂窝网络 / 无 WiFi') + '；目标模块：' + moduleName);
+  timer = setTimeout(function () { finish('模块切换超时，无法确认实际状态'); }, 12000);
+  function readState(callback) {
+    $httpAPI('GET', '/v1/modules', {}, function (result) {
+      if (finished) return;
+      if (!result || result.error || !Array.isArray(result.available) || !Array.isArray(result.enabled)) {
+        finish('模块状态查询失败，无法确认实际状态'); return;
+      }
+      if (result.available.indexOf(moduleName) === -1) {
+        finish('找不到模块：' + moduleName + '，请检查模块名称参数'); return;
+      }
+      callback(result.enabled.indexOf(moduleName) !== -1);
+    });
+  }
+  try {
+    readState(function (enabled) {
+      if (enabled === shouldEnable) { finish('模块已处于目标状态：' + moduleName + ' → ' + (enabled ? '开启' : '关闭')); return; }
+      var body = {};
+      body[moduleName] = shouldEnable;
+      try { $httpAPI('POST', '/v1/modules', body, function (result) {
+        if (finished) return;
+        if (result && result.error) { finish('模块切换失败，实际状态未确认'); return; }
+        try {
+          readState(function (actual) {
+            finish(actual === shouldEnable
+              ? '已确认模块状态：' + moduleName + ' → ' + (actual ? '开启' : '关闭')
+              : '模块切换未生效：' + moduleName);
+          });
+        } catch (_) { finish('模块状态复查失败'); }
+      }); } catch (_) { finish('无法提交 Surge 模块切换'); }
+    });
+  } catch (_) { finish('无法调用 Surge 模块 API'); }
+}());

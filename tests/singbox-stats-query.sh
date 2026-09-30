@@ -4,7 +4,7 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 load() { eval "$(awk -v fn="$1" 'index($0, fn "() {") == 1 {on=1} on {print} on && $0 == "}" {exit}' "$repo/vless-server.sh")"; }
-for fn in _traffic_snapshot _commit_traffic_snapshots singbox_api_query _singbox_stats_proto _sync_all_user_traffic_unlocked _get_singbox_stat_user_mappings db_exists db_get_user_field db_list_protocols _singbox_stats_config_ready; do load "$fn"; done
+for fn in _quota_alert_thresholds _traffic_snapshot _commit_traffic_snapshots singbox_api_query _singbox_stats_proto _sync_all_user_traffic_unlocked _get_singbox_stat_user_mappings db_exists db_get_user_field db_list_protocols _singbox_stats_config_ready; do load "$fn"; done
 _core_traffic_epoch() { echo test-epoch; }
 _db_apply() { jq "$@" "$DB_FILE" > "$fixture/new" && mv "$fixture/new" "$DB_FILE"; }
 SINGBOX_V2RAY_API_PORT=10086

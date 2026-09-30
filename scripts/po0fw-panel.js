@@ -14,6 +14,32 @@
   }
   function clean(text) { return String(text).replace(/[\r\n\t]/g, ' '); }
   function integer(value) { return typeof value === 'number' && isFinite(value) && Math.floor(value) === value; }
+  function sameC24(a, b) {
+    if (!a || !b) return false;
+    a = String(a); b = String(b);
+    function ipv4(value) {
+      var parts = value.replace(/\/24$/, '').split('.');
+      if (parts.length !== 4 || !parts.every(function (part) {
+        return /^(0|[1-9][0-9]{0,2})$/.test(part) && Number(part) <= 255;
+      })) return null;
+      return parts;
+    }
+    var pa = ipv4(a), pb = ipv4(b);
+    if (pa && pb) {
+      if (a === b) return true;
+      return (a.slice(-3) === '/24' || b.slice(-3) === '/24') &&
+        pa[0] === pb[0] && pa[1] === pb[1] && pa[2] === pb[2];
+    }
+    // IPv6 exact matches remain supported; reject malformed strings/CIDRs.
+    if (a !== b || !/^[0-9a-f:]+$/i.test(a) || a.indexOf(':') < 0) return false;
+    var halves = a.split('::');
+    if (halves.length > 2) return false;
+    var groups = halves.map(function (half) { return half ? half.split(':') : []; });
+    var count = groups.reduce(function (n, group) { return n + group.length; }, 0);
+    return groups.every(function (group) { return group.every(function (part) {
+      return /^[0-9a-f]{1,4}$/i.test(part);
+    }); }) && (halves.length === 2 ? count < 8 : count === 8);
+  }
   function render(data) {
     if (!data || !Array.isArray(data.whitelist)) throw new Error('schema');
     var list = data.whitelist;
@@ -23,7 +49,7 @@
     var fixed = [], fifo = [], other = [], hit = false;
     list.forEach(function (entry) {
       if (!entry || typeof entry.ip !== 'string' || !entry.ip) throw new Error('entry');
-      if (entry.ip === current) hit = true;
+      if (sameC24(entry.ip, current)) hit = true;
       if (entry.slot === null) fifo.push(entry);
       else if ((typeof entry.slot === 'number' || (typeof entry.slot === 'string' && /^\d+$/.test(entry.slot))) && integer(Number(entry.slot)) && Number(entry.slot) >= 0) fixed.push(entry);
       else other.push(entry);
@@ -32,7 +58,7 @@
     var lines = ['占用 ' + list.length + '/' + (knownLimit ? limit : '?') + ' · 剩余 ' + (knownLimit ? Math.max(0, limit-list.length) : '?')];
     lines.push('本机出口：' + (current ? clean(current) : '接口未返回'));
     lines.push(current ? (hit ? '✓ 当前出口已在白名单' : '⚠ 当前出口未在白名单') : '当前出口命中状态未知');
-    function row(label, entry) { lines.push((entry.ip === current ? '● ' : '○ ') + label + '  ' + clean(entry.ip)); }
+    function row(label, entry) { lines.push((sameC24(entry.ip, current) ? '● ' : '○ ') + label + '  ' + clean(entry.ip)); }
     fixed.forEach(function (entry) { row('固定槽 ' + entry.slot, entry); });
     fifo.forEach(function (entry, index) { row('FIFO ' + (index + 1), entry); });
     other.forEach(function (entry, index) { row('未标注槽位 ' + (index + 1), entry); });

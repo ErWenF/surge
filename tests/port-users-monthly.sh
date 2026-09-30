@@ -19,7 +19,7 @@ for fn in _ss2022_key_len _ss2022_valid_key _ss2022_share_password gen_xray_ss20
     db_set_user_enabled db_get_user db_get_user_field db_get_user_alert_state db_set_user_alert_state db_get_users_stats db_list_users \
     gen_xray_vless_clients gen_xray_vmess_clients gen_xray_trojan_clients \
     reset_monthly_user_traffic check_monthly_traffic_reset \
-    _sync_all_user_traffic_unlocked; do
+    _quota_alert_thresholds _sync_all_user_traffic_unlocked; do
     load_function "$fn"
 done
 

@@ -119,6 +119,83 @@ _pgrep() {
     return 1
 }
 
+# 按实际能力检测 flock；探测使用独立文件，不能影响业务锁或继承的描述符。
+ensure_flock() {
+    local bin probe
+    bin=$(command -v flock) || bin=""
+    if [[ -z "$bin" ]]; then
+        _FLOCK_BIN=""
+        _FLOCK_CHECKED_BIN=""
+        _FLOCK_HAS_WAIT=false
+    elif [[ "${_FLOCK_CHECKED_BIN:-}" != "$bin" ]]; then
+        probe=$(mktemp "${TMPDIR:-/tmp}/vless-flock.XXXXXX") || return 1
+        _FLOCK_HAS_WAIT=false
+        if ( "$bin" -x -w 0 9 ) 9>"$probe" 2>/dev/null; then
+            _FLOCK_HAS_WAIT=true
+        fi
+        rm -f "$probe"
+        _FLOCK_BIN="$bin"
+        _FLOCK_CHECKED_BIN="$bin"
+    fi
+
+    # Alpine 3.21 的独立 flock 子包提供 cmd:flock（/usr/bin/flock）。
+    # 让当前 apk 软件源解析提供项，避免猜测 util-linux 的子包名称。
+    # 仅依赖安装阶段尝试升级；后台任务和持锁路径不访问软件源。
+    if [[ "${1:-}" == install && "$_FLOCK_HAS_WAIT" != true &&
+          "${_FLOCK_APK_ATTEMPTED:-false}" != true ]] && command -v apk >/dev/null 2>&1; then
+        _FLOCK_APK_ATTEMPTED=true
+        if apk add --no-cache 'cmd:flock' >/dev/null 2>&1; then
+            hash -r
+            _FLOCK_CHECKED_BIN=""
+            ensure_flock || return 1
+        fi
+    fi
+    [[ -n "$_FLOCK_BIN" ]]
+}
+
+# Linux uptime 是单调时钟，不受 NTP/手动校时影响；单位为百分之一秒。
+_flock_ticks() {
+    local uptime unused
+    if read -r uptime unused < /proc/uptime; then
+        printf '%s\n' "$((10#${uptime%%.*} * 100 + 10#${uptime#*.}))"
+    else
+        printf '%s\n' "$((SECONDS * 100))"
+    fi
+}
+
+# 空超时保留数据库的阻塞锁语义；业务锁目前使用整数秒超时。
+flock_wait() {
+    local wait_seconds="$1" fd="$2" deadline now rc
+    ensure_flock || return 1
+    if [[ -z "$wait_seconds" ]]; then
+        "$_FLOCK_BIN" -x "$fd"
+        return $?
+    fi
+    [[ "$wait_seconds" =~ ^[0-9]+$ ]] || return 1
+    wait_seconds=$((10#$wait_seconds))
+    if [[ "$_FLOCK_HAS_WAIT" == true ]]; then
+        "$_FLOCK_BIN" -x -w "$wait_seconds" "$fd"
+        return $?
+    fi
+
+    # BusyBox 支持 -n，但不支持 -w。锁仍由内核 flock 持有，
+    # 只重试非阻塞加锁，避免依赖 GNU date/timeout 参数。
+    now=$(_flock_ticks) || return 1
+    deadline=$((now + wait_seconds * 100))
+    while true; do
+        if "$_FLOCK_BIN" -x -n "$fd"; then return 0; else rc=$?; fi
+        [[ "$rc" == 1 ]] || return "$rc"
+        now=$(_flock_ticks) || return 1
+        (( now < deadline )) || return 1
+        sleep 0.1 || return 1
+    done
+}
+
+flock_unlock() {
+    ensure_flock || return 1
+    "$_FLOCK_BIN" -u "$1"
+}
+
 #═══════════════════════════════════════════════════════════════════════════════
 #  全局状态数据库 (JSON)
 #═══════════════════════════════════════════════════════════════════════════════
@@ -140,9 +217,9 @@ _db_lock_acquire() {
     local lock_file="${DB_LOCK_FILE:-$CFG/.db.lock}"
     DB_LOCK_HELD_FILE="$lock_file"
     mkdir -p "$CFG" || return 1
-    if command -v flock >/dev/null 2>&1; then
+    if ensure_flock; then
         exec {DB_LOCK_FD}>"$lock_file" || return 1
-        flock -x "$DB_LOCK_FD" || {
+        flock_wait "" "$DB_LOCK_FD" || {
             exec {DB_LOCK_FD}>&-
             DB_LOCK_FD=""
             return 1
@@ -177,7 +254,7 @@ _db_lock_release() {
     DB_LOCK_DEPTH=$((DB_LOCK_DEPTH - 1))
     (( DB_LOCK_DEPTH == 0 )) || return 0
     if [[ -n "${DB_LOCK_FD:-}" ]]; then
-        flock -u "$DB_LOCK_FD" 2>/dev/null || true
+        flock_unlock "$DB_LOCK_FD" 2>/dev/null || true
         exec {DB_LOCK_FD}>&-
         DB_LOCK_FD=""
     fi
@@ -3609,9 +3686,9 @@ _with_named_lock() {
     (
         local lock="$CFG/.${task}.lock" task_fd lock_dir attempt holder
         mkdir -p "$CFG" || return 1
-        if command -v flock >/dev/null 2>&1; then
+        if ensure_flock; then
             exec {task_fd}>"$lock" || return 1
-            flock -x -w 30 "$task_fd" || { _err "等待 $task 锁超时"; return 1; }
+            flock_wait 30 "$task_fd" || { _err "等待 $task 锁超时"; return 1; }
         else
             lock_dir="${lock}.d"
             for ((attempt=0; attempt<600; attempt++)); do
@@ -6350,6 +6427,9 @@ check_dependencies() {
         _ok "依赖安装完成"
     fi
 
+    # 完整 flock 获取失败时仍可使用 BusyBox 重试或原有目录锁。
+    ensure_flock install || true
+
     # qrencode 只用于终端显示二维码，不应因软件源缺包阻断协议安装。
     _install_optional_qrencode
     return 0
@@ -7984,6 +8064,7 @@ install_deps() {
         fi
         _ok "依赖安装完成"
     fi
+    ensure_flock install || true
 }
 
 #═══════════════════════════════════════════════════════════════════════════════

@@ -13,6 +13,7 @@ load_function() {
 }
 for fn in _ss2022_key_len _ss2022_valid_key _ss2022_share_password gen_xray_ss2022_clients \
     gen_ss2022_link _gen_user_share_link \
+    ensure_flock _flock_ticks flock_wait flock_unlock \
     _db_lock_acquire _db_lock_release _with_db_lock _restore_db_backup \
     _traffic_snapshot _xray_traffic_counters _commit_traffic_snapshots \
     _user_management_supported _user_change_begin _user_change_apply db_add_user db_del_user \

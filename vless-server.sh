@@ -36,7 +36,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.7.5 [服务端]
+#  多协议代理一键部署脚本 v3.7.9 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 默认处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.8"
+readonly VERSION="3.7.9"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"

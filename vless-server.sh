@@ -6295,6 +6295,45 @@ _has_ca_bundle() {
     return 1
 }
 
+# 菜单初始化数据库和后台版本检查前就需要这些命令。
+# 只补齐缺失的必需依赖，不在启动时安装 cron、二维码或协议组件。
+ensure_startup_dependencies() {
+    local cmd required_cmds="curl jq openssl" missing=() install_rc=0
+    for cmd in $required_cmds; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    _has_ca_bundle || missing+=("ca-certificates")
+    (( ${#missing[@]} > 0 )) || return 0
+
+    _info "安装启动所需依赖: ${missing[*]}..."
+    if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache "${missing[@]}" || install_rc=$?
+    elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing[@]}" || install_rc=$?
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y "${missing[@]}" || install_rc=$?
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y "${missing[@]}" || install_rc=$?
+    else
+        _err "缺少启动依赖: ${missing[*]}；未找到受支持的包管理器，请先手动安装"
+        return 1
+    fi
+    if (( install_rc != 0 )); then
+        _err "启动依赖安装失败: ${missing[*]}；请检查软件源、网络和磁盘空间后重试"
+        return 1
+    fi
+
+    # 包管理器返回成功也必须复查，不能带着缺失的 jq 进入菜单。
+    for cmd in $required_cmds; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            _err "启动依赖仍不可用: $cmd；请检查安装结果和 PATH"
+            return 1
+        }
+    done
+    _has_ca_bundle || { _err "启动所需 CA 证书仍不可用"; return 1; }
+    return 0
+}
+
 # 检测并安装基础依赖
 _install_optional_qrencode() {
     command -v qrencode >/dev/null 2>&1 && return 0
@@ -30651,7 +30690,8 @@ do_update() {
 main_menu() {
     check_root
     init_log  # 初始化日志
-    init_db   # 初始化 JSON 数据库
+    ensure_startup_dependencies || return 1
+    init_db || return 1  # 初始化 JSON 数据库
     db_migrate_to_multiuser  # 迁移旧的单用户配置到多用户格式
     ensure_singbox_runtime_consistency 2>/dev/null || true
 

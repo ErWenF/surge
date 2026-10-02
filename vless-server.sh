@@ -36,7 +36,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.7.11 [服务端]
+#  多协议代理一键部署脚本 v3.7.12 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 默认处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.11"
+readonly VERSION="3.7.12"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -83,6 +83,11 @@ readonly SUBSCRIPTION_MAX_BYTES=10485760
 # IP 缓存变量
 _CACHED_IPV4=""
 _CACHED_IPV6=""
+# IPv6 展示缓存只保存在本次进程内；接口地址每次重读，出口失败也缓存 60 秒。
+_SERVER_IPV6_ROWS=""
+_SERVER_IPV6_EGRESS=""
+_SERVER_IPV6_PROBED_AT=-60
+_SERVER_IPV6_PREVIOUS_ROWS=""
 
 # 兼容精简 Alpine：BusyBox 镜像可能没有 pgrep，但通常提供 pidof。
 # 最后一层直接检查 /proc，避免服务已经启动却被误判为“进程未运行”。
@@ -6751,6 +6756,199 @@ get_local_ipv6() {
     echo "$result"
 }
 
+# 展开为统一的 32 位十六进制键，避免压缩形式、大小写造成重复。
+_server_ipv6_key() {
+    local address="${1,,}" part left right missing
+    local left_parts=() right_parts=()
+    _is_valid_ipv6_literal "$address" || return 1
+    if [[ "$address" == *::* ]]; then
+        left="${address%%::*}"; right="${address#*::}"
+        [[ -z "$left" ]] || IFS=: read -r -a left_parts <<< "$left"
+        [[ -z "$right" ]] || IFS=: read -r -a right_parts <<< "$right"
+        missing=$((8 - ${#left_parts[@]} - ${#right_parts[@]}))
+    else
+        IFS=: read -r -a left_parts <<< "$address"
+        missing=0
+    fi
+    for part in "${left_parts[@]}"; do printf '%04x' "$((16#$part))"; done
+    while (( missing > 0 )); do printf '0000'; missing=$((missing - 1)); done
+    for part in "${right_parts[@]}"; do printf '%04x' "$((16#$part))"; done
+}
+
+_server_ipv6_scope() {
+    local key="$1"
+    case "$key" in
+        fc*|fd*) echo local ;;
+        # 2000::/3 公网单播；文档及基准测试地址不能推荐为公网节点地址。
+        20010db8*|200100020000*|3fff0*) return 1 ;;
+        2*|3*) echo public ;;
+        *) return 1 ;;
+    esac
+}
+
+# 不依赖 ip -o/-j 或专属过滤参数，兼容 BusyBox ip 与 iproute2。
+_parse_server_ipv6_ip() {
+    awk '
+        /^[0-9]+:/ {
+            dev=$2; sub(/:$/, "", dev); sub(/@.*/, "", dev)
+            up=($0 ~ /[<,]UP[,>]/); next
+        }
+        $1 == "inet6" && up {
+            if ($0 ~ /(^|[[:space:]])(tentative|dadfailed|deprecated)([[:space:]]|$)/) next
+            address=$2; sub(/\/.*/, "", address)
+            kind=($0 ~ /(^|[[:space:]])temporary([[:space:]]|$)/) ? "temporary" : "stable"
+            print address "|" dev "|" kind
+        }
+    '
+}
+
+_server_ipv6_interface_up() {
+    local flags
+    [[ "$1" =~ ^[a-zA-Z0-9_.:-]+$ ]] || return 1
+    [[ -r "/sys/class/net/$1/flags" ]] || return 1
+    read -r flags < "/sys/class/net/$1/flags" || return 1
+    [[ "$flags" =~ ^0x[0-9a-fA-F]+$ ]] && (( flags & 1 ))
+}
+
+# ip 不存在/执行失败时，读取内核表；不用 gawk strtonum 或 GNU 专属参数。
+_parse_server_ipv6_proc() {
+    local hex index prefix scope flags dev address kind i
+    while read -r hex index prefix scope flags dev; do
+        [[ "$hex" =~ ^[0-9a-fA-F]{32}$ && "$flags" =~ ^[0-9a-fA-F]{1,8}$ ]] || continue
+        _server_ipv6_interface_up "$dev" || continue
+        # Linux IFA_F_DADFAILED=0x08, DEPRECATED=0x20, TENTATIVE=0x40。
+        (( (16#$flags & 0x68) == 0 )) || continue
+        kind=stable; (( (16#$flags & 1) == 0 )) || kind=temporary
+        address=""
+        for ((i=0; i<32; i+=4)); do
+            printf -v address '%s%x:' "$address" "$((16#${hex:i:4}))"
+        done
+        printf '%s|%s|%s\n' "${address%:}" "$dev" "$kind"
+    done
+}
+
+_read_server_ipv6_records() {
+    local data address ip_read=false
+    if command -v ip >/dev/null 2>&1 && data=$(ip -6 addr show 2>/dev/null); then
+        ip_read=true
+        data=$(_parse_server_ipv6_ip <<< "$data")
+        if [[ -n "$data" ]]; then
+            printf '%s\n' "$data"
+            return 0
+        fi
+    fi
+    if [[ -r /proc/net/if_inet6 ]]; then
+        _parse_server_ipv6_proc < /proc/net/if_inet6
+    elif [[ "$ip_read" == false ]] && command -v hostname >/dev/null 2>&1; then
+        # 最后一层缺少接口状态，明确标记为 unknown，不声称已验证可用。
+        for address in $(hostname -I 2>/dev/null); do
+            printf '%s|未知接口|unknown\n' "$address"
+        done
+    fi
+}
+
+_server_ipv6_is_warp() {
+    case "$1" in wgcf|warp|warp[0-9]*|WARP|CloudflareWARP) return 0 ;; *) return 1 ;; esac
+}
+
+get_server_ipv6_addresses() {
+    local address dev kind key scope rank
+    local -A seen=()
+    while IFS='|' read -r address dev kind; do
+        key=$(_server_ipv6_key "$address") || continue
+        [[ -z "${seen[$key]:-}" ]] || continue
+        scope=$(_server_ipv6_scope "$key") || continue
+        seen[$key]=1
+        case "$kind" in stable) rank=0 ;; temporary) rank=1 ;; *) rank=2 ;; esac
+        [[ "$scope" == public ]] || rank=$((rank + 3))
+        _server_ipv6_is_warp "$dev" && rank=$((rank + 6))
+        printf '%s|%s|%s|%s|%s\n' "$rank" "${address,,}" "$dev" "$kind" "$scope"
+    done < <(_read_server_ipv6_records) |
+        sort -t '|' -k1,1n | cut -d '|' -f2-
+}
+
+# 仅无本机公网类型地址时补充出口查询，三个 HTTPS 服务并行，单个最多 3 秒。
+# 出口地址可能来自 WARP/NAT，绝不自动当作本机入站地址或写进节点配置。
+_probe_server_ipv6_egress() {
+    local dir endpoint result key pid i=0
+    local pids=()
+    command -v curl >/dev/null 2>&1 || return 1
+    dir=$(mktemp -d) || return 1
+    for endpoint in https://api6.ipify.org https://ifconfig.co/ip https://ifconfig.me/ip; do
+        (
+            result=$(curl -q -6 --noproxy '*' -fsS --connect-timeout 2 --max-time 3 --max-filesize 256 "$endpoint" 2>/dev/null) || exit 1
+            # 只去掉首尾空白，不能把多行或中间有空格的响应拼成另一个地址。
+            result="${result#"${result%%[![:space:]]*}"}"
+            result="${result%"${result##*[![:space:]]}"}"
+            key=$(_server_ipv6_key "$result") || exit 1
+            [[ "$(_server_ipv6_scope "$key")" == public ]] || exit 1
+            printf '%s\n' "${result,,}"
+        ) > "$dir/$i" &
+        pids+=("$!"); i=$((i + 1))
+    done
+    for pid in "${pids[@]}"; do wait "$pid" || true; done
+    result=""
+    for ((i=0; i<3; i++)); do
+        [[ -s "$dir/$i" ]] || continue
+        read -r result < "$dir/$i"
+        break
+    done
+    rm -rf "$dir"
+    [[ -n "$result" ]] || return 1
+    printf '%s\n' "$result"
+}
+
+_refresh_server_ipv6() {
+    local address dev kind scope
+    _SERVER_IPV6_ROWS=$(get_server_ipv6_addresses)
+    if [[ "$_SERVER_IPV6_ROWS" != "$_SERVER_IPV6_PREVIOUS_ROWS" ]]; then
+        _SERVER_IPV6_PROBED_AT=-60
+        _SERVER_IPV6_EGRESS=""
+        _SERVER_IPV6_PREVIOUS_ROWS="$_SERVER_IPV6_ROWS"
+    fi
+    while IFS='|' read -r address dev kind scope; do
+        if [[ "$scope" == public ]]; then
+            _SERVER_IPV6_EGRESS=""
+            return 0
+        fi
+    done <<< "$_SERVER_IPV6_ROWS"
+    if (( SECONDS - _SERVER_IPV6_PROBED_AT >= 60 )); then
+        _SERVER_IPV6_EGRESS=$(_probe_server_ipv6_egress) || _SERVER_IPV6_EGRESS=""
+        _SERVER_IPV6_PROBED_AT=$SECONDS
+    fi
+    return 0
+}
+
+show_server_ipv6() {
+    local mode="${1:-compact}" address dev kind scope suffix has_public=false
+    _refresh_server_ipv6
+    while IFS='|' read -r address dev kind scope; do
+        [[ -n "$address" ]] || continue
+        suffix="$dev"
+        [[ "$kind" != temporary ]] || suffix="$suffix，临时地址"
+        [[ "$kind" != unknown ]] || suffix="$suffix，接口状态未确认"
+        if _server_ipv6_is_warp "$dev"; then
+            echo -e "  WARP IPv6: ${D}$address ($suffix，隧道地址，不推荐用于直连节点)${NC}"
+        elif [[ "$scope" == public ]]; then
+            has_public=true
+            echo -e "  本机 IPv6: ${G}$address${NC} ${D}($suffix)${NC}"
+        else
+            echo -e "  内网 IPv6: ${D}$address ($suffix，仅内网可用)${NC}"
+        fi
+    done <<< "$_SERVER_IPV6_ROWS"
+    if [[ -z "$_SERVER_IPV6_ROWS" ]]; then
+        echo -e "  本机 IPv6: ${D}未检测到可用于节点的地址${NC}"
+    fi
+    if [[ -n "$_SERVER_IPV6_EGRESS" ]]; then
+        echo -e "  IPv6 出口: ${D}$_SERVER_IPV6_EGRESS (非本机接口地址，不能直接用于节点)${NC}"
+    fi
+    if [[ "$mode" == details && "$has_public" == true ]]; then
+        echo -e "  ${D}可将上面的本机 IPv6 填入客户端「服务器地址」；含端口的 URL 使用 [IPv6]:端口。${NC}"
+        echo -e "  ${D}优先使用非临时地址；保留原端口、SNI 和认证参数，并确认 IPv6 安全组/防火墙放行。${NC}"
+    fi
+    return 0
+}
+
 # 获取用于客户端配置和分享链接的地址。只要存在任一公网地址，就保持原有
 # 公网优先逻辑；仅在公网 IPv4/IPv6 都不可用时才回落到本机接口地址。
 # 输出格式: ipv4|ipv6
@@ -6768,21 +6966,18 @@ get_connection_addresses() {
 # 公网地址不是安装代理核心的必要条件。无公网服务器仍可通过内网、NAT
 # 端口映射或隧道使用，因此这里只提示网络环境，永不阻断安装。
 show_install_network_environment() {
-    local public_ipv4 public_ipv6 local_ipv4 local_ipv6
+    local public_ipv4 local_ipv4
     public_ipv4=$(get_ipv4)
-    public_ipv6=$(get_ipv6)
 
     echo -e "  公网 IPv4: ${public_ipv4:-${R}无${NC}}"
-    echo -e "  公网 IPv6: ${public_ipv6:-${R}无${NC}}"
-    if [[ -n "$public_ipv4" || -n "$public_ipv6" ]]; then
+    show_server_ipv6
+    if [[ -n "$public_ipv4" || "$_SERVER_IPV6_ROWS" == *'|public'* || -n "$_SERVER_IPV6_EGRESS" ]]; then
         return 0
     fi
 
     local_ipv4=$(get_local_ipv4)
-    local_ipv6=$(get_local_ipv6)
     _warn "未检测到公网 IP，将继续安装"
     echo -e "  内网 IPv4: ${local_ipv4:-${D}无${NC}}"
-    echo -e "  内网 IPv6: ${local_ipv6:-${D}无${NC}}"
     echo -e "  ${D}安装完成后，请使用内网地址、NAT 端口映射地址、域名或隧道地址配置客户端。${NC}"
     return 0
 }
@@ -21378,7 +21573,7 @@ show_single_protocol_info() {
     _line
     
     [[ -n "$ipv4" ]] && echo -e "  IPv4: ${G}$ipv4${NC}"
-    [[ -n "$ipv6" ]] && echo -e "  IPv6: ${G}$ipv6${NC}"
+    show_server_ipv6 details
     local runtime_core_label="Xray"
     [[ "$core" == "singbox" ]] && runtime_core_label="Sing-box"
     [[ "$(get_protocol_default_core "$protocol")" == "standalone" ]] && runtime_core_label="独立核心"
@@ -21847,12 +22042,6 @@ show_single_protocol_info() {
             echo -e "  ${D}如需显示 JOIN 码，请修改脚本头部 SHOW_JOIN_CODE=\"on\"${NC}"
             echo ""
         fi
-    fi
-    
-    # IPv6 提示（仅双栈时显示，纯 IPv6 已经使用 IPv6 地址了）
-    if [[ -n "$ipv4" && -n "$ipv6" ]]; then
-        echo ""
-        echo -e "  ${D}提示: 服务器支持 IPv6 ($ipv6)，如需使用请自行替换地址${NC}"
     fi
     
     # 自签名证书提示（VMess-WS、VLESS-WS、VLESS-Vision、Trojan、Trojan-WS、Hysteria2 使用自签名证书时）
@@ -31174,6 +31363,7 @@ main_menu() {
         # 显示版本信息（已包含状态标识）
         echo -e "  ${D}系统: ${os_version} | ${kernel_version}${NC}"
         echo -e "  ${D}核心: Xray ${xray_ver_with_status} | Sing-box ${singbox_ver_with_status}${NC}"
+        show_server_ipv6
         if [[ -n "$script_update_ver" ]]; then
             echo -e "  ${Y}提示: 脚本有新版本 v${script_update_ver}，可在菜单选择「检查脚本更新」${NC}"
         fi

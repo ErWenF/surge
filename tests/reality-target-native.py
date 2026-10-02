@@ -44,7 +44,7 @@ x509_extensions=leaf
 [policy]
 commonName=supplied
 [leaf]
-subjectAltName=DNS:*.reality.test
+subjectAltName=DNS:probe.reality.test,DNS:*.reality.test
 extendedKeyUsage=serverAuth
 basicConstraints=critical,CA:FALSE
 [mismatch]
@@ -78,7 +78,7 @@ environment.update(PATH=str(bin_dir)+os.pathsep+environment['PATH'],
 
 
 class Endpoint:
-    def __init__(self, mode='ok', cert='valid', ipv6=False):
+    def __init__(self, mode='ok', cert='valid', ipv6=False, port=0):
         self.mode = mode
         self.ipv6 = ipv6
         self.stop = threading.Event()
@@ -93,7 +93,7 @@ class Endpoint:
             self.context.set_ecdh_curve('prime256v1')
         self.context.set_servername_callback(lambda sock, name, ctx: self.sni.append(name))
         self.listener = socket.socket(socket.AF_INET6 if ipv6 else socket.AF_INET)
-        self.listener.bind(('::1' if ipv6 else '127.0.0.1', 0))
+        self.listener.bind(('::1' if ipv6 else '127.0.0.1', port))
         self.port = self.listener.getsockname()[1]
         self.listener.listen()
         self.listener.settimeout(0.2)
@@ -160,7 +160,7 @@ class Endpoint:
             worker.join(2)
 
 
-def probe(endpoint, expected, *, trust=True):
+def probe(endpoint, expected, *, trust=True, discovered_ip=''):
     env = environment.copy()
     env['REALITY_TEST_PORT'] = str(endpoint.port)
     env['REALITY_TEST_ADDRESS'] = '[::1]' if endpoint.ipv6 else '127.0.0.1'
@@ -169,8 +169,8 @@ def probe(endpoint, expected, *, trust=True):
         env.pop('SSL_CERT_FILE')
     start = time.monotonic()
     result = subprocess.run(['bash', '-c',
-        'source "$1"; probe_reality_target probe.reality.test "$2" 1 3',
-        'test', str(library), str(endpoint.port)], env=env,
+        'source "$1"; probe_reality_target probe.reality.test "$2" 1 3 "$3"',
+        'test', str(library), str(endpoint.port), discovered_ip], env=env,
         text=True, capture_output=True, timeout=10)
     elapsed = time.monotonic()-start
     if expected:
@@ -211,6 +211,82 @@ try:
     print('PASS IPv6 HTTPS IP is reused with bracketed OpenSSL address', flush=True)
 finally:
     endpoint.close()
+
+for discovered_ip, expected in [('127.0.0.1', True), ('127.0.0.2', False),
+                                ('127.0.0.2,127.0.0.1', True)]:
+    endpoint = Endpoint()
+    try:
+        probe(endpoint, expected, discovered_ip=discovered_ip)
+        if not expected:
+            assert endpoint.connections == 1, endpoint.connections
+    finally:
+        endpoint.close()
+print('PASS discovered IP must match real forward-DNS HTTPS connection', flush=True)
+
+# Discovery really uses OpenSSL without SNI, extracts SAN (not CN), and never expands wildcards.
+for mode, expected in [('ok', True), ('no_h2', False), ('tls12', False), ('http_stall', False)]:
+    endpoint = Endpoint(mode)
+    try:
+        start = time.monotonic()
+        result = subprocess.run(['bash', '-c',
+            'source "$1"; group=$(_reality_tls_group_flag); _reality_scan_ip 127.0.0.1 "$2" "$group"',
+            'test', str(library), str(endpoint.port)], env=environment,
+            capture_output=True, text=True, timeout=10)
+        assert time.monotonic()-start < 8, (mode, result)
+        if expected:
+            assert result.returncode == 0, result.stderr
+            assert result.stdout == '127.0.0.1\tprobe.reality.test\n', result.stdout
+            assert endpoint.sni == [None], endpoint.sni
+        else:
+            assert result.returncode != 0 and not result.stdout, result
+        print(f'PASS native discovery {mode=} bounded; SAN only, no wildcard invention', flush=True)
+    finally:
+        endpoint.close()
+
+# Complete production flow, with only the generated target list/IP endpoint redirected
+# to a controlled local server. Real curl DNS connection, discovery and all TLS checks run.
+endpoint = Endpoint(port=443)
+try:
+    env = environment.copy()
+    env['REALITY_TEST_PORT'] = '443'
+    env['REALITY_TEST_ADDRESS'] = '127.0.0.1'
+    result = subprocess.run(['bash', '-c', '''source "$1"
+_reality_public_ipv4() { echo 8.20.158.164; }
+_reality_neighbor_ips() { [[ "$3" == 1 ]] || return 3; echo 127.0.0.1; }
+ask_sni_config default.example '' reality
+''', 'test', str(library)], input='3\n\n', env=env,
+        capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0 and result.stdout == 'probe.reality.test\n', result
+    assert endpoint.connections == 5 and endpoint.sni == [None]+['probe.reality.test']*4, endpoint.sni
+    print('PASS native automatic menu -> discovery -> DNS/CA/TLS verification -> recommendation', flush=True)
+finally:
+    endpoint.close()
+
+# Interactive early stop must preserve candidates and advance, without Ctrl-C cancelling installation.
+master, slave = os.openpty()
+stop_env = environment.copy()
+stop_env['REALITY_STOP_READY'] = str(work/'stop-ready')
+process = subprocess.Popen(['bash', '-c', '''source "$1"
+_reality_tls_group_flag() { echo -groups; }
+_reality_scan_ip() { printf '%s\\tstop.example\\n' "$1"; touch "$REALITY_STOP_READY"; sleep .2; }
+_reality_discover_candidates 8.20.158.164 443 600
+''', 'test', str(library)], stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    env=stop_env, text=True)
+os.close(slave)
+try:
+    deadline = time.monotonic()+12
+    while not (work/'stop-ready').exists():
+        assert process.poll() is None and time.monotonic() < deadline, 'discovery did not start'
+        time.sleep(.05)
+    os.write(master, b'\n')
+    output, errors = process.communicate(timeout=12)
+    assert process.returncode == 0 and '\tstop.example\n' in output, (output, errors)
+    print('PASS interactive Enter stops expanding discovery and preserves candidates for verification', flush=True)
+finally:
+    os.close(master)
+    if process.poll() is None:
+        process.kill()
+        process.wait()
 
 # Both external timeout and the Bash fallback must terminate TERM-resistant commands.
 for backend in ('native', 'missing', 'unsupported'):

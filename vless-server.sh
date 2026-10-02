@@ -36,7 +36,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.7.10 [服务端]
+#  多协议代理一键部署脚本 v3.7.11 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 默认处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.10"
+readonly VERSION="3.7.11"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -7775,11 +7775,234 @@ _reality_run_timeout() (
     return "$rc"
 )
 
+_reality_tls_group_flag() {
+    local help flag
+    command -v openssl >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 || {
+        _err "Reality 检测需要 openssl 和 curl" >&2; return 2;
+    }
+    help=$(LC_ALL=C openssl s_client -help 2>&1 || true)
+    for flag in -tls1_3 -alpn -verify_hostname -verify_return_error -showcerts -noservername; do
+        if ! grep -q -- "$flag" <<< "$help"; then
+            _err "当前 OpenSSL 不支持完整 Reality 检测 ($flag)" >&2
+            return 2
+        fi
+    done
+    if grep -q -- '-groups' <<< "$help"; then
+        echo -groups
+    elif grep -q -- '-curves' <<< "$help"; then
+        echo -curves
+    else
+        _err "当前 OpenSSL 无法检测 X25519" >&2
+        return 2
+    fi
+}
+
+_reality_valid_hostname() {
+    (( ${#1} <= 253 )) && [[ "$1" != *'*'* && ! "$1" =~ ^[0-9.]+$ &&
+        "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]
+}
+
+# 只允许公网单播 IPv4；不把私网、共享地址或保留地址作为扫描起点。
+_reality_public_ipv4_valid() {
+    _is_valid_ipv4_literal "$1" || return 1
+    local a b c d
+    IFS=. read -r a b c d <<< "$1"
+    a=$((10#$a)) b=$((10#$b)) c=$((10#$c)) d=$((10#$d))
+    [[ "$1" == "$a.$b.$c.$d" ]] || return 1
+    (( a != 0 && a != 10 && a != 127 && a < 224 &&
+        !(a == 100 && b >= 64 && b <= 127) &&
+        !(a == 169 && b == 254) && !(a == 172 && b >= 16 && b <= 31) &&
+        !(a == 192 && (b == 168 || (b == 0 && (c == 0 || c == 2)) || (b == 88 && c == 99))) &&
+        !(a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100))) &&
+        !(a == 203 && b == 0 && c == 113) ))
+}
+
+_reality_public_ipv4() {
+    local endpoint ip
+    # 不复用可能来自代理环境的缓存；只有主动自动发现才发起请求。
+    for endpoint in https://ip.sb https://ifconfig.me; do
+        ip=$(_reality_run_timeout 5 curl -q -4 --noproxy '*' --proto '=https' -fsS \
+            --connect-timeout 3 --max-time 5 "$endpoint" 2>/dev/null) || continue
+        ip=$(printf '%s' "$ip" | tr -d '[:space:]')
+        _reality_public_ipv4_valid "$ip" || continue
+        printf '%s\n' "$ip"
+        return 0
+    done
+    _warn "无法识别公网 IPv4（纯 IPv6 不扩展扫描），可选择手动检测域名" >&2
+    return 1
+}
+
+# 按 RealiTLScanner 单 IP 模式的顺序向两侧扩展，不限制在 /24 或 /16。
+# 每批只生成少量地址；跳过自身及非公网地址，IPv4 数值边界不回绕。
+_reality_neighbor_ips() {
+    local seed="$1" count="${2:-8}" start="${3:-1}" a b c d center index number ip
+    _reality_public_ipv4_valid "$seed" || return 1
+    [[ "$count" =~ ^[1-9][0-9]{0,3}$ && "$start" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+    (( count <= 4096 && start <= 8589934590 )) || return 1
+    IFS=. read -r a b c d <<< "$seed"
+    center=$(((a << 24) | (b << 16) | (c << 8) | d))
+    for ((index=start; index<start+count; index++)); do
+        if (( index % 2 )); then number=$((center - (index + 1) / 2)); else number=$((center + index / 2)); fi
+        (( number >= 0 && number <= 4294967295 )) || continue
+        printf -v ip '%d.%d.%d.%d' "$(((number >> 24) & 255))" "$(((number >> 16) & 255))" "$(((number >> 8) & 255))" "$((number & 255))"
+        _reality_public_ipv4_valid "$ip" || continue
+        printf '%s\n' "$ip"
+    done
+    return 0
+}
+
+# 未带 SNI 的握手只发现证书 SAN 候选，不代表证书可信或目标合格。
+# 此阶段不下载工具/数据库，不跟随 HTTP 跳转，不枚举通配符域名。
+_reality_scan_ip() (
+    local ip="$1" port="${2:-443}" group="$3" work host
+    _is_valid_ipv4_literal "$ip" && [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || return 1
+    [[ "$group" == -groups || "$group" == -curves ]] || return 1
+    work=$(mktemp -d) || return 1
+    trap 'rm -rf -- "$work"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # 发现阶段允许未受信任的默认站点证书；后续必须严格验证才可选中。
+    _reality_run_timeout 3 env LC_ALL=C openssl s_client -connect "$ip:$port" \
+        -noservername -tls1_3 -alpn h2 "$group" X25519 -showcerts \
+        </dev/null >"$work/tls" 2>/dev/null || return 1
+    grep -qE '^[[:space:]]*ALPN protocol: h2[[:space:]]*$' "$work/tls" || return 1
+    awk '/-----BEGIN CERTIFICATE-----/ {on=1} on {print} /-----END CERTIFICATE-----/ {exit}' \
+        "$work/tls" >"$work/leaf"
+    _reality_run_timeout 2 env LC_ALL=C openssl x509 -in "$work/leaf" -noout -text \
+        >"$work/cert" 2>/dev/null || return 1
+    while IFS= read -r host; do
+        host="${host,,}"
+        _reality_valid_hostname "$host" || continue
+        printf '%s\t%s\n' "$ip" "$host"
+    done < <(awk '/X509v3 Subject Alternative Name:/ {getline; gsub(/,/, "\n"); print}' "$work/cert" |
+        sed -n 's/^[[:space:]]*DNS:\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 8)
+)
+
+_reality_discover_candidates() (
+    local seed="$1" port="${2:-443}" budget="${3:-600}" group work ip pid index=1 scanned=0 deadline last_progress
+    local slot rc stop_fd="" ended=false last_ip="$1"
+    local -a pids=()
+    _reality_public_ipv4_valid "$seed" && [[ "$budget" =~ ^[1-9][0-9]{0,2}$ ]] && (( budget <= 600 )) || return 1
+    group=$(_reality_tls_group_flag) || return 2
+    work=$(mktemp -d) || return 1
+    # 每个 worker 有独立超时，中断时先回收再清理。
+    trap 'for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done; rm -rf -- "$work"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [[ -t 0 ]]; then
+        exec {stop_fd}<&0
+        _info "发现阶段可按回车提前结束，使用已发现候选继续复核" >&2
+    fi
+    deadline=$((SECONDS + budget)) last_progress=$SECONDS
+    : >"$work/candidates"
+    while (( SECONDS < deadline && index <= 8589934590 )); do
+        if [[ -n "$stop_fd" ]] && read -r -t .05 -u "$stop_fd"; then ended=true; break; fi
+        rc=0
+        _reality_neighbor_ips "$seed" 8 "$index" >"$work/ips" || rc=$?
+        (( rc == 0 )) || break
+        index=$((index + 8))
+        slot=0
+        while IFS= read -r ip; do
+            (( SECONDS < deadline )) || break
+            last_ip="$ip"
+            _reality_scan_ip "$ip" "$port" "$group" >"$work/$slot" 2>/dev/null &
+            pids+=("$!")
+            slot=$((slot + 1)) scanned=$((scanned + 1))
+        done <"$work/ips"
+        for pid in "${pids[@]}"; do wait "$pid" || true; done
+        pids=()
+        # 文件名只复用本批 0..7，候选日志有界，避免十分钟快速扫描产生海量空文件。
+        for ((slot=0; slot<8; slot++)); do
+            [[ ! -f "$work/$slot" ]] || { cat "$work/$slot" >>"$work/candidates"; rm -f -- "$work/$slot"; }
+        done
+        awk 'NF==2 && !seen[$0]++ && n++<5000 {print}' "$work/candidates" >"$work/next"
+        mv "$work/next" "$work/candidates"
+        if (( SECONDS - last_progress >= 10 )); then
+            _info "已扫描 $scanned 个 IP，最近探测 $last_ip；剩余 $((deadline - SECONDS > 0 ? deadline - SECONDS : 0)) 秒；候选 $(wc -l <"$work/candidates") 个 IP/域名组合" >&2
+            last_progress=$SECONDS
+        fi
+    done
+    if [[ "$ended" == true ]]; then _info "已结束发现，开始复核已有候选" >&2; else _info "发现阶段结束，开始复核已有候选" >&2; fi
+    cat "$work/candidates"
+)
+
+_reality_verify_discovered() (
+    local candidates="$1" budget="${2:-180}" deadline host allowed_ips result measured_host ms extra
+    local remaining seconds rc pid index=0 best="" best_ms=0 cap_error=false work
+    local -a pids=() hosts=()
+    [[ "$budget" =~ ^[1-9][0-9]{0,2}$ ]] && (( budget <= 180 )) || return 1
+    work=$(mktemp -d) || return 1
+    trap 'for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done; rm -rf -- "$work"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # 按首次发现顺序合并同域 IP；最多 5000 条记录，域名不重复复核。
+    awk -F '\t' 'NF==2 {
+        if (!seen[$2]++) order[++n]=$2
+        if (!pair[$2 SUBSEP $1]++) ips[$2]=ips[$2] (ips[$2]!="" ? "," : "") $1
+    } END {for(i=1;i<=n;i++) print order[i] "\t" ips[order[i]]}' <<< "$candidates" >"$work/targets"
+    deadline=$((SECONDS + budget))
+    while IFS=$'\t' read -r host allowed_ips; do
+        _reality_valid_hostname "$host" || continue
+        remaining=$((deadline - SECONDS))
+        # HTTPS + 三次 TLS：每次为 timeout fallback 预留两秒清理时间。
+        (( remaining >= 12 )) || break
+        seconds=$(((remaining - 8) / 4))
+        (( seconds <= 5 )) || seconds=5
+        _info "复核候选 $((index + 1)): $host" >&2
+        hosts+=("$host")
+        (probe_reality_target "$host" 443 "$seconds" 3 "$allowed_ips" >"$work/$index" || {
+            rc=$?; rm -f -- "$work/$index"; exit "$rc";
+        }) &
+        pids+=("$!")
+        index=$((index + 1))
+        if (( ${#pids[@]} == 8 )); then
+            for pid in "${pids[@]}"; do rc=0; wait "$pid" || rc=$?; (( rc != 2 )) || cap_error=true; done
+            pids=()
+            [[ "$cap_error" == false ]] || return 1
+        fi
+    done <"$work/targets"
+    for pid in "${pids[@]}"; do rc=0; wait "$pid" || rc=$?; (( rc != 2 )) || cap_error=true; done
+    pids=()
+    [[ "$cap_error" == false ]] || return 1
+    for ((index=0; index<${#hosts[@]}; index++)); do
+        [[ -s "$work/$index" ]] || continue
+        read -r measured_host ms extra <"$work/$index" || continue
+        [[ "$measured_host" == "${hosts[$index]}" && "$ms" =~ ^[0-9]+$ && -z "$extra" ]] || continue
+        _ok "$measured_host: DNS / 证书 / TLS 通过，中位握手 ${ms}ms" >&2
+        if [[ -z "$best" ]] || (( ms < best_ms )); then best="$measured_host" best_ms="$ms"; fi
+    done
+    [[ -n "$best" ]] || { _warn "未找到通过严格复核的目标，返回 SNI 菜单" >&2; return 1; }
+    _ok "推荐 SNI: $best（中位握手 ${best_ms}ms）" >&2
+    printf '%s\n' "$best"
+)
+
+select_reality_sni() {
+    local choice seed candidates
+    echo "  1) 自动发现 VPS 邻近 IP 的 SNI（默认）" >&2
+    echo "  2) 检测自有候选域名" >&2
+    read -r -p "  检测方式 [1-2，默认 1]: " choice || return 1
+    case "${choice:-1}" in
+        1)
+            seed=$(_reality_public_ipv4) || return 1
+            _info "公网 IPv4: $seed；由此向两侧逐步扩展，不限制 /24 或 /16（排除自身和非公网地址）" >&2
+            _info "自动发现 10 分钟、严格复核最多 3 分钟；每阶段最多 8 路并发，另有少量任务回收时间" >&2
+            _info "IP 数值相邻不保证地理邻近；按本 VPS 的实际握手耗时推荐" >&2
+            candidates=$(_reality_discover_candidates "$seed") || return 1
+            _reality_verify_discovered "$candidates"
+            ;;
+        2) select_reality_sni_candidates "$1" ;;
+        *) _warn "无效检测方式，返回 SNI 菜单" >&2; return 1 ;;
+    esac
+}
+
 # 成功时 stdout 仅输出“域名<TAB>握手耗时中位数(ms)”。
 # 1=目标未通过；2=参数/本机检测能力不足。证书有效期由 TLS 校验，不能按整数天判断。
 probe_reality_target() (
     local host="${1:-}" port="${2:-443}" seconds="${3:-5}" samples="${4:-3}"
-    local help work ip address status location authority output start finish i rc
+    local work ip address status location authority output start finish i rc
+    local expected_ip="${5:-}" allowed_ip
+    local -a expected_addresses=()
+    local -a family_args=()
     local -a group_args timings=()
     host="${host,,}"
     if (( ${#host} > 253 )) || [[ "$host" != *.* || "$host" =~ ^[0-9.]+$ ]] ||
@@ -7793,20 +8016,15 @@ probe_reality_target() (
         _err "Reality 检测需要 openssl 和 curl" >&2
         return 2
     fi
-    help=$(LC_ALL=C openssl s_client -help 2>&1 || true)
-    for output in -tls1_3 -alpn -verify_hostname -verify_return_error; do
-        if ! grep -q -- "$output" <<< "$help"; then
-            _err "当前 OpenSSL 不支持完整 Reality 检测 ($output)" >&2
-            return 2
-        fi
-    done
-    if grep -q -- '-groups' <<< "$help"; then
-        group_args=(-groups X25519)
-    elif grep -q -- '-curves' <<< "$help"; then
-        group_args=(-curves X25519)
-    else
-        _err "当前 OpenSSL 无法检测 X25519" >&2
-        return 2
+    output=$(_reality_tls_group_flag) || return 2
+    group_args=("$output" X25519)
+    if [[ -n "$expected_ip" ]]; then
+        read -r -a expected_addresses <<< "${expected_ip//,/ }"
+        (( ${#expected_addresses[@]} > 0 && ${#expected_addresses[@]} <= 5000 )) || return 2
+        for allowed_ip in "${expected_addresses[@]}"; do
+            _is_valid_ipv4_literal "$allowed_ip" || return 2
+        done
+        family_args=(-4)
     fi
     work=$(mktemp -d) || return 2
     trap 'rm -rf -- "$work"' EXIT
@@ -7815,7 +8033,7 @@ probe_reality_target() (
 
     # HTTPS 校验不能受代理环境或 curlrc 影响；不跟随跳转。
     # 记录本次实际连接 IP，后续握手固定此地址，避免不同 DNS 后端混淆结果。
-    if ! output=$(_reality_run_timeout "$seconds" env LC_ALL=C curl -q --noproxy '*' --proto '=https' -sS \
+    if ! output=$(_reality_run_timeout "$seconds" env LC_ALL=C curl -q --noproxy '*' --proto '=https' -sS "${family_args[@]}" \
         --connect-timeout "$seconds" --max-time "$seconds" --http1.1 \
         -D "$work/headers" -o /dev/null -w '%{http_code} %{remote_ip}' \
         "https://${host}:${port}/" 2>"$work/curl-error"); then
@@ -7825,6 +8043,10 @@ probe_reality_target() (
     read -r status ip <<< "$output"
     if [[ ! "$status" =~ ^[2-5][0-9]{2}$ || ! "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
         _warn "$host: 未获得完整 HTTPS 检测结果" >&2
+        return 1
+    fi
+    if [[ -n "$expected_ip" && " ${expected_addresses[*]} " != *" $ip "* ]]; then
+        _warn "$host: DNS 实际连接 IP 与发现 IP 不一致，已跳过" >&2
         return 1
     fi
     if [[ "$status" == 3?? ]]; then
@@ -7866,7 +8088,7 @@ probe_reality_target() (
     printf '%s\t%s\n' "$host" "$output"
 )
 
-select_reality_sni() {
+select_reality_sni_candidates() {
     local preferred="$1" input host result measured_host ms best="" best_ms=0 rc idx i
     local -a candidates=() checked=()
     echo "  输入候选域名（空格或逗号分隔，最多 5 个；回车检测 5 个内置候选）:" >&2
@@ -9113,7 +9335,7 @@ ask_sni_config() {
     if [[ -n "$cert_domain" ]]; then
         echo -e "  ${G}1${NC}) 使用随机SNI (${G}$random_sni${NC}) - 推荐" >&2
         echo -e "  ${G}2${NC}) 自定义SNI" >&2
-        [[ "$sni_mode" != reality ]] || echo -e "  ${G}3${NC}) 检测并优选SNI" >&2
+        [[ "$sni_mode" != reality ]] || echo -e "  ${G}3${NC}) 自动发现 / 检测并优选SNI" >&2
         echo "" >&2
         
         local sni_choice=""
@@ -9143,7 +9365,7 @@ ask_sni_config() {
         # 没有证书域名时（如Reality协议），提供随机SNI和自定义选项
         echo -e "  ${G}1${NC}) 使用随机SNI (${G}$default_sni${NC}) - 推荐" >&2
         echo -e "  ${G}2${NC}) 自定义SNI" >&2
-        [[ "$sni_mode" != reality ]] || echo -e "  ${G}3${NC}) 检测并优选SNI" >&2
+        [[ "$sni_mode" != reality ]] || echo -e "  ${G}3${NC}) 自动发现 / 检测并优选SNI" >&2
         echo "" >&2
         
         local sni_choice=""

@@ -55,24 +55,24 @@ unset -f openssl
 rm "$CFG/certs/server.crt"
 echo 'PASS legacy/default/custom/real-certificate selections do not probe'
 
-result=$(ask_sni_config default.example '' reality <<< $'3\nslow.example,fast.example bad.example FAST.EXAMPLE malformed.example')
+result=$(ask_sni_config default.example '' reality <<< $'3\n2\nslow.example,fast.example bad.example FAST.EXAMPLE malformed.example')
 [[ "$result" == fast.example ]]
 [[ "$(cat "$fixture/probes")" == $'slow.example\nfast.example\nbad.example\nmalformed.example' ]]
 echo 'PASS measured selection filters failures and malformed results, deduplicates, and ranks'
 
 : > "$fixture/probes"
-result=$(ask_sni_config default.example '' reality <<< $'3\nbad.example\n2\nmanual.example')
+result=$(ask_sni_config default.example '' reality <<< $'3\n2\nbad.example\n2\nmanual.example')
 [[ "$result" == manual.example && "$(cat "$fixture/probes")" == bad.example ]]
 result=$(ask_sni_config default.example '' <<< $'3\n1' 2>"$fixture/menu")
 [[ "$result" == default.example ]]
 ! grep -q '检测并优选' "$fixture/menu"
-if ask_sni_config default.example '' reality <<< $'3\nbad.example' >"$fixture/output" 2>/dev/null; then
+if ask_sni_config default.example '' reality <<< $'3\n2\nbad.example' >"$fixture/output" 2>/dev/null; then
     echo 'Unexpected success on exhausted input' >&2
     exit 1
 fi
 [[ ! -s "$fixture/output" ]]
 : > "$fixture/probes"
-expect_failure select_reality_sni default.example <<< 'a.example b.example c.example d.example e.example f.example'
+expect_failure select_reality_sni_candidates default.example <<< 'a.example b.example c.example d.example e.example f.example'
 [[ ! -s "$fixture/probes" ]]
 echo 'PASS failed/oversized scans do not choose a target; other protocols do not offer scanning'
 

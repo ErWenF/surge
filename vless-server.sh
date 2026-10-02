@@ -36,7 +36,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.7.9 [服务端]
+#  多协议代理一键部署脚本 v3.7.10 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 默认处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.9"
+readonly VERSION="3.7.10"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -7733,6 +7733,188 @@ gen_sni() {
     echo "${COMMON_SNI_LIST[$((idx % ${#COMMON_SNI_LIST[@]}))]}"
 }
 
+# 仅供主动选择 Reality 检测时使用；不依赖 GNU date 或发行版名称。
+_reality_now_ms() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        local stamp="$EPOCHREALTIME"
+        local seconds="${stamp%.*}" fraction="${stamp#*.}"
+        printf '%s\n' "$((10#$seconds * 1000 + 10#${fraction:0:3}))"
+    else
+        printf '%s\n' "$((SECONDS * 1000))"
+    fi
+}
+
+_reality_run_timeout() (
+    local seconds="$1"
+    shift
+    # BusyBox 和 coreutils 的能力可能不同，实际试运行参数。
+    if command -v timeout >/dev/null 2>&1 && command timeout -k 1 1 true >/dev/null 2>&1; then
+        exec timeout -k 1 "$seconds" "$@"
+    fi
+
+    # 无可用 timeout 时，限制实际子进程；TERM 无效后使用 KILL。
+    local child="" deadline=$((SECONDS + seconds + 1)) rc=0
+    trap '[[ -z "$child" ]] || { kill -TERM "$child" 2>/dev/null; kill -KILL "$child" 2>/dev/null; wait "$child" 2>/dev/null; }' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    "$@" <&0 &
+    child=$!
+    while kill -0 "$child" 2>/dev/null; do
+        if (( SECONDS >= deadline )); then
+            kill -TERM "$child" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$child" 2>/dev/null || true
+            wait "$child" 2>/dev/null || true
+            child=""
+            return 124
+        fi
+        sleep 0.1
+    done
+    wait "$child" || rc=$?
+    child=""
+    return "$rc"
+)
+
+# 成功时 stdout 仅输出“域名<TAB>握手耗时中位数(ms)”。
+# 1=目标未通过；2=参数/本机检测能力不足。证书有效期由 TLS 校验，不能按整数天判断。
+probe_reality_target() (
+    local host="${1:-}" port="${2:-443}" seconds="${3:-5}" samples="${4:-3}"
+    local help work ip address status location authority output start finish i rc
+    local -a group_args timings=()
+    host="${host,,}"
+    if (( ${#host} > 253 )) || [[ "$host" != *.* || "$host" =~ ^[0-9.]+$ ]] ||
+        [[ ! "$host" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]] ||
+        [[ ! "$port" =~ ^[1-9][0-9]{0,4}$ || ! "$seconds" =~ ^([1-9]|1[0-5])$ || ! "$samples" =~ ^[1-3]$ ]] ||
+        (( port > 65535 )); then
+        _err "Reality 检测参数无效: $host" >&2
+        return 2
+    fi
+    if ! command -v openssl >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+        _err "Reality 检测需要 openssl 和 curl" >&2
+        return 2
+    fi
+    help=$(LC_ALL=C openssl s_client -help 2>&1 || true)
+    for output in -tls1_3 -alpn -verify_hostname -verify_return_error; do
+        if ! grep -q -- "$output" <<< "$help"; then
+            _err "当前 OpenSSL 不支持完整 Reality 检测 ($output)" >&2
+            return 2
+        fi
+    done
+    if grep -q -- '-groups' <<< "$help"; then
+        group_args=(-groups X25519)
+    elif grep -q -- '-curves' <<< "$help"; then
+        group_args=(-curves X25519)
+    else
+        _err "当前 OpenSSL 无法检测 X25519" >&2
+        return 2
+    fi
+    work=$(mktemp -d) || return 2
+    trap 'rm -rf -- "$work"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    # HTTPS 校验不能受代理环境或 curlrc 影响；不跟随跳转。
+    # 记录本次实际连接 IP，后续握手固定此地址，避免不同 DNS 后端混淆结果。
+    if ! output=$(_reality_run_timeout "$seconds" env LC_ALL=C curl -q --noproxy '*' --proto '=https' -sS \
+        --connect-timeout "$seconds" --max-time "$seconds" --http1.1 \
+        -D "$work/headers" -o /dev/null -w '%{http_code} %{remote_ip}' \
+        "https://${host}:${port}/" 2>"$work/curl-error"); then
+        _warn "$host: HTTPS 连接/证书校验失败或超时" >&2
+        return 1
+    fi
+    read -r status ip <<< "$output"
+    if [[ ! "$status" =~ ^[2-5][0-9]{2}$ || ! "$ip" =~ ^[0-9a-fA-F:.]+$ ]]; then
+        _warn "$host: 未获得完整 HTTPS 检测结果" >&2
+        return 1
+    fi
+    if [[ "$status" == 3?? ]]; then
+        location=$(awk 'tolower($1)=="location:" {sub(/^[^:]*:[ \t]*/, ""); sub(/\r$/, ""); value=$0} END {print value}' "$work/headers")
+        location="${location,,}"
+        case "$location" in
+            https://*) authority="${location#https://}" ;;
+            //*) authority="${location#//}" ;;
+            http://*|*[a-z]:*) _warn "$host: 跳转到其他协议，未通过检测" >&2; return 1 ;;
+            "") _warn "$host: 重定向缺少目标地址" >&2; return 1 ;;
+            *) authority="$host:$port" ;;
+        esac
+        authority="${authority%%[/?#]*}"
+        if [[ "$authority" != "$host:$port" && ( "$authority" != "$host" || "$port" != 443 ) ]]; then
+            _warn "$host: 跳转到其他域名或端口，未通过检测" >&2
+            return 1
+        fi
+    fi
+    address="$ip:$port"
+    [[ "$ip" != *:* ]] || address="[$ip]:$port"
+    for ((i=0; i<samples; i++)); do
+        start=$(_reality_now_ms)
+        rc=0
+        _reality_run_timeout "$seconds" env LC_ALL=C openssl s_client \
+            -connect "$address" -servername "$host" -tls1_3 -alpn h2 \
+            "${group_args[@]}" -verify_hostname "$host" -verify_return_error \
+            </dev/null >"$work/tls" 2>&1 || rc=$?
+        finish=$(_reality_now_ms)
+        if (( rc != 0 )) || ! grep -qE '^[[:space:]]*ALPN protocol: h2[[:space:]]*$' "$work/tls" ||
+            ! grep -qE 'Verify return code: 0 \(ok\)|Verification: OK' "$work/tls"; then
+            _warn "$host: TLS1.3 / h2 / X25519 / 证书校验失败或超时" >&2
+            return 1
+        fi
+        (( finish > start )) || finish=$((start + 1))
+        timings+=("$((finish - start))")
+    done
+    output=$(printf '%s\n' "${timings[@]}" | sort -n | awk '{v[NR]=$1} END {if (NR%2) print v[(NR+1)/2]; else print int((v[NR/2]+v[NR/2+1])/2)}')
+    [[ "$output" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\t%s\n' "$host" "$output"
+)
+
+select_reality_sni() {
+    local preferred="$1" input host result measured_host ms best="" best_ms=0 rc idx i
+    local -a candidates=() checked=()
+    echo "  输入候选域名（空格或逗号分隔，最多 5 个；回车检测 5 个内置候选）:" >&2
+    read -r -p "  候选: " input || return 1
+    if [[ -n "$input" ]]; then
+        read -r -a candidates <<< "${input//,/ }"
+        if (( ${#candidates[@]} > 5 )); then
+            _warn "一次最多检测 5 个域名，请重新选择" >&2
+            return 1
+        fi
+    else
+        candidates=("$preferred")
+        idx=$((RANDOM % ${#COMMON_SNI_LIST[@]}))
+        for ((i=0; i<${#COMMON_SNI_LIST[@]} && ${#candidates[@]}<5; i++)); do
+            host="${COMMON_SNI_LIST[$(((idx + i) % ${#COMMON_SNI_LIST[@]}))]}"
+            [[ "$host" == "$preferred" ]] || candidates+=("$host")
+        done
+    fi
+    [[ -n "${EPOCHREALTIME:-}" ]] || _warn "当前计时精度为秒，仅供粗略排序" >&2
+    for host in "${candidates[@]}"; do
+        host="${host,,}"
+        [[ " ${checked[*]} " != *" $host "* ]] || continue
+        checked+=("$host")
+        _info "检测 Reality 目标: $host（每次最多 5 秒，3 次握手）" >&2
+        rc=0
+        result=$(probe_reality_target "$host") || rc=$?
+        if (( rc != 0 )); then
+            (( rc != 2 )) || return 1
+            continue
+        fi
+        read -r measured_host ms <<< "$result"
+        if [[ "$measured_host" != "$host" || ! "$ms" =~ ^[0-9]+$ ]]; then
+            _warn "$host: 检测结果不完整，已跳过" >&2
+            continue
+        fi
+        _ok "$host: TLS1.3 / h2 / X25519 / 证书通过，中位握手 ${ms}ms" >&2
+        if [[ -z "$best" ]] || (( ms < best_ms )); then
+            best="$host" best_ms="$ms"
+        fi
+    done
+    if [[ -z "$best" ]]; then
+        _warn "没有通过检测的候选，返回 SNI 选择" >&2
+        return 1
+    fi
+    _ok "选择 SNI: $best（中位握手 ${best_ms}ms）" >&2
+    printf '%s\n' "$best"
+}
+
 gen_xhttp_path() {
     # 生成随机XHTTP路径，避免与Web服务器默认路由冲突
     local path="/$(head -c 32 /dev/urandom 2>/dev/null | base64 | tr -d '/+=' | head -c 8)"
@@ -8892,6 +9074,8 @@ setup_cert_and_nginx() {
 ask_sni_config() {
     local default_sni="${1:-$(gen_sni)}"
     local cert_domain="${2:-}"
+    local sni_mode="${3:-}" sni_range="1-2" detected_sni=""
+    [[ "$sni_mode" != reality ]] || sni_range="1-3"
     
     # 如果 Reality 协议已在 setup_cert_and_nginx 中确定使用真实域名，直接返回
     if [[ -n "$REALITY_SNI_CONFIRMED" ]]; then
@@ -8929,11 +9113,12 @@ ask_sni_config() {
     if [[ -n "$cert_domain" ]]; then
         echo -e "  ${G}1${NC}) 使用随机SNI (${G}$random_sni${NC}) - 推荐" >&2
         echo -e "  ${G}2${NC}) 自定义SNI" >&2
+        [[ "$sni_mode" != reality ]] || echo -e "  ${G}3${NC}) 检测并优选SNI" >&2
         echo "" >&2
         
         local sni_choice=""
         while true; do
-            read -rp "  请选择 [1-2，默认 1]: " sni_choice
+            read -rp "  请选择 [$sni_range，默认 1]: " sni_choice || return 1
             
             if [[ -z "$sni_choice" ]]; then
                 sni_choice="1"
@@ -8944,20 +9129,26 @@ ask_sni_config() {
                 return 0
             elif [[ "$sni_choice" == "2" ]]; then
                 break
+            elif [[ "$sni_choice" == "3" && "$sni_mode" == reality ]]; then
+                if detected_sni=$(select_reality_sni "$random_sni"); then
+                    printf '%s\n' "$detected_sni"
+                    return 0
+                fi
             else
                 _err "无效选择: $sni_choice" >&2
-                _warn "请输入 1 或 2" >&2
+                _warn "请输入 $sni_range 中的选项" >&2
             fi
         done
     else
         # 没有证书域名时（如Reality协议），提供随机SNI和自定义选项
         echo -e "  ${G}1${NC}) 使用随机SNI (${G}$default_sni${NC}) - 推荐" >&2
         echo -e "  ${G}2${NC}) 自定义SNI" >&2
+        [[ "$sni_mode" != reality ]] || echo -e "  ${G}3${NC}) 检测并优选SNI" >&2
         echo "" >&2
         
         local sni_choice=""
         while true; do
-            read -rp "  请选择 [1-2，默认 1]: " sni_choice
+            read -rp "  请选择 [$sni_range，默认 1]: " sni_choice || return 1
             
             if [[ -z "$sni_choice" ]]; then
                 sni_choice="1"
@@ -8968,9 +9159,14 @@ ask_sni_config() {
                 return 0
             elif [[ "$sni_choice" == "2" ]]; then
                 break
+            elif [[ "$sni_choice" == "3" && "$sni_mode" == reality ]]; then
+                if detected_sni=$(select_reality_sni "$default_sni"); then
+                    printf '%s\n' "$detected_sni"
+                    return 0
+                fi
             else
                 _err "无效选择: $sni_choice" >&2
-                _warn "请输入 1 或 2" >&2
+                _warn "请输入 $sni_range 中的选项" >&2
             fi
         done
     fi
@@ -8979,7 +9175,7 @@ ask_sni_config() {
     while true; do
         echo "" >&2
         echo -e "  ${C}请输入自定义SNI域名 (回车使用随机SNI):${NC}" >&2
-        read -rp "  SNI: " custom_sni
+        read -rp "  SNI: " custom_sni || return 1
         
         if [[ -z "$custom_sni" ]]; then
             # 重新生成一个随机SNI
@@ -22606,7 +22802,8 @@ do_install_server() {
                 local cert_domain="$CERT_DOMAIN"
                 
                 # 询问SNI配置
-                local final_sni=$(ask_sni_config "$(gen_sni)" "$cert_domain")
+                local final_sni
+                final_sni=$(ask_sni_config "$(gen_sni)" "$cert_domain" reality) || return 1
                 
                 # 如果没有真实域名，用选择的 SNI 重新生成自签证书
                 if [[ -z "$cert_domain" ]]; then
@@ -22669,7 +22866,8 @@ do_install_server() {
                 local cert_domain="$CERT_DOMAIN"
                 
                 # 询问SNI配置
-                local final_sni=$(ask_sni_config "$(gen_sni)" "$cert_domain")
+                local final_sni
+                final_sni=$(ask_sni_config "$(gen_sni)" "$cert_domain" reality) || return 1
                 
                 echo ""
                 _line

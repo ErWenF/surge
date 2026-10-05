@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.12"
+readonly VERSION="3.7.13"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -10715,21 +10715,65 @@ _pinned_github_asset_sha256() {
     esac
 }
 
-# 使用 GitHub Release API 提供的 digest；旧发布缺少 digest 时尝试其 checksum 资产。
+# API 限流且没有缓存时，通过官方 latest 页面重定向获取 Xray 稳定版。
+_get_xray_latest_version_from_web() {
+    local release_url
+    release_url=$(curl -fsSLI --connect-timeout 10 --max-time 30 -o /dev/null \
+        -w '%{url_effective}' 'https://github.com/XTLS/Xray-core/releases/latest' 2>/dev/null) || return 1
+    [[ "$release_url" =~ ^https://github\.com/XTLS/Xray-core/releases/tag/v([0-9][0-9A-Za-z._-]*)$ ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# Xray 官方与 ZIP 同时发布 .dgst；直接获取它，避免校验依赖 GitHub API 配额。
+_xray_release_asset_sha256() {
+    local version="${1#v}" asset_name="$2" checksum_file expected
+    [[ "$version" =~ ^[0-9][0-9A-Za-z._-]*$ && "$asset_name" =~ ^Xray-linux-[A-Za-z0-9_-]+\.zip$ ]] || return 1
+    checksum_file=$(mktemp "${TMPDIR:-/tmp}/vless-xray-checksum.XXXXXX") || return 1
+    if ! curl -fsSL --connect-timeout 10 --max-time 30 --max-filesize 65536 \
+        -o "$checksum_file" "https://github.com/XTLS/Xray-core/releases/download/v${version}/${asset_name}.dgst" 2>/dev/null; then
+        rm -f "$checksum_file"
+        return 1
+    fi
+    # OpenSSL 版本不同会输出 SHA256 或 SHA2-256；仅接受唯一、完整的 SHA-256。
+    # 不用 awk 的区间正则，兼容 BusyBox awk；拒绝 MD5、SHA1、SHA512 和重复行。
+    expected=$(awk -F= '
+        $1 ~ /^[[:space:]]*SHA(2-)?256[[:space:]]*$/ {
+            count++
+            value=$2
+            gsub(/[[:space:]]/, "", value)
+            if (NF != 2 || length(value) != 64 || value ~ /[^0-9a-fA-F]/) bad=1
+            hash=tolower(value)
+        }
+        END { if (count != 1 || bad) exit 1; print hash }
+    ' "$checksum_file") || expected=""
+    rm -f "$checksum_file"
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s\n' "$expected"
+}
+
+# Xray 优先使用官方 .dgst；其他资产沿用 GitHub digest/checksum 校验。
 _verify_github_release_asset() {
     local repo="$1" version="$2" asset_url="$3" file="$4"
     local asset_name="${asset_url%%\?*}"
     asset_name="${asset_name##*/}"
     local release_json digest expected actual checksum_url checksum_file
+    _GITHUB_ASSET_VERIFY_ERROR="无法取得官方 SHA-256 校验值"
 
     # 固定资产不依赖 GitHub API 是否返回 digest，也避免 API 限流导致误报。
     expected=$(_pinned_github_asset_sha256 "$repo" "$version" "$asset_name" 2>/dev/null || true)
+
+    if [[ -z "$expected" && "$repo" == "XTLS/Xray-core" ]]; then
+        expected=$(_xray_release_asset_sha256 "$version" "$asset_name" 2>/dev/null || true)
+    fi
 
     if [[ -z "$expected" ]]; then
         release_json=$(curl -fsSL --connect-timeout 10 --max-time 30 \
             "https://api.github.com/repos/${repo}/releases/tags/v${version}" 2>/dev/null) ||
         release_json=$(curl -fsSL --connect-timeout 10 --max-time 30 \
-            "https://api.github.com/repos/${repo}/releases/tags/${version}" 2>/dev/null) || return 1
+            "https://api.github.com/repos/${repo}/releases/tags/${version}" 2>/dev/null) || {
+            _GITHUB_ASSET_VERIFY_ERROR="无法取得官方校验值：GitHub API 请求失败（可能限流或网络异常）"
+            return 1
+        }
 
         digest=$(printf '%s' "$release_json" | jq -r --arg n "$asset_name" \
             '[.assets[]? | select(.name == $n) | .digest // empty][0] // empty' 2>/dev/null)
@@ -10754,10 +10798,20 @@ _verify_github_release_asset() {
         fi
     fi
 
+    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
     actual=$(_sha256_file "$file")
     actual=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
     expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
-    [[ -n "$expected" && -n "$actual" && "$actual" == "$expected" ]]
+    if [[ ! "$actual" =~ ^[0-9a-f]{64}$ ]]; then
+        _GITHUB_ASSET_VERIFY_ERROR="无法计算下载文件的 SHA-256"
+        return 1
+    fi
+    if [[ "$actual" != "$expected" ]]; then
+        _GITHUB_ASSET_VERIFY_ERROR="下载文件 SHA-256 与官方校验值不匹配"
+        return 1
+    fi
+    _GITHUB_ASSET_VERIFY_ERROR=""
+    return 0
 }
 
 _verify_direct_download() {
@@ -10914,6 +10968,11 @@ _install_binary() {
             version=$(_get_latest_version "$repo" "true")
         fi
 
+        if [[ -z "$version" && "$repo" == "XTLS/Xray-core" && "$channel" == stable ]]; then
+            version=$(_get_xray_latest_version_from_web 2>/dev/null || true)
+            [[ -z "$version" ]] || _save_version_cache "$repo" "$version" || true
+        fi
+
         # 如果获取失败（缓存过期且网络失败），尝试强制使用旧缓存
         if [[ -z "$version" ]]; then
             local cached_version=""
@@ -10962,6 +11021,7 @@ _install_binary() {
         if [[ "${ALLOW_UNVERIFIED_DOWNLOADS:-0}" != "1" ]]; then
             rm -rf "$tmp"
             _err "$name 下载包无法通过发布方 SHA-256 校验，已拒绝安装"
+            _err "版本 v$version：${_GITHUB_ASSET_VERIFY_ERROR:-未知校验错误}"
             _warn "仅在你已自行核验来源时，才可临时设置 ALLOW_UNVERIFIED_DOWNLOADS=1"
             return 1
         fi

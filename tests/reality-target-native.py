@@ -289,12 +289,17 @@ finally:
         process.wait()
 
 # Both external timeout and the Bash fallback must terminate TERM-resistant commands.
-for backend in ('native', 'missing', 'unsupported'):
+backends = ['native', 'missing', 'unsupported']
+if subprocess.run(['bash', '-c', 'command -v busybox'], capture_output=True).returncode == 0:
+    backends.append('busybox')
+for backend in backends:
     command = '''source "$1"
 if [[ "$2" == missing ]]; then
     command() { if [[ "$1" == -v && "$2" == timeout ]]; then return 1; fi; builtin command "$@"; }
 elif [[ "$2" == unsupported ]]; then
     command() { if [[ "$1" == timeout ]]; then return 64; fi; builtin command "$@"; }
+elif [[ "$2" == busybox ]]; then
+    command() { if [[ "$1" == timeout ]]; then shift; busybox timeout "$@"; else builtin command "$@"; fi; }
 fi
 _reality_run_timeout 1 bash -c 'echo "$BASHPID" > "$REALITY_TIMEOUT_PID"; trap "" TERM; while :; do :; done'
 '''

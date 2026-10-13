@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.13"
+readonly VERSION="3.7.14"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -7942,9 +7942,9 @@ _reality_now_ms() {
 _reality_run_timeout() (
     local seconds="$1"
     shift
-    # BusyBox 和 coreutils 的能力可能不同，实际试运行参数。
-    if command -v timeout >/dev/null 2>&1 && command timeout -k 1 1 true >/dev/null 2>&1; then
-        exec timeout -k 1 "$seconds" "$@"
+    # 保留 timeout 监护进程，KILL 后由它回收子进程；不支持该模式则用下方回退。
+    if command -v timeout >/dev/null 2>&1 && command timeout --foreground -k 1 1 true >/dev/null 2>&1; then
+        exec timeout --foreground -k 1 "$seconds" "$@"
     fi
 
     # 无可用 timeout 时，限制实际子进程；TERM 无效后使用 KILL。
@@ -10790,10 +10790,34 @@ _verify_github_release_asset() {
                 return 1
             fi
             expected=$(awk -v name="$asset_name" '
-                index($0, name) {
-                    for (i=1; i<=NF; i++) if ($i ~ /^[0-9a-fA-F]{64}$/) { print tolower($i); exit }
+                function record(file, value) {
+                    sub(/^\*/, "", file)
+                    sub(/^\.\//, "", file)
+                    if (file != name) return
+                    count++
+                    if (length(value) != 64 || value ~ /[^0-9a-fA-F]/) bad=1
+                    hash=tolower(value)
                 }
-            ' "$checksum_file")
+                {
+                    sub(/\r$/, "")
+                    if ($0 ~ /^SHA(2-)?256[[:space:]]+\(/) {
+                        line=$0
+                        sub(/^SHA(2-)?256[[:space:]]+\(/, "", line)
+                        if (match(line, /\)[[:space:]]*=[[:space:]]*/)) {
+                            file=substr(line, 1, RSTART-1)
+                            value=substr(line, RSTART+RLENGTH)
+                            sub(/[[:space:]]+$/, "", value)
+                            record(file, value)
+                        }
+                    } else if (NF >= 2) {
+                        file=$0
+                        sub(/^[^[:space:]]+[[:space:]]+/, "", file)
+                        sub(/[[:space:]]+$/, "", file)
+                        record(file, $1)
+                    }
+                }
+                END { if (count != 1 || bad) exit 1; print hash }
+            ' "$checksum_file") || expected=""
             rm -f "$checksum_file"
         fi
     fi

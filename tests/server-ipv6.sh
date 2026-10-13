@@ -69,6 +69,8 @@ EOF
 echo 'PASS /proc fallback rejects tentative/deprecated/DAD-failed/down addresses'
 
 # No local GUA: reject NAT64 IPv4, HTML and private data; direct IPv6 and strict HTTPS.
+# Keep the empty-interface case independent of the host's /proc fallback.
+_server_ipv6_interface_up() { return 1; }
 : > "$fixture/ip"
 curl() {
     printf '%s\n' "$*" >> "$fixture/curl-log"

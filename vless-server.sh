@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.15"
+readonly VERSION="3.7.16"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -2299,7 +2299,7 @@ _tg_config_lock_release() {
 
 # 初始化 TG 配置
 init_tg_config() {
-    local defaults='{"enabled":false,"bot_token":"","chat_id":"","notify_quota_percent":80,"notify_daily":false,"server_name":"","user_bot_enabled":false,"user_bot_token":"","user_bot_id":"","user_bot_traffic_view":"server_estimate","user_bot_update_offset":0}'
+    local defaults='{"enabled":false,"bot_token":"","chat_id":"","notify_quota_percent":80,"notify_daily":false,"server_name":"","user_bot_enabled":false,"user_bot_token":"","user_bot_id":"","user_bot_traffic_view":"net","user_bot_traffic_view_version":1,"user_bot_update_offset":0}'
     mkdir -p "$CFG" 2>/dev/null || return 1
     _tg_config_lock_acquire || return 1
     if [[ ! -f "$TG_CONFIG_FILE" ]]; then
@@ -2309,10 +2309,14 @@ init_tg_config() {
         return 0
     fi
 
-    # 为旧配置补齐用户机器人字段，不改变现有管理员通知设置。
+    # 旧版自动双向默认迁移为单向；独立用户设置在数据库中，保持原样。
     local tmp
     tmp=$(mktemp "${TG_CONFIG_FILE}.migrate.XXXXXX") || { _tg_config_lock_release; return 1; }
-    if jq --argjson defaults "$defaults" '$defaults * .' "$TG_CONFIG_FILE" > "$tmp" 2>/dev/null; then
+    if jq --argjson defaults "$defaults" '
+        if (.user_bot_traffic_view_version // 0) == 0 then
+            .user_bot_traffic_view = "net" | .user_bot_traffic_view_version = 1
+        else . end | $defaults * .
+    ' "$TG_CONFIG_FILE" > "$tmp" 2>/dev/null; then
         chmod 600 "$tmp" 2>/dev/null || true
         if mv "$tmp" "$TG_CONFIG_FILE"; then
             _tg_config_lock_release
@@ -2524,34 +2528,59 @@ _tg_format_usage_bytes() {
 }
 
 tg_get_user_report_by_chat() {
-    local chat_id="$1" mapping core proto name
+    local chat_id="$1" report_type="${2:-traffic}" mapping core proto name
+    [[ "$report_type" == traffic || "$report_type" == status ]] || return 1
     mapping=$(db_find_user_by_tg_chat "$chat_id")
     [[ -n "$mapping" ]] || return 1
     IFS='|' read -r core proto name <<< "$mapping"
 
-    local used quota enabled expire_date proto_name server_name last_sync port cycle reason
-    used=$(db_get_user_field "$core" "$proto" "$name" "used")
-    quota=$(db_get_user_field "$core" "$proto" "$name" "quota")
-    enabled=$(db_get_user_field "$core" "$proto" "$name" "enabled")
-    expire_date=$(db_get_user_expire_date "$core" "$proto" "$name")
+    local proto_name server_name port
     proto_name=$(get_protocol_name "$proto")
     server_name=$(tg_get_config "server_name")
-    last_sync=$(jq -r '.meta.last_traffic_sync // "尚未同步"' "$DB_FILE" 2>/dev/null)
     port=$(db_get_users_stats "$core" "$proto" | awk -F'|' -v name="$name" '$1 == name {print $6; exit}')
+    [[ -z "$server_name" ]] && server_name="当前服务器"
+
+    if [[ "$report_type" == status ]]; then
+        local enabled expire_date reason status_text="正常" expire_text="永不过期"
+        enabled=$(db_get_user_field "$core" "$proto" "$name" enabled)
+        expire_date=$(db_get_user_expire_date "$core" "$proto" "$name")
+        reason=$(db_get_user_field "$core" "$proto" "$name" disabled_reason)
+        if [[ "$enabled" != true ]]; then
+            status_text="已禁用"
+            case "$reason" in quota) status_text="流量超额停用" ;; manual) status_text="管理员停用" ;; expired) status_text="已过期" ;; esac
+        fi
+        if [[ -n "$expire_date" ]]; then
+            expire_text="$expire_date"
+            [[ "$(date '+%Y-%m-%d')" > "$expire_date" ]] && status_text="已过期"
+        fi
+        cat <<EOF
+账号状态
+服务器：${server_name}
+用户：${name}
+协议：${proto_name}
+端口：${port:-未知}
+账号状态：${status_text}
+到期时间：${expire_text}
+EOF
+        return 0
+    fi
+
+    local used quota last_sync cycle
+    used=$(db_get_user_field "$core" "$proto" "$name" used)
+    quota=$(db_get_user_field "$core" "$proto" "$name" quota)
+    last_sync=$(jq -r '.meta.last_traffic_sync // "尚未同步"' "$DB_FILE" 2>/dev/null)
     cycle=$(_traffic_cycle_display "$(db_get_user "$core" "$proto" "$name")")
-    reason=$(db_get_user_field "$core" "$proto" "$name" disabled_reason)
     used=${used:-0}
     quota=${quota:-0}
     [[ "$used" =~ ^[0-9]+$ ]] || used=0
     [[ "$quota" =~ ^[0-9]+$ ]] || quota=0
 
-    local multiplier=1 traffic_scope="单向显示：用户净流量（上传＋下载）" traffic_note="" view
+    local multiplier=1 traffic_scope="单向显示：用户净流量（上传＋下载）" view
     view=$(db_get_user_field "$core" "$proto" "$name" telegram_traffic_view)
     case "$view" in net|server_estimate) ;; *) view=$(tg_get_config user_bot_traffic_view) ;; esac
     if [[ "$view" == server_estimate ]]; then
         multiplier=2
         traffic_scope="服务器双向估算（净流量×2）"
-        traffic_note=$'\n说明：已用、配额、剩余均为换算值；限额仍按净流量执行。\n估算不含协议开销、重传或其他服务，可能与官网账单不同。'
     fi
     local quota_text="无限制" remaining_text="无限制" percent_text="--"
     if [[ "$quota" =~ ^[0-9]+$ && "$quota" -gt 0 ]]; then
@@ -2562,19 +2591,6 @@ tg_get_user_report_by_chat() {
         percent_text="${percent}%"
     fi
 
-    local status_text="正常" expire_text="永不过期"
-    [[ "$enabled" != "true" ]] && status_text="已禁用"
-    if [[ "$enabled" != true ]]; then
-        case "$reason" in quota) status_text="流量超额停用" ;; manual) status_text="管理员停用" ;; expired) status_text="已过期" ;; esac
-    fi
-    if [[ -n "$expire_date" ]]; then
-        expire_text="$expire_date"
-        if [[ "$(date '+%Y-%m-%d')" > "$expire_date" ]]; then
-            status_text="已过期"
-        fi
-    fi
-
-    [[ -z "$server_name" ]] && server_name="当前服务器"
     cat <<EOF
 流量查询
 服务器：${server_name}
@@ -2587,9 +2603,7 @@ tg_get_user_report_by_chat() {
 剩余流量：${remaining_text}
 使用率：${percent_text}
 流量周期：${cycle}
-到期时间：${expire_text}
-账号状态：${status_text}
-最后同步：${last_sync}${traffic_note}
+最后同步：${last_sync}
 EOF
 }
 
@@ -2678,7 +2692,7 @@ tg_user_bot_handle_update() {
             ;;
         /status)
             local report
-            if report=$(tg_get_user_report_by_chat "$chat_id"); then
+            if report=$(tg_get_user_report_by_chat "$chat_id" status); then
                 tg_send_chat_message "$chat_id" "$report"
             else
                 tg_send_chat_message "$chat_id" "尚未绑定代理账号。请发送 /bind 绑定码。"
@@ -30144,10 +30158,10 @@ _configure_tg_user_bot() {
         service_status="${R}○ 未运行${NC}"
         tg_user_bot_service_action active >/dev/null 2>&1 && service_status="${G}● 常驻长轮询${NC}"
         token_status="${D}未配置${NC}"
-        if [[ -n "$(tg_get_config user_bot_token)" ]]; then token_status="${G}独立用户 Bot${NC}"
+        if [[ -n "$(tg_get_config user_bot_token)" ]]; then token_status="${G}用户查询 Bot（本服务器用户共用）${NC}"
         elif [[ -n "$bot_token" ]]; then token_status="${Y}复用管理员 Bot（兼容旧配置）${NC}"; fi
         binding_count=$(db_list_tg_user_bindings | awk 'NF{n++} END{print n+0}')
-        traffic_view="用户净流量"
+        traffic_view="单向流量（脚本统计口径）"
         [[ "$(tg_get_config user_bot_traffic_view)" != server_estimate ]] || traffic_view="服务器双向估算（净流量×2）"
 
         _header
@@ -30158,8 +30172,6 @@ _configure_tg_user_bot() {
         echo -e "  已绑定用户: ${G}$binding_count${NC}"
         echo -e "  Bot 配置: $token_status"
         echo -e "  默认查询口径: $traffic_view（可按用户设置）"
-        echo -e "  ${D}同一个用户 Bot 仅供一台服务器轮询；建议配置专用 Bot。${NC}"
-        echo -e "  ${D}不占用入站端口，无需域名或证书；保留现有 webhook。${NC}"
         _line
         if [[ "$enabled" == "true" ]]; then
             _item "1" "禁用用户机器人"
@@ -30171,7 +30183,7 @@ _configure_tg_user_bot() {
         _item "4" "解除用户绑定"
         _item "5" "重启机器人消息服务"
         _item "6" "查看机器人命令"
-        _item "7" "设置独立用户 Bot Token"
+        _item "7" "设置用户查询 Bot Token（本服务器用户共用）"
         _item "8" "设置某个用户的单向/双向显示"
         _item "0" "返回"
         _line
@@ -30215,8 +30227,8 @@ _configure_tg_user_bot() {
                 if [[ "$enabled" == true ]]; then
                     _err "请先禁用用户机器人再更换 Token，避免处理中途切换账号"
                 else
-                    echo -e "  ${D}向 @BotFather 创建专用 Bot；直接回车沿用管理员 Token。${NC}"
-                    read -rsp "  用户 Bot Token: " new_token
+                    echo -e "  ${D}为本服务器创建一个查询 Bot，所有用户共用；直接回车沿用管理员 Token。${NC}"
+                    read -rsp "  用户查询 Bot Token: " new_token
                     echo ""
                     if tg_change_user_bot_token "$new_token"; then _ok "用户 Bot 配置已保存；现有绑定保留"
                     else _err "Bot 验证或保存失败，原配置保留"; fi
@@ -30230,7 +30242,6 @@ _configure_tg_user_bot() {
                 echo "  1) 单向显示：用户净流量（上传＋下载）"
                 echo "  2) 服务器双向估算（已用、配额、剩余均×2）"
                 echo "  3) 沿用默认显示口径"
-                echo "  显示换算不改变现有配额和停用逻辑；估算不等于官网账单。"
                 local view_choice view_value
                 read -rp "  请选择 [1/2/3，回车保留]: " view_choice
                 case "$view_choice" in

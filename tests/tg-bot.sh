@@ -7,6 +7,7 @@ printf '%s\n' '{"enabled":true,"bot_token":"100:admin_fixture","chat_id":"123","
 init_tg_config
 [[ $(tg_get_user_bot_token) == 100:admin_fixture ]]
 [[ $(tg_get_config user_bot_update_offset) == 7 ]]
+[[ $(tg_get_config user_bot_traffic_view) == net && $(tg_get_config user_bot_traffic_view_version) == 1 ]]
 [[ $(stat -c %a "$TG_CONFIG_FILE") == 600 ]]
 _tg_config_lock_acquire
 [[ $(cat "$TG_CONFIG_LOCK_DIR/pid") == "$BASHPID" ]]
@@ -130,9 +131,31 @@ api_mode=ok
 [[ $(send_expire_warnings 3) == 0 ]]
 echo 'PASS legacy delivery API status/encoding and failed admin expiry warnings remain retryable'
 
+db_set_user_tg_traffic_view xray ss2022 bob server_estimate
+cp "$DB_FILE" "$fixture/before-default-migration"
+jq 'del(.user_bot_traffic_view_version) | .user_bot_traffic_view="server_estimate"' "$TG_CONFIG_FILE" > "$fixture/old-default-config"
+cp "$fixture/old-default-config" "$TG_CONFIG_FILE"
+init_tg_config
+[[ $(tg_get_config user_bot_traffic_view) == net && $(tg_get_config user_bot_update_offset) == 9 ]]
+jq 'del(.user_bot_traffic_view, .user_bot_traffic_view_version)' "$fixture/old-default-config" > "$fixture/expected-settings"
+jq 'del(.user_bot_traffic_view, .user_bot_traffic_view_version)' "$TG_CONFIG_FILE" > "$fixture/actual-settings"
+cmp "$fixture/expected-settings" "$fixture/actual-settings"
+cmp "$DB_FILE" "$fixture/before-default-migration"
+cp "$TG_CONFIG_FILE" "$fixture/migrated-settings"
+init_tg_config
+cmp "$TG_CONFIG_FILE" "$fixture/migrated-settings"
+tg_get_user_report_by_chat 123 | grep -q '已使用：100 B'
+[[ $(db_get_user_field xray ss2022 bob telegram_traffic_view) == server_estimate ]]
+mv "$TG_CONFIG_FILE" "$fixture/saved-settings"
+init_tg_config
+[[ $(tg_get_config user_bot_traffic_view) == net ]]
+mv "$fixture/saved-settings" "$TG_CONFIG_FILE"
+echo 'PASS fresh/legacy defaults are net, migration is idempotent and tokens/offset/bindings/per-user choices remain unchanged'
+
 sync_all_user_traffic() { echo synced >> "$fixture/sync"; [[ ! -f "$fixture/sync-fail" ]]; }
 tg_user_bot_handle_update '{"message":{"chat":{"id":999,"type":"private"},"text":"/traffic"}}'
 [[ ! -e "$fixture/sync" ]]
+tg_set_config user_bot_traffic_view server_estimate
 tg_get_user_report_by_chat 123 > "$fixture/report"
 grep -q alice "$fixture/report"
 ! grep -q bob "$fixture/report"
@@ -141,6 +164,7 @@ grep -q '已使用：200 B' "$fixture/report"
 grep -q '总配额：1.95 KiB' "$fixture/report"
 grep -q '剩余流量：1.76 KiB' "$fixture/report"
 grep -q '使用率：10%' "$fixture/report"
+! grep -Eq '说明：|估算不含|官网账单|账号状态：|到期时间：' "$fixture/report"
 cp "$DB_FILE" "$fixture/before-display-change"
 tg_set_config user_bot_traffic_view net
 tg_get_user_report_by_chat 123 > "$fixture/net-report"
@@ -179,6 +203,27 @@ tg_user_bot_handle_update '{"message":{"chat":{"id":123,"type":"private"},"text"
 cmp "$DB_FILE" "$fixture/before-user-command"
 tg_get_user_report_by_chat 123 | grep -q '服务器双向估算'
 echo 'PASS user bot cannot change an administrator-selected traffic display policy'
+
+cp "$DB_FILE" "$fixture/before-status-report"
+tg_get_user_report_by_chat 123 status > "$fixture/status-report"
+grep -q '^账号状态$' "$fixture/status-report"
+grep -q '账号状态：正常' "$fixture/status-report"
+grep -q '到期时间：永不过期' "$fixture/status-report"
+! grep -Eq '已使用：|总配额：|剩余流量：|使用率：|流量周期：|最后同步：|统计口径：|说明：|估算不含' "$fixture/status-report"
+for reason in manual quota expired other; do
+    case "$reason" in manual) expected_status=管理员停用 ;; quota) expected_status=流量超额停用 ;; expired) expected_status=已过期 ;; other) expected_status=已禁用 ;; esac
+    _db_apply --arg reason "$reason" '.xray.ss2022[0].users[0] |= (.enabled=false | .disabled_reason=$reason)'
+    tg_get_user_report_by_chat 123 status | grep -q "账号状态：$expected_status"
+done
+_db_apply '.xray.ss2022[0].users[0] |= (.enabled=true | .expire_date="2000-01-01")'
+tg_get_user_report_by_chat 123 status > "$fixture/expired-status"
+grep -q '账号状态：已过期' "$fixture/expired-status"
+grep -q '到期时间：2000-01-01' "$fixture/expired-status"
+if tg_get_user_report_by_chat 999 status; then exit 1; fi
+if tg_get_user_report_by_chat 123 invalid; then exit 1; fi
+cp "$fixture/before-status-report" "$DB_FILE"
+[[ ! -e "$fixture/sync" ]]
+echo 'PASS distinct traffic/status reports, correct disabled/expired states, concise replies and no status-triggered synchronization'
 original_api=$(declare -f tg_bot_api_request)
 tg_bot_api_request() {
     if [[ "$1" == getUpdates ]]; then
@@ -208,10 +253,13 @@ grep -q timeout=20 "$fixture/poll-args"
 api_mode=failure
 if tg_poll_user_bot; then exit 1; fi
 [[ $(tg_get_config user_bot_update_offset) == 13 && ! -d "$CFG/tg-user-bot.lock" ]]
+sync_before_status=$(wc -l < "$fixture/sync")
 api_mode=blocked
 printf '%s\n' '{"ok":true,"result":[{"update_id":13,"message":{"chat":{"id":456,"type":"private"},"text":"/help"}},{"update_id":14,"message":{"chat":{"id":123,"type":"private"},"text":"/status"}}]}' > "$fixture/updates"
 tg_poll_user_bot
 [[ $(tg_get_config user_bot_update_offset) == 15 ]]
+grep -q '账号状态：正常' "$fixture/replies"
+[[ $(wc -l < "$fixture/sync") == "$sync_before_status" ]]
 api_mode=ok
 rm -f "$CFG/.tg-query-last-sync"
 touch "$fixture/sync-fail"
@@ -246,6 +294,8 @@ crontab() { return 1; }
 _configure_tg_user_bot <<< 0 > "$fixture/user-menu"
 _configure_tg_notify <<< 0 > "$fixture/admin-menu"
 ! grep -Eq '100:admin_fixture|200:rotated_fixture' "$fixture/user-menu" "$fixture/admin-menu"
+grep -q '设置用户查询 Bot Token（本服务器用户共用）' "$fixture/user-menu"
+! grep -Eq '不占用入站端口|设置独立用户' "$fixture/user-menu"
 echo 'PASS admin and user menus do not display tokens'
 
 # Isolated service-state model; no live init files or services are touched.

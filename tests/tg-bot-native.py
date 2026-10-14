@@ -21,9 +21,9 @@ config.write_text(json.dumps(dict(enabled=False, bot_token='100:admin_fixture',
                                  user_bot_enabled=True, user_bot_update_offset=0)))
 (cfg / 'db.json').write_text(json.dumps(dict(xray=dict(ss2022=[
     dict(port=11111, users=[dict(name='alice', uuid='fixture-a', used=100, quota=1000,
-                               enabled=True, telegram_chat_id='123')]),
+                               enabled=True, telegram_chat_id='123', telegram_traffic_view='server_estimate')]),
     dict(port=22222, users=[dict(name='bob', uuid='fixture-b', used=200, quota=1000,
-                               enabled=True, telegram_chat_id='456', telegram_traffic_view='net')])]), singbox={}, meta={})))
+                               enabled=True, telegram_chat_id='456')])]), singbox={}, meta={})))
 updates, replies, polls = [], [], []
 condition = threading.Condition()
 ready, failed_reply = threading.Event(), threading.Event()
@@ -145,6 +145,7 @@ def exercise(label, main_pid):
     assert '服务器双向估算（净流量×2）' in replies[1][1]
     assert '已使用：200 B' in replies[1][1] and '已使用：200 B' in replies[2][1]
     assert '单向显示：用户净流量' in replies[2][1]
+    assert all('说明：' not in text and '估算不含' not in text for _, text, _ in replies)
     assert '尚未绑定' in replies[3][1]
     assert (work / 'sync').read_text().splitlines() == ['synced']
     fail_send = True
@@ -154,6 +155,9 @@ def exercise(label, main_pid):
     assert json.loads(config.read_text())['user_bot_update_offset'] == 105, 'failed reply was acknowledged'
     wait_until(lambda: len(replies) >= 5)
     wait_until(lambda: json.loads(config.read_text())['user_bot_update_offset'] == 106)
+    assert replies[4][1].startswith('账号状态\n') and '账号状态：正常' in replies[4][1]
+    assert '到期时间：永不过期' in replies[4][1] and '已使用：' not in replies[4][1]
+    assert (work / 'sync').read_text().splitlines() == ['synced'], 'status query triggered traffic sync'
     print(f'PASS {label}: long-poll reply {latency:.2f}s, isolated reports, one batch sync and transient-failure retry', flush=True)
 
 

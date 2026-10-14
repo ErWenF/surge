@@ -28,7 +28,7 @@ umask 077
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) )); then
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         echo "用法: $0 [选项]"
-        echo "选项: --sync-traffic, --show-traffic, --tg-bot-poll, --check-expire, --setup-expire-cron, --help"
+        echo "选项: --sync-traffic, --show-traffic, --tg-bot-poll, --tg-bot-run, --check-expire, --setup-expire-cron, --help"
         echo "运行功能需要 Bash 4.1 或更高版本。"
         exit 0
     fi
@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.14"
+readonly VERSION="3.7.15"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -1345,11 +1345,23 @@ db_get_user_field() {
 
 # 设置用户 Telegram 绑定信息（支持单端口和多端口配置）
 db_set_user_tg_binding() {
-    local core="$1" proto="$2" name="$3" chat_id="$4" tg_username="$5" bound_at="$6"
+    local core="$1" proto="$2" name="$3" chat_id="$4" tg_username="$5" bound_at="$6" expected_hash="${7:-}"
     [[ ! -f "$DB_FILE" ]] && return 1
+    [[ "$chat_id" =~ ^[1-9][0-9]*$ ]] || return 1
 
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" \
-        --arg chat "$chat_id" --arg username "$tg_username" --arg at "$bound_at" '
+        --arg chat "$chat_id" --arg username "$tg_username" --arg at "$bound_at" \
+        --arg hash "$expected_hash" --argjson now "$(date +%s)" '
+        [paths(objects) as $path | getpath($path) |
+            select(($path[0] == "xray" or $path[0] == "singbox") and $path[-2] == "users") |
+            {path:$path,user:.}] as $all |
+        [$all[] | select(.path[0] == $c and .path[1] == $p and .user.name == $n)] as $target |
+        if ($target | length) != 1 or
+           any($all[]; .user.telegram_chat_id == $chat and .path != $target[0].path) or
+           ($hash != "" and ($target[0].user.telegram_bind_token_hash != $hash or
+            ($target[0].user.telegram_bind_expires_at // 0) < $now)) then
+            error("ambiguous user, chat already bound or binding code expired")
+        else . end |
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
             .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] |
@@ -1380,6 +1392,8 @@ db_set_user_tg_bind_token() {
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" \
         --arg hash "$token_hash" --argjson expires "$expires_at" '
         .[$c][$p] as $cfg |
+        [($cfg | if type == "array" then .[] else . end) | (.users // [])[] | select(.name == $n)] as $users |
+        if ($users | length) != 1 then error("ambiguous or missing user") else . end |
         if ($cfg | type) == "array" then
             .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] |
                 if .name == $n then
@@ -1396,6 +1410,18 @@ db_set_user_tg_bind_token() {
             ]
         end
     '
+}
+
+# 只更新查询显示口径；不改流量、配额或核心配置，单/多端口均按唯一用户定位。
+db_set_user_tg_traffic_view() {
+    local core="$1" proto="$2" name="$3" view="$4"
+    [[ -f "$DB_FILE" && ( "$view" == net || "$view" == server_estimate || "$view" == default ) ]] || return 1
+    _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg view "$view" '
+        [paths(objects) as $path | select($path[0] == $c and $path[1] == $p and $path[-2] == "users") |
+            select(getpath($path).name == $n) | $path] as $targets |
+        if ($targets | length) != 1 then error("ambiguous or missing user")
+        elif $view == "default" then delpaths([$targets[0] + ["telegram_traffic_view"]])
+        else setpath($targets[0] + ["telegram_traffic_view"]; $view) end'
 }
 
 db_clear_user_tg_binding() {
@@ -1431,11 +1457,13 @@ db_find_user_by_tg_bind_hash() {
         (.[$core] // {} | to_entries[]) as $proto_entry |
         $proto_entry.key as $proto |
         (if ($proto_entry.value | type) == "array" then $proto_entry.value[] else $proto_entry.value end) |
-        (.users // [])[] |
+        (.users // [])[] as $user |
+        select([($proto_entry.value | if type == "array" then .[] else . end) |
+                (.users // [])[] | select(.name == $user.name)] | length == 1) | $user |
         select((.telegram_bind_token_hash // "") == $hash) |
         select(((((.telegram_bind_expires_at // 0) | tonumber?) // 0)) >= $now) |
         "\($core)|\($proto)|\(.name)"
-    ' "$DB_FILE" 2>/dev/null | head -n1
+    ' "$DB_FILE" 2>/dev/null | awk 'NF {value=$0; n++} END {if (n == 1) print value}'
 }
 
 # 输出 core|proto|name；每个私聊 Chat ID 只允许绑定一个脚本用户。
@@ -1447,10 +1475,12 @@ db_find_user_by_tg_chat() {
         (.[$core] // {} | to_entries[]) as $proto_entry |
         $proto_entry.key as $proto |
         (if ($proto_entry.value | type) == "array" then $proto_entry.value[] else $proto_entry.value end) |
-        (.users // [])[] |
+        (.users // [])[] as $user |
+        select([($proto_entry.value | if type == "array" then .[] else . end) |
+                (.users // [])[] | select(.name == $user.name)] | length == 1) | $user |
         select((.telegram_chat_id // "") == $chat) |
         "\($core)|\($proto)|\(.name)"
-    ' "$DB_FILE" 2>/dev/null | head -n1
+    ' "$DB_FILE" 2>/dev/null | awk 'NF {value=$0; n++} END {if (n == 1) print value}'
 }
 
 # 输出 core|proto|name|chat_id|telegram_username|bound_at
@@ -1963,56 +1993,56 @@ send_tg_message() {
     
     [[ -z "$bot_token" || -z "$chat_id" ]] && return 1
     
-    curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
-        -d "chat_id=${chat_id}" \
-        -d "text=${message}" \
-        -d "parse_mode=Markdown" \
-        --connect-timeout 10 >/dev/null 2>&1
+    local _TG_BOT_TOKEN_OVERRIDE="$bot_token"
+    tg_send_chat_message "$chat_id" "$message" || return 1
+    return 0
 }
 
 # 发送用户即将过期提醒
 send_tg_expire_warning() {
-    local name="$1" proto="$2" expire_date="$3" days_left="$4" core="${5:-}"
+    local name="$1" proto="$2" expire_date="$3" days_left="$4" core="${5:-}" rc=0
     local proto_name=$(get_protocol_name "$proto")
     local server_display=$(get_tg_server_display)
     
-    local message="⚠️ *用户即将过期*
+    local message="⚠️ 用户即将过期
 ${server_display}
-👤 用户: \`$name\`
+👤 用户: $name
 📋 协议: $proto_name
 📅 到期: $expire_date
-⏰ 剩余: *${days_left}天*"
+⏰ 剩余: ${days_left}天"
     
-    send_tg_message "$message"
+    send_tg_message "$message" || rc=1
     if [[ -n "$core" ]]; then
         tg_send_bound_user_message "$core" "$proto" "$name" "⚠️ 账号即将到期
 用户：${name}
 协议：$(get_protocol_name "$proto")
 到期时间：${expire_date}
-剩余：${days_left} 天"
+剩余：${days_left} 天" || rc=1
     fi
+    return "$rc"
 }
 
 # 发送用户已过期通知
 send_tg_expired_notice() {
-    local name="$1" proto="$2" expire_date="$3" core="${4:-}"
+    local name="$1" proto="$2" expire_date="$3" core="${4:-}" rc=0
     local proto_name=$(get_protocol_name "$proto")
     local server_display=$(get_tg_server_display)
     
-    local message="🚫 *用户已过期禁用*
+    local message="🚫 用户已过期禁用
 ${server_display}
-👤 用户: \`$name\`
+👤 用户: $name
 📋 协议: $proto_name
 📅 到期: $expire_date"
     
-    send_tg_message "$message"
+    send_tg_message "$message" || rc=1
     if [[ -n "$core" ]]; then
         tg_send_bound_user_message "$core" "$proto" "$name" "🚫 账号已到期
 用户：${name}
 协议：$(get_protocol_name "$proto")
 到期时间：${expire_date}
-账号已自动禁用"
+账号已自动禁用" || rc=1
     fi
+    return "$rc"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -2055,9 +2085,10 @@ send_expire_warnings() {
         [[ -z "$name" ]] && continue
         local last_warn=$(db_get_user_alert_state "$core" "$proto" "$name" "last_expire_warn_day")
         [[ "$last_warn" == "$days_left" ]] && continue
-        send_tg_expire_warning "$name" "$proto" "$expire_date" "$days_left" "$core"
-        db_set_user_alert_state "$core" "$proto" "$name" "last_expire_warn_day" "$days_left"
-        ((count++))
+        if send_tg_expire_warning "$name" "$proto" "$expire_date" "$days_left" "$core"; then
+            db_set_user_alert_state "$core" "$proto" "$name" "last_expire_warn_day" "$days_left"
+            count=$((count + 1))
+        fi
     done <<< "$expiring_users"
     
     echo "$count"
@@ -2235,9 +2266,15 @@ readonly TG_CONFIG_LOCK_DIR="$CFG/.telegram.lock"
 
 _tg_config_lock_acquire() {
     local attempt owner
+    if [[ "${TG_CONFIG_LOCK_OWNER:-}" == "$BASHPID" ]]; then
+        TG_CONFIG_LOCK_DEPTH=$((TG_CONFIG_LOCK_DEPTH + 1))
+        return 0
+    fi
     for ((attempt=0; attempt<200; attempt++)); do
         if mkdir "$TG_CONFIG_LOCK_DIR" 2>/dev/null; then
-            printf '%s\n' "$$" > "$TG_CONFIG_LOCK_DIR/pid"
+            printf '%s\n' "$BASHPID" > "$TG_CONFIG_LOCK_DIR/pid" || { rmdir "$TG_CONFIG_LOCK_DIR"; return 1; }
+            TG_CONFIG_LOCK_OWNER=$BASHPID
+            TG_CONFIG_LOCK_DEPTH=1
             return 0
         fi
         owner=$(cat "$TG_CONFIG_LOCK_DIR/pid" 2>/dev/null || true)
@@ -2252,13 +2289,17 @@ _tg_config_lock_acquire() {
 }
 
 _tg_config_lock_release() {
+    [[ "${TG_CONFIG_LOCK_OWNER:-}" == "$BASHPID" ]] || return 0
+    TG_CONFIG_LOCK_DEPTH=$((TG_CONFIG_LOCK_DEPTH - 1))
+    (( TG_CONFIG_LOCK_DEPTH == 0 )) || return 0
     rm -f "$TG_CONFIG_LOCK_DIR/pid" 2>/dev/null
     rmdir "$TG_CONFIG_LOCK_DIR" 2>/dev/null || true
+    TG_CONFIG_LOCK_OWNER=""
 }
 
 # 初始化 TG 配置
 init_tg_config() {
-    local defaults='{"enabled":false,"bot_token":"","chat_id":"","notify_quota_percent":80,"notify_daily":false,"server_name":"","user_bot_enabled":false,"user_bot_update_offset":0}'
+    local defaults='{"enabled":false,"bot_token":"","chat_id":"","notify_quota_percent":80,"notify_daily":false,"server_name":"","user_bot_enabled":false,"user_bot_token":"","user_bot_id":"","user_bot_traffic_view":"server_estimate","user_bot_update_offset":0}'
     mkdir -p "$CFG" 2>/dev/null || return 1
     _tg_config_lock_acquire || return 1
     if [[ ! -f "$TG_CONFIG_FILE" ]]; then
@@ -2295,9 +2336,9 @@ get_tg_server_display() {
     [[ -z "$server_ip" ]] && server_ip=$(hostname 2>/dev/null || echo "unknown")
 
     if [[ -n "$server_name" ]]; then
-        printf '🔗 服务器: `%s`\n🌐 IP: `%s`' "$server_name" "$server_ip"
+        printf '🔗 服务器: %s\n🌐 IP: %s' "$server_name" "$server_ip"
     else
-        printf '🖥 服务器: `%s`' "$server_ip"
+        printf '🖥 服务器: %s' "$server_ip"
     fi
 }
 
@@ -2341,33 +2382,88 @@ tg_send_message() {
     [[ "$enabled" != "true" ]] && return 0
     [[ -z "$bot_token" || -z "$chat_id" ]] && return 1
     
-    curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
-        -d "chat_id=${chat_id}" \
-        -d "text=${message}" \
-        -d "parse_mode=Markdown" \
-        --connect-timeout 10 \
-        >/dev/null 2>&1
+    local _TG_BOT_TOKEN_OVERRIDE="$bot_token"
+    tg_send_chat_message "$chat_id" "$message" || return 1
+    return 0
 }
 
-# 调用 Telegram Bot API。用户机器人与管理员通知共用 Bot Token，开关相互独立。
+tg_get_user_bot_token() {
+    local token
+    token=$(tg_get_config user_bot_token)
+    [[ -n "$token" ]] || token=$(tg_get_config bot_token)
+    printf '%s' "$token"
+}
+
+# 用户机器人可独立配置；旧配置继续回落到管理员 Token。
 tg_bot_api_request() {
     local method="$1"
     shift
-    local bot_token
-    bot_token=$(tg_get_config "bot_token")
-    [[ -n "$bot_token" ]] || return 1
-    curl -fsS -X POST "https://api.telegram.org/bot${bot_token}/${method}" \
-        --connect-timeout 10 --max-time 25 "$@"
+    local bot_token max_time=25
+    bot_token="${_TG_BOT_TOKEN_OVERRIDE:-$(tg_get_user_bot_token)}"
+    [[ "$bot_token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ && "$method" =~ ^[A-Za-z]+$ ]] || return 1
+    [[ "$method" != getUpdates ]] || max_time=35
+    # URL 经 stdin 传给 curl，避免 Bot Token 出现在进程命令行。
+    curl -sS -X POST --config - --connect-timeout 10 --max-time "$max_time" "$@" \
+        2>/dev/null <<< "url = \"https://api.telegram.org/bot${bot_token}/${method}\""
 }
+
+# 拒绝占用已有 webhook；更换 Bot 时重置 offset，避免沿用另一机器人的消息序号。
+tg_validate_user_bot() {
+    local _TG_BOT_TOKEN_OVERRIDE="$1" response id
+    [[ "$_TG_BOT_TOKEN_OVERRIDE" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || return 1
+    response=$(tg_bot_api_request getMe) || return 1
+    id=$(jq -er 'select(.ok == true) | .result.id | select(type == "number" and . > 0)' <<< "$response") || return 1
+    response=$(tg_bot_api_request getWebhookInfo) || return 1
+    jq -e '.ok == true and .result.url == ""' >/dev/null <<< "$response" || {
+        _err "此 Bot 已被 webhook 使用，请使用独立 Bot；未修改原 webhook"
+        return 1
+    }
+    printf '%s\n' "$id"
+}
+
+tg_save_user_bot_identity() {
+    local token="$1" id="$2" tmp rc=1
+    _tg_config_lock_acquire || return 1
+    tmp=$(mktemp "${TG_CONFIG_FILE}.tmp.XXXXXX") || { _tg_config_lock_release; return 1; }
+    if jq --arg token "$token" --arg id "$id" '
+        if .user_bot_id != $id and ((.user_bot_id // "") != "" or (.user_bot_token // "") != $token)
+        then .user_bot_update_offset = 0 else . end |
+        .user_bot_token = $token | .user_bot_id = $id
+    ' "$TG_CONFIG_FILE" > "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$TG_CONFIG_FILE"; then rc=0; fi
+    rm -f "$tmp"
+    _tg_config_lock_release
+    return "$rc"
+}
+
+tg_change_user_bot_token() (
+    local token="$1" id
+    id=$(tg_validate_user_bot "${token:-$(tg_get_config bot_token)}") || return 1
+    _tg_config_lock_acquire || return 1
+    trap '_tg_config_lock_release' EXIT
+    [[ "$(tg_get_config user_bot_enabled)" != true ]] || { _err "请先禁用用户机器人再更换 Token"; return 1; }
+    tg_save_user_bot_identity "$token" "$id"
+)
 
 # 用户查询回复使用纯文本，避免用户名等用户字段触发 Markdown 解析。
 tg_send_chat_message() {
-    local chat_id="$1" message="$2" response
-    [[ "$chat_id" =~ ^[0-9]+$ ]] || return 1
-    response=$(tg_bot_api_request "sendMessage" \
-        --data-urlencode "chat_id=${chat_id}" \
-        --data-urlencode "text=${message}") || return 1
-    jq -e '.ok == true' >/dev/null 2>&1 <<< "$response"
+    local chat_id="$1" message="$2" response part chunks
+    [[ "$chat_id" =~ ^-?[0-9]+$ ]] || return 1
+    [[ -n "$message" ]] || return 1
+    # jq 按 Unicode 字符拆分，兼容 LANG=C；每段最多 4000 个 UTF-16 单元。
+    # 所有通知均为 URL 编码的纯文本，不解析用户名中的 Markdown 或 &。
+    chunks=$(printf '%s' "$message" | jq -Rsc 'range(0; length; 2000) as $i | .[$i:$i+2000]') || return 1
+    while IFS= read -r part; do
+        part=$(jq -r . <<< "$part") || return 1
+        response=$(tg_bot_api_request "sendMessage" \
+            --data-urlencode "chat_id=${chat_id}" \
+            --data-urlencode "text=${part}") || return 1
+        if ! jq -e '.ok == true' >/dev/null 2>&1 <<< "$response"; then
+            # 用户屏蔽 Bot / 聊天已失效时跳过此条，避免堵住其他用户的消息队列。
+            if jq -e '.ok == false and (.error_code == 400 or .error_code == 403)' >/dev/null 2>&1 <<< "$response"; then return 78; fi
+            return 1
+        fi
+    done <<< "$chunks"
+    return 0
 }
 
 tg_send_bound_user_message() {
@@ -2375,7 +2471,9 @@ tg_send_bound_user_message() {
     [[ "$(tg_get_config "user_bot_enabled")" == "true" ]] || return 0
     chat_id=$(db_get_user_field "$core" "$proto" "$user" "telegram_chat_id")
     [[ -n "$chat_id" ]] || return 0
-    tg_send_chat_message "$chat_id" "$message"
+    local rc=0
+    tg_send_chat_message "$chat_id" "$message" || rc=$?
+    [[ "$rc" == 0 || "$rc" == 78 ]]
 }
 
 tg_hash_bind_token() {
@@ -2400,13 +2498,38 @@ tg_user_bot_help_text() {
 EOF
 }
 
+tg_refresh_query_traffic() {
+    if [[ "${TASK_TG_QUERY_SYNC_LOCK_OWNER:-}" != "$BASHPID" ]]; then
+        _with_named_lock tg_query_sync tg_refresh_query_traffic; return $?
+    fi
+    local now last=0 stamp="$CFG/.tg-query-last-sync" staged
+    now=$(date +%s)
+    [[ ! -f "$stamp" ]] || read -r last < "$stamp"
+    [[ "$last" =~ ^[0-9]{1,12}$ ]] || last=0
+    last=$((10#$last))
+    # 连续点击或同批多个用户查询，共享 5 秒内成功同步的结果。
+    if (( now >= last && now - last < 5 )); then return 0; fi
+    sync_all_user_traffic true >/dev/null 2>&1 || return 1
+    staged=$(mktemp "${stamp}.XXXXXX") || return 0
+    printf '%s\n' "$now" > "$staged" && mv "$staged" "$stamp"
+    rm -f "$staged"
+    return 0
+}
+
+_tg_format_usage_bytes() {
+    local result
+    result=$(format_bytes "$1") || return 1
+    [[ "$result" == *" B" ]] || result="${result/%B/iB}"
+    printf '%s' "$result"
+}
+
 tg_get_user_report_by_chat() {
     local chat_id="$1" mapping core proto name
     mapping=$(db_find_user_by_tg_chat "$chat_id")
     [[ -n "$mapping" ]] || return 1
     IFS='|' read -r core proto name <<< "$mapping"
 
-    local used quota enabled expire_date proto_name server_name last_sync
+    local used quota enabled expire_date proto_name server_name last_sync port cycle reason
     used=$(db_get_user_field "$core" "$proto" "$name" "used")
     quota=$(db_get_user_field "$core" "$proto" "$name" "quota")
     enabled=$(db_get_user_field "$core" "$proto" "$name" "enabled")
@@ -2414,22 +2537,36 @@ tg_get_user_report_by_chat() {
     proto_name=$(get_protocol_name "$proto")
     server_name=$(tg_get_config "server_name")
     last_sync=$(jq -r '.meta.last_traffic_sync // "尚未同步"' "$DB_FILE" 2>/dev/null)
+    port=$(db_get_users_stats "$core" "$proto" | awk -F'|' -v name="$name" '$1 == name {print $6; exit}')
+    cycle=$(_traffic_cycle_display "$(db_get_user "$core" "$proto" "$name")")
+    reason=$(db_get_user_field "$core" "$proto" "$name" disabled_reason)
     used=${used:-0}
     quota=${quota:-0}
     [[ "$used" =~ ^[0-9]+$ ]] || used=0
     [[ "$quota" =~ ^[0-9]+$ ]] || quota=0
 
+    local multiplier=1 traffic_scope="单向显示：用户净流量（上传＋下载）" traffic_note="" view
+    view=$(db_get_user_field "$core" "$proto" "$name" telegram_traffic_view)
+    case "$view" in net|server_estimate) ;; *) view=$(tg_get_config user_bot_traffic_view) ;; esac
+    if [[ "$view" == server_estimate ]]; then
+        multiplier=2
+        traffic_scope="服务器双向估算（净流量×2）"
+        traffic_note=$'\n说明：已用、配额、剩余均为换算值；限额仍按净流量执行。\n估算不含协议开销、重传或其他服务，可能与官网账单不同。'
+    fi
     local quota_text="无限制" remaining_text="无限制" percent_text="--"
     if [[ "$quota" =~ ^[0-9]+$ && "$quota" -gt 0 ]]; then
         local remaining=$((quota - used)) percent=$((used * 100 / quota))
         (( remaining < 0 )) && remaining=0
-        quota_text=$(format_bytes "$quota")
-        remaining_text=$(format_bytes "$remaining")
+        quota_text=$(_tg_format_usage_bytes "$((quota * multiplier))")
+        remaining_text=$(_tg_format_usage_bytes "$((remaining * multiplier))")
         percent_text="${percent}%"
     fi
 
     local status_text="正常" expire_text="永不过期"
     [[ "$enabled" != "true" ]] && status_text="已禁用"
+    if [[ "$enabled" != true ]]; then
+        case "$reason" in quota) status_text="流量超额停用" ;; manual) status_text="管理员停用" ;; expired) status_text="已过期" ;; esac
+    fi
     if [[ -n "$expire_date" ]]; then
         expire_text="$expire_date"
         if [[ "$(date '+%Y-%m-%d')" > "$expire_date" ]]; then
@@ -2443,13 +2580,16 @@ tg_get_user_report_by_chat() {
 服务器：${server_name}
 用户：${name}
 协议：${proto_name}
-已使用：$(format_bytes "$used")
+端口：${port:-未知}
+统计口径：${traffic_scope}
+已使用：$(_tg_format_usage_bytes "$((used * multiplier))")
 总配额：${quota_text}
 剩余流量：${remaining_text}
 使用率：${percent_text}
+流量周期：${cycle}
 到期时间：${expire_text}
 账号状态：${status_text}
-最后同步：${last_sync}
+最后同步：${last_sync}${traffic_note}
 EOF
 }
 
@@ -2480,7 +2620,7 @@ tg_user_bot_bind_chat() {
     fi
     IFS='|' read -r core proto name <<< "$mapping"
 
-    if db_set_user_tg_binding "$core" "$proto" "$name" "$chat_id" "$tg_username" "$(date '+%Y-%m-%d %H:%M:%S')"; then
+    if db_set_user_tg_binding "$core" "$proto" "$name" "$chat_id" "$tg_username" "$(date '+%Y-%m-%d %H:%M:%S')" "$token_hash"; then
         local success_message
         printf -v success_message '绑定成功：%s（%s）。\n发送 /traffic 查询个人流量。' "$name" "$(get_protocol_name "$proto")"
         tg_send_chat_message "$chat_id" "$success_message"
@@ -2519,12 +2659,19 @@ tg_user_bot_handle_update() {
             fi
             ;;
         /traffic)
-            # 查询前先抓取核心中的增量。即使某台机器的 cron 曾异常，用户也能
-            # 获得最新数据；同步锁会阻止与定时任务并发 reset。
-            sync_all_user_traffic "true" >/dev/null 2>&1 || true
-            local report
+            mapping=$(db_find_user_by_tg_chat "$chat_id")
+            if [[ -z "$mapping" ]]; then
+                tg_send_chat_message "$chat_id" "尚未绑定代理账号。请发送 /bind 绑定码。"
+                return $?
+            fi
+            local report warning=""
+            # 同批命令只同步一次；未绑定用户不能触发全量统计或配额检查。
+            if [[ "${_TG_BATCH_SYNCED:-false}" != true ]]; then
+                if tg_refresh_query_traffic; then _TG_BATCH_SYNCED=true
+                else warning=$'\n提示：本次统计同步失败，以上为已保存用量，请参考最后同步时间。'; fi
+            fi
             if report=$(tg_get_user_report_by_chat "$chat_id"); then
-                tg_send_chat_message "$chat_id" "$report"
+                tg_send_chat_message "$chat_id" "$report$warning"
             else
                 tg_send_chat_message "$chat_id" "尚未绑定代理账号。请发送 /bind 绑定码。"
             fi
@@ -2561,9 +2708,11 @@ tg_user_bot_handle_update() {
     esac
 }
 
-tg_poll_user_bot() {
-    init_tg_config || return 1
+_tg_poll_user_bot() {
+    [[ -f "$TG_CONFIG_FILE" ]] || init_tg_config || return 1
     [[ "$(tg_get_config "user_bot_enabled")" == "true" ]] || return 0
+    local poll_timeout="${1:-0}"
+    [[ "$poll_timeout" == 0 || "$poll_timeout" == 20 ]] || return 1
 
     local lock_dir="$CFG/tg-user-bot.lock" owner
     if ! mkdir "$lock_dir" 2>/dev/null; then
@@ -2571,50 +2720,111 @@ tg_poll_user_bot() {
         if [[ -n "$owner" && "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
             rm -f "$lock_dir/pid" 2>/dev/null
             rmdir "$lock_dir" 2>/dev/null || true
-            mkdir "$lock_dir" 2>/dev/null || return 0
+            mkdir "$lock_dir" 2>/dev/null || return 75
         else
-            return 0
+            return 75
         fi
     fi
-    printf '%s\n' "$$" > "$lock_dir/pid"
+    # 服务管理器和主进程可能同时发停止信号，清理期间忽略重复信号。
+    trap 'trap "" TERM INT; rm -f "$CFG/tg-user-bot.lock/pid"; rmdir "$CFG/tg-user-bot.lock" 2>/dev/null || true' EXIT
+    trap 'trap "" TERM INT; exit 143' TERM
+    trap 'trap "" TERM INT; exit 130' INT
+    printf '%s\n' "$BASHPID" > "$lock_dir/pid" || return 1
 
     local offset response update update_id
     offset=$(tg_get_config "user_bot_update_offset")
     [[ "$offset" =~ ^[0-9]+$ ]] || offset=0
     response=$(tg_bot_api_request "getUpdates" \
         --data-urlencode "offset=${offset}" \
+        --data-urlencode "timeout=${poll_timeout}" \
         --data-urlencode "limit=100" \
         --data-urlencode 'allowed_updates=["message"]') || {
-        rm -f "$lock_dir/pid" 2>/dev/null
-        rmdir "$lock_dir" 2>/dev/null || true
         return 1
     }
     if ! jq -e '.ok == true and (.result | type == "array")' >/dev/null 2>&1 <<< "$response"; then
-        rm -f "$lock_dir/pid" 2>/dev/null
-        rmdir "$lock_dir" 2>/dev/null || true
+        local api_code
+        api_code=$(jq -r '.error_code // 0' <<< "$response" 2>/dev/null)
+        [[ "$api_code" =~ ^[0-9]+$ ]] || api_code=0
+        echo "TG 消息读取失败 (API $api_code)；409 通常表示同一 Bot 被其他进程轮询" >&2
         return 1
     fi
 
-    local updates=()
+    local updates=() _TG_BATCH_SYNCED=false
     mapfile -t updates < <(jq -c '.result[]' <<< "$response")
     for update in "${updates[@]}"; do
         update_id=$(jq -r '.update_id // empty' <<< "$update")
         [[ "$update_id" =~ ^[0-9]+$ ]] || continue
-        tg_user_bot_handle_update "$update"
-        tg_set_config "user_bot_update_offset" "$((update_id + 1))"
+        # 回复失败不确认该消息，重试可能重复回复，但不会静默丢失命令。
+        local handled=0
+        tg_user_bot_handle_update "$update" || handled=$?
+        [[ "$handled" == 0 || "$handled" == 78 ]] || return 1
+        tg_set_config "user_bot_update_offset" "$((update_id + 1))" || return 1
     done
 
-    rm -f "$lock_dir/pid" 2>/dev/null
-    rmdir "$lock_dir" 2>/dev/null || true
     return 0
 }
 
+# 单次调用在子 Shell 中清理；常驻服务直接后台运行实现函数，避免多一层进程。
+tg_poll_user_bot() ( _tg_poll_user_bot "$@" )
+
+tg_run_user_bot() {
+    init_tg_config || return 1
+    local rc delay=2 poll_pid=""
+    # 服务停止时先等轮询进程执行清理，避免主进程先退出导致清理进程被杀。
+    trap '[[ -z "$poll_pid" ]] || { kill -TERM "$poll_pid" 2>/dev/null || true; wait "$poll_pid" 2>/dev/null || true; }; exit 143' TERM
+    trap '[[ -z "$poll_pid" ]] || { kill -TERM "$poll_pid" 2>/dev/null || true; wait "$poll_pid" 2>/dev/null || true; }; exit 130' INT
+    while [[ "$(tg_get_config user_bot_enabled)" == true ]]; do
+        rc=0
+        _tg_poll_user_bot 20 & poll_pid=$!
+        wait "$poll_pid" || rc=$?
+        poll_pid=""
+        case "$rc" in
+            0) delay=2; sleep 0.2 ;;
+            75) sleep 1 ;;
+            *)
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] TG 请求或处理失败，${delay} 秒后重试" >&2
+                sleep "$delay"
+                (( delay >= 30 )) || delay=$((delay * 2))
+                (( delay <= 30 )) || delay=30
+                ;;
+        esac
+    done
+    trap - TERM INT
+}
+
+tg_set_user_bot_enabled() (
+    local enabled="$1" id token backup
+    _tg_config_lock_acquire || return 1
+    trap '_tg_config_lock_release' EXIT
+    if [[ "$enabled" == false ]]; then
+        stop_tg_user_bot_service || { _err "停止机器人失败，保留启用状态"; return 1; }
+        tg_set_config user_bot_enabled false || { setup_tg_user_bot_service true; return 1; }
+        return 0
+    fi
+    [[ "$enabled" == true ]] || return 1
+    token=$(tg_get_user_bot_token)
+    id=$(tg_validate_user_bot "$token") || { _err "Bot 验证失败，请检查 Token、网络或 webhook 占用"; return 1; }
+    backup=$(mktemp "$CFG/.tg-enable-backup.XXXXXX") || return 1
+    cp -p "$TG_CONFIG_FILE" "$backup" || { rm -f "$backup"; return 1; }
+    if ! tg_save_user_bot_identity "$(tg_get_config user_bot_token)" "$id" ||
+       ! tg_set_config user_bot_enabled true || ! setup_tg_user_bot_service true; then
+        cp -p "$backup" "$TG_CONFIG_FILE" || { _err "恢复机器人配置失败: $backup"; return 1; }
+        rm -f "$backup"
+        return 1
+    fi
+    rm -f "$backup"
+    tg_bot_api_request setMyCommands --data-urlencode 'scope={"type":"all_private_chats"}' \
+        --data-urlencode 'commands=[{"command":"traffic","description":"查询个人流量"},{"command":"status","description":"查询账号状态"},{"command":"bind","description":"绑定代理账号"},{"command":"unbind","description":"解除绑定"},{"command":"help","description":"查看帮助"}]' >/dev/null 2>&1 || true
+)
+
 # 发送流量告警
 tg_send_quota_alert() {
-    local user="$1" proto="$2" used="$3" quota="$4" percent="$5" core="${6:-}"
-    local server_display=$(get_tg_server_display)
+    local user="$1" proto="$2" used="$3" quota="$4" percent="$5" core="${6:-}" rc=0
+    local server_display=""
+    [[ "$(tg_get_config enabled)" != true ]] || server_display=$(get_tg_server_display)
     
-    local message="⚠️ *流量告警*
+    local message="⚠️ 流量告警
+统计口径：用户净流量（上传＋下载）
 
 ${server_display}
 协议: ${proto}
@@ -2623,23 +2833,27 @@ ${server_display}
 配额: $(format_bytes $quota)
 使用率: ${percent}%"
     
-    tg_send_message "$message"
+    tg_send_message "$message" || rc=1
     if [[ -n "$core" ]]; then
         tg_send_bound_user_message "$core" "$proto" "$user" "⚠️ 流量提醒
 用户：${user}
 协议：$(get_protocol_name "$proto")
+统计口径：用户净流量（上传＋下载）
 已使用：$(format_bytes "$used")
 总配额：$(format_bytes "$quota")
-使用率：${percent}%"
+使用率：${percent}%" || rc=1
     fi
+    return "$rc"
 }
 
 # 发送超限通知
 tg_send_over_quota() {
-    local user="$1" proto="$2" used="$3" quota="$4" core="${5:-}"
-    local server_display=$(get_tg_server_display)
+    local user="$1" proto="$2" used="$3" quota="$4" core="${5:-}" rc=0
+    local server_display=""
+    [[ "$(tg_get_config enabled)" != true ]] || server_display=$(get_tg_server_display)
     
-    local message="🚫 *流量超限*
+    local message="🚫 流量超限
+统计口径：用户净流量（上传＋下载）
 
 ${server_display}
 协议: ${proto}
@@ -2649,15 +2863,34 @@ ${server_display}
 
 用户已被自动禁用"
     
-    tg_send_message "$message"
+    tg_send_message "$message" || rc=1
     if [[ -n "$core" ]]; then
         tg_send_bound_user_message "$core" "$proto" "$user" "🚫 流量已超限
 用户：${user}
 协议：$(get_protocol_name "$proto")
+统计口径：用户净流量（上传＋下载）
 已使用：$(format_bytes "$used")
 总配额：$(format_bytes "$quota")
-账号已自动禁用"
+账号已自动禁用" || rc=1
     fi
+    return "$rc"
+}
+
+# 统计 API 在用户停用后可能不再返回其计数；补发只读取保存的用量，不重启核心。
+_tg_retry_quota_notices() {
+    local core proto name used quota
+    while IFS='|' read -r core proto name used quota; do
+        [[ -n "$name" ]] || continue
+        if tg_send_over_quota "$name" "$proto" "$used" "$quota" "$core"; then
+            db_set_user_alert_state "$core" "$proto" "$name" quota_exceeded_notified true || return 1
+        else return 0; fi  # 网络异常时不连续重试全部用户。
+    done < <(jq -r '
+        ["xray","singbox"][] as $c | (.[$c] // {} | to_entries[]) as $p |
+        ($p.value | if type == "array" then .[] else . end) | (.users // [])[] |
+        select(.enabled == false and .disabled_reason == "quota" and .quota_exceeded_notified != true and
+               (.quota // 0) > 0 and (.used // 0) >= .quota) |
+        "\($c)|\($p.key)|\(.name)|\(.used)|\(.quota)"
+    ' "$DB_FILE")
 }
 
 # 发送每日流量报告
@@ -2666,9 +2899,10 @@ ${server_display}
 tg_send_daily_report() {
     local server_display=$(get_tg_server_display)
     
-    local report="📊 *每日流量报告*
+    local report="📊 每日流量报告
 ${server_display}
 时间: $(date '+%Y-%m-%d %H:%M')
+统计口径：用户净流量（上传＋下载）
 ━━━━━━━━━━━━━━━━━━━━"
     
     local total_users=0
@@ -2703,7 +2937,7 @@ ${server_display}
                 fi
                 
                 user_details+="
-${status_icon} *${name}* (${proto})
+${status_icon} ${name} (${proto})
    ${used_fmt} / ${quota_fmt}${percent_str}"
             done <<< "$stats"
         done
@@ -2717,7 +2951,7 @@ ${status_icon} *${name}* (${proto})
     # 如果有用户详情则显示
     if [[ -n "$user_details" ]]; then
         report+="
-*用户详情:*${user_details}"
+用户详情:${user_details}"
     fi
     
     # 添加已安装协议列表
@@ -2725,7 +2959,7 @@ ${status_icon} *${name}* (${proto})
     if [[ -n "$installed_protocols" ]]; then
         report+="
 ━━━━━━━━━━━━━━━━━━━━
-*已安装协议:*"
+已安装协议:"
         for proto in $installed_protocols; do
             local proto_name=$(get_protocol_name "$proto")
             report+="
@@ -2748,24 +2982,19 @@ check_daily_report() {
     report_hour=${report_hour:-9}     # 默认早上9点
     report_minute=${report_minute:-0}  # 默认0分
     
-    local current_hour=$(date '+%H' | sed 's/^0//')
-    local current_minute=$(date '+%M' | sed 's/^0//')
+    local current_hour=$(date '+%H')
+    local current_minute=$(date '+%M')
     local last_report_date=$(tg_get_config "last_report_date")
     local today=$(date '+%Y-%m-%d')
     
-    # 获取检测间隔（用于范围匹配）
-    local interval=$(get_traffic_interval)
-    interval=${interval:-5}
-    
-    # 范围匹配：当前小时等于报告小时，且当前分钟在 [报告分钟, 报告分钟+间隔) 范围内
-    # 这样即使 cron 不是精确在报告分钟运行，也能在下一个间隔内触发
-    if [[ "$current_hour" -eq "$report_hour" && 
-          "$current_minute" -ge "$report_minute" && 
-          "$current_minute" -lt "$((report_minute + interval))" && 
+    [[ "$report_hour" =~ ^[0-9]{1,2}$ && "$report_minute" =~ ^[0-9]{1,2}$ ]] || return 1
+    (( 10#$report_hour < 24 && 10#$report_minute < 60 )) || return 1
+    # 定点之后首次成功发送；停机、跨小时或网络失败后仍可在当天补发。
+    if [[ "$((10#$current_hour * 60 + 10#$current_minute))" -ge "$((10#$report_hour * 60 + 10#$report_minute))" &&
           "$last_report_date" != "$today" ]]; then
-        tg_send_daily_report
-        tg_set_config "last_report_date" "$today"
+        if tg_send_daily_report; then tg_set_config "last_report_date" "$today"; fi
     fi
+    return 0
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -3382,10 +3611,12 @@ _sync_all_user_traffic_unlocked() {
                     if [[ "$used" -ge "$quota" ]]; then
                         local exceeded_notified=$(db_get_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified")
                         if [[ "$exceeded_notified" != "true" ]]; then
-                            if [[ "$(db_get_user_field xray "$proto" "$user" enabled)" != true ]]; then continue; fi
-                            db_set_user_enabled "xray" "$proto" "$user" "false" quota || { rm -f "$tmp_stats"; mark_traffic_sync_result "quota_apply_error" "$updated"; return 1; }
-                            db_set_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified" "true"
-                            tg_send_over_quota "$user" "$proto" "$used" "$quota" "xray"
+                            if [[ "$(db_get_user_field xray "$proto" "$user" enabled)" == true ]]; then
+                                db_set_user_enabled "xray" "$proto" "$user" "false" quota || { rm -f "$tmp_stats"; mark_traffic_sync_result "quota_apply_error" "$updated"; return 1; }
+                            elif [[ "$(db_get_user_field xray "$proto" "$user" disabled_reason)" != quota ]]; then continue; fi
+                            if tg_send_over_quota "$user" "$proto" "$used" "$quota" "xray"; then
+                                db_set_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified" "true"
+                            fi
                         fi
                     elif [[ "$percent" -ge "$notify_percent" ]]; then
                         local last_alert=$(db_get_user_alert_state "xray" "$proto" "$user" "last_alert_percent")
@@ -3399,8 +3630,9 @@ _sync_all_user_traffic_unlocked() {
                             fi
                         done
                         if [[ "$should_alert" == "true" ]]; then
-                            tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent" "xray"
-                            db_set_user_alert_state "xray" "$proto" "$user" "last_alert_percent" "$current_threshold"
+                            if tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent" "xray"; then
+                                db_set_user_alert_state "xray" "$proto" "$user" "last_alert_percent" "$current_threshold"
+                            fi
                         fi
                     fi
                 fi
@@ -3436,10 +3668,12 @@ _sync_all_user_traffic_unlocked() {
                         if [[ "$used" -ge "$quota" ]]; then
                             local exceeded_notified=$(db_get_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified")
                             if [[ "$exceeded_notified" != "true" ]]; then
-                                if [[ "$(db_get_user_field singbox "$proto" "$user" enabled)" != true ]]; then continue; fi
-                                db_set_user_enabled "singbox" "$proto" "$user" "false" quota || { rm -f "$tmp_stats"; mark_traffic_sync_result "quota_apply_error" "$updated"; return 1; }
-                                db_set_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified" "true"
-                                tg_send_over_quota "$user" "$proto" "$used" "$quota" "singbox"
+                                if [[ "$(db_get_user_field singbox "$proto" "$user" enabled)" == true ]]; then
+                                    db_set_user_enabled "singbox" "$proto" "$user" "false" quota || { rm -f "$tmp_stats"; mark_traffic_sync_result "quota_apply_error" "$updated"; return 1; }
+                                elif [[ "$(db_get_user_field singbox "$proto" "$user" disabled_reason)" != quota ]]; then continue; fi
+                                if tg_send_over_quota "$user" "$proto" "$used" "$quota" "singbox"; then
+                                    db_set_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified" "true"
+                                fi
                             fi
                         elif [[ "$percent" -ge "$notify_percent" ]]; then
                             local last_alert=$(db_get_user_alert_state "singbox" "$proto" "$user" "last_alert_percent")
@@ -3453,8 +3687,9 @@ _sync_all_user_traffic_unlocked() {
                                 fi
                             done
                             if [[ "$should_alert" == "true" ]]; then
-                                tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent" "singbox"
-                                db_set_user_alert_state "singbox" "$proto" "$user" "last_alert_percent" "$current_threshold"
+                                if tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent" "singbox"; then
+                                    db_set_user_alert_state "singbox" "$proto" "$user" "last_alert_percent" "$current_threshold"
+                                fi
                             fi
                         fi
                     fi
@@ -3488,6 +3723,7 @@ sync_all_user_traffic() {
     for attempt in {1..10}; do
         if mkdir "$TRAFFIC_SYNC_LOCK_DIR" 2>/dev/null; then
             printf '%s\n' "$BASHPID" > "$TRAFFIC_SYNC_LOCK_DIR/pid"
+            _tg_retry_quota_notices || _log WARN "TG 超额提醒状态保存失败"
             _sync_all_user_traffic_unlocked "$reset"
             rc=$?
             rm -f "$TRAFFIC_SYNC_LOCK_DIR/pid" 2>/dev/null
@@ -3784,34 +4020,167 @@ remove_traffic_cron() {
     _ok "已移除流量统计定时任务"
 }
 
-setup_tg_user_bot_cron() {
-    local silent="${1:-false}"
-    local script_path="/usr/local/bin/vless-server.sh"
-    [[ -x "$script_path" ]] || script_path=$(readlink -f "$0")
-    local bash_path log_file cron_cmd
-    bash_path=$(get_bash_interpreter)
-    [[ -x "$script_path" ]] || { _err "脚本不存在或不可执行: $script_path"; return 1; }
-    [[ -n "$bash_path" ]] || { _err "未找到 bash，无法启动用户机器人"; return 1; }
-    log_file="$CFG/tg-user-bot.log"
-    cron_cmd="$(build_cron_command "* * * * *" "$script_path" "--tg-bot-poll" "$log_file") # tg-user-bot"
+_tg_user_bot_manager() {
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then echo systemd
+    elif command -v rc-service >/dev/null 2>&1 && command -v supervise-daemon >/dev/null 2>&1; then echo openrc
+    else _err "用户机器人常驻模式需要 systemd 或 OpenRC supervise-daemon"; return 1; fi
+}
 
-    if ! ensure_cron_service_running; then
-        [[ "$silent" == "true" ]] || _err "cron 服务未运行，机器人规则未更改"
+_tg_user_bot_service_file() {
+    if [[ "$1" == systemd ]]; then echo /etc/systemd/system/vless-tg-user-bot.service
+    else echo /etc/init.d/vless-tg-user-bot; fi
+}
+
+tg_user_bot_service_action() {
+    local action="$1" manager
+    manager=$(_tg_user_bot_manager) || return 1
+    if [[ "$manager" == systemd ]]; then
+        case "$action" in
+            active) systemctl is-active --quiet vless-tg-user-bot ;;
+            enabled) systemctl is-enabled --quiet vless-tg-user-bot ;;
+            reload) systemctl daemon-reload ;;
+            *) systemctl "$action" vless-tg-user-bot ;;
+        esac
+    else
+        case "$action" in
+            active) rc-service vless-tg-user-bot status ;;
+            enabled) [[ -e /etc/runlevels/default/vless-tg-user-bot ]] ;;
+            enable) rc-update add vless-tg-user-bot default ;;
+            disable) rc-update del vless-tg-user-bot default ;;
+            reload) return 0 ;;
+            *) rc-service vless-tg-user-bot "$action" ;;
+        esac
+    fi
+}
+
+_tg_write_user_bot_service() {
+    local manager="$1" output="$2" script_path="$3" bash_path="$4"
+    # 服务使用固定安装路径；拒绝控制字符及服务管理器的命令转义语法。
+    [[ "$script_path" =~ ^/[A-Za-z0-9_./-]+$ && "$bash_path" =~ ^/[A-Za-z0-9_./-]+$ ]] || return 1
+    if [[ "$manager" == systemd ]]; then
+        cat > "$output" <<EOF
+[Unit]
+Description=Surge Telegram user bot
+After=network-online.target
+Wants=network-online.target
+# Script version: $VERSION
+[Service]
+Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=$bash_path $script_path --tg-bot-run
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+KillMode=control-group
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+EOF
+        chmod 600 "$output"
+    else
+        cat > "$output" <<EOF
+#!/sbin/openrc-run
+# Script version: $VERSION
+description="Surge Telegram user bot"
+supervisor="supervise-daemon"
+command="$bash_path"
+command_args="$script_path --tg-bot-run"
+pidfile="/run/vless-tg-user-bot.pid"
+respawn_delay=5
+respawn_max=0
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+depend() { need net; }
+EOF
+        chmod 700 "$output" && sh -n "$output"
+    fi
+}
+
+setup_tg_user_bot_service() {
+    if [[ "${TASK_TG_BOT_SETUP_LOCK_OWNER:-}" != "$BASHPID" ]]; then
+        _with_named_lock tg_bot_setup setup_tg_user_bot_service "$@"; return $?
+    fi
+    local silent="${1:-false}" manager file staged backup running=false enabled=false changed=false failed=""
+    local script_path=/usr/local/bin/vless-server.sh bash_path
+    [[ -x "$script_path" ]] || script_path=$(readlink -f "$0")
+    bash_path=$(get_bash_interpreter)
+    [[ -x "$script_path" && -x "$bash_path" ]] || return 1
+    manager=$(_tg_user_bot_manager) || return 1
+    file=$(_tg_user_bot_service_file "$manager") || return 1
+    staged=$(mktemp "${file}.new.XXXXXX") || return 1
+    backup=$(mktemp "$CFG/.tg-service-backup.XXXXXX") || { rm -f "$staged"; return 1; }
+    _tg_write_user_bot_service "$manager" "$staged" "$script_path" "$bash_path" || { rm -f "$staged" "$backup"; return 1; }
+    tg_user_bot_service_action active >/dev/null 2>&1 && running=true
+    tg_user_bot_service_action enabled >/dev/null 2>&1 && enabled=true
+    if [[ -f "$file" ]]; then cp -p "$file" "$backup" || { rm -f "$staged" "$backup"; return 1; }; fi
+    if ! cmp -s "$staged" "$file"; then
+        if [[ "$running" == true ]]; then
+            tg_user_bot_service_action stop >/dev/null 2>&1 && ! tg_user_bot_service_action active >/dev/null 2>&1 || failed="停止旧机器人失败"
+        fi
+        if [[ -z "$failed" ]]; then
+            if mv "$staged" "$file"; then
+                changed=true
+                tg_user_bot_service_action reload >/dev/null 2>&1 || failed="服务文件更新失败"
+            else failed="服务文件更新失败"; fi
+        fi
+    fi
+    if [[ -z "$failed" ]]; then
+        tg_user_bot_service_action enable >/dev/null 2>&1 && tg_user_bot_service_action start >/dev/null 2>&1 || failed="机器人服务启动失败"
+    fi
+    if [[ -z "$failed" ]]; then
+        sleep 0.3
+        tg_user_bot_service_action active >/dev/null 2>&1 && tg_user_bot_service_action enabled >/dev/null 2>&1 || failed="机器人服务健康检查失败"
+    fi
+    # 新服务健康后才移除旧 cron；单实例请求锁阻止两种入口同时读取消息。
+    if [[ -z "$failed" ]]; then remove_cron_entry tg-user-bot || failed="旧机器人 cron 迁移失败"; fi
+    if [[ -n "$failed" ]]; then
+        tg_user_bot_service_action stop >/dev/null 2>&1 || _err "停止失败服务失败"
+        if [[ "$changed" == true ]]; then
+            if [[ -s "$backup" ]]; then cp -p "$backup" "$file" || _err "恢复服务文件失败: $backup"
+            else rm -f "$file"; fi
+            tg_user_bot_service_action reload >/dev/null 2>&1 || _err "恢复服务定义失败"
+        fi
+        if [[ "$enabled" == true ]]; then tg_user_bot_service_action enable >/dev/null 2>&1 || _err "恢复自启失败"
+        else tg_user_bot_service_action disable >/dev/null 2>&1 || _err "恢复禁用状态失败"; fi
+        [[ "$running" != true ]] || tg_user_bot_service_action start >/dev/null 2>&1 || _err "恢复原机器人服务失败"
+        rm -f "$staged"
+        _err "$failed；保留备份: $backup"
         return 1
     fi
-    if install_cron_entry "tg-user-bot" "$cron_cmd"; then
-        if [[ "$silent" != "true" ]]; then
-            _ok "用户机器人轮询已启用（最长约 1 分钟响应）"
-            echo -e "  ${D}日志: $log_file${NC}"
-        fi
-        return 0
+    rm -f "$staged" "$backup"
+    [[ "$silent" == true ]] || _ok "用户机器人常驻长轮询已启用"
+    return 0
+}
+
+# 保留旧辅助入口的名称，升级时迁移为常驻服务。
+setup_tg_user_bot_cron() {
+    setup_tg_user_bot_service "$@"
+}
+
+stop_tg_user_bot_service() {
+    if [[ "${TASK_TG_BOT_SETUP_LOCK_OWNER:-}" != "$BASHPID" ]]; then
+        _with_named_lock tg_bot_setup stop_tg_user_bot_service; return $?
     fi
-    _err "用户机器人定时任务写入失败"
-    return 1
+    local manager file running=false enabled=false failed=""
+    manager=$(_tg_user_bot_manager) || return 1
+    file=$(_tg_user_bot_service_file "$manager") || return 1
+    if [[ -f "$file" ]]; then
+        tg_user_bot_service_action active >/dev/null 2>&1 && running=true
+        tg_user_bot_service_action enabled >/dev/null 2>&1 && enabled=true
+        tg_user_bot_service_action stop >/dev/null 2>&1 && ! tg_user_bot_service_action active >/dev/null 2>&1 || failed="停止机器人失败"
+        if [[ -z "$failed" ]]; then tg_user_bot_service_action disable >/dev/null 2>&1 || failed="禁用机器人自启失败"; fi
+    fi
+    if [[ -z "$failed" ]]; then remove_cron_entry tg-user-bot || failed="移除旧机器人 cron 失败"; fi
+    if [[ -n "$failed" ]]; then
+        if [[ "$enabled" == true ]]; then tg_user_bot_service_action enable >/dev/null 2>&1 || _err "恢复机器人自启失败"; fi
+        if [[ "$running" == true ]]; then tg_user_bot_service_action start >/dev/null 2>&1 || _err "恢复机器人运行失败"; fi
+        _err "$failed，已尝试恢复原服务状态"
+        return 1
+    fi
+    return 0
 }
 
 remove_tg_user_bot_cron() {
-    remove_cron_entry "tg-user-bot"
+    stop_tg_user_bot_service
 }
 
 # 升级旧预览版后自动重写 cron 命令（补齐 PATH）并修复守护进程。
@@ -3822,7 +4191,7 @@ repair_scheduled_jobs() {
     fi
     if [[ "$(tg_get_config "user_bot_enabled")" == "true" ]]; then
         setup_tg_user_bot_cron "true" || \
-            _log "WARN" "TG 用户机器人定时任务自动修复失败"
+            _log "WARN" "TG 用户机器人常驻服务迁移/修复失败，保留原设置"
     fi
 }
 
@@ -22805,7 +23174,7 @@ do_uninstall() {
     force_cleanup
 
     # 清理脚本创建的定时任务，避免卸载后继续调用已删除的脚本。
-    remove_cron_entry "tg-user-bot"
+    stop_tg_user_bot_service || { _err "用户机器人停止失败，请排查后再继续卸载"; return 1; }
     remove_cron_entry "sync-traffic"
     remove_cron_entry "check-expire"
     
@@ -29646,24 +30015,25 @@ _regenerate_config() {
 # 选择可绑定 Telegram 的受管用户；只有数据库 users 数组中的账号可绑定。
 _select_tg_bind_user() {
     _select_protocol_for_users || return 1
-    local core="$SELECTED_CORE" proto="$SELECTED_PROTO" users user
+    local core="$SELECTED_CORE" proto="$SELECTED_PROTO" users user purpose="${1:-绑定用户}"
     users=$(db_list_users "$core" "$proto")
     [[ -n "$users" ]] || { _err "该协议没有可绑定用户"; return 1; }
 
     echo ""
     _line
-    echo -e "  ${W}选择绑定用户 - $(get_protocol_name "$proto")${NC}"
+    echo -e "  ${W}选择${purpose} - $(get_protocol_name "$proto")${NC}"
     _line
     local i=1 user_array=()
     while IFS= read -r user; do
         [[ -z "$user" ]] && continue
         [[ -n "$(db_get_user "$core" "$proto" "$user")" ]] || continue
-        local chat_id
+        local chat_id port
         chat_id=$(db_get_user_field "$core" "$proto" "$user" "telegram_chat_id")
+        port=$(db_get_users_stats "$core" "$proto" | awk -F'|' -v name="$user" '$1 == name {print $6; exit}')
         if [[ -n "$chat_id" ]]; then
-            _item "$i" "$user ${D}(已绑定: $chat_id)${NC}"
+            _item "$i" "$user ${D}(端口: ${port:-未知}，已绑定: $chat_id)${NC}"
         else
-            _item "$i" "$user ${D}(未绑定)${NC}"
+            _item "$i" "$user ${D}(端口: ${port:-未知}，未绑定)${NC}"
         fi
         user_array+=("$user")
         ((i++))
@@ -29766,29 +30136,30 @@ _tg_unbind_user() {
 _configure_tg_user_bot() {
     init_tg_config
     while true; do
-        local enabled bot_token bot_status cron_status binding_count
+        local enabled bot_token bot_status service_status binding_count token_status traffic_view
         enabled=$(tg_get_config "user_bot_enabled")
-        bot_token=$(tg_get_config "bot_token")
+        bot_token=$(tg_get_user_bot_token)
         bot_status="${R}○ 未启用${NC}"
         [[ "$enabled" == "true" ]] && bot_status="${G}● 已启用${NC}"
-        cron_status="${R}○ 未运行${NC}"
-        if tg_user_bot_cron_entry_exists; then
-            if cron_service_is_active; then
-                cron_status="${G}● 每分钟轮询${NC}"
-            else
-                cron_status="${Y}● 规则存在，但 cron 未运行${NC}"
-            fi
-        fi
+        service_status="${R}○ 未运行${NC}"
+        tg_user_bot_service_action active >/dev/null 2>&1 && service_status="${G}● 常驻长轮询${NC}"
+        token_status="${D}未配置${NC}"
+        if [[ -n "$(tg_get_config user_bot_token)" ]]; then token_status="${G}独立用户 Bot${NC}"
+        elif [[ -n "$bot_token" ]]; then token_status="${Y}复用管理员 Bot（兼容旧配置）${NC}"; fi
         binding_count=$(db_list_tg_user_bindings | awk 'NF{n++} END{print n+0}')
+        traffic_view="用户净流量"
+        [[ "$(tg_get_config user_bot_traffic_view)" != server_estimate ]] || traffic_view="服务器双向估算（净流量×2）"
 
         _header
         echo -e "  ${W}TG 用户查询机器人${NC}"
         _dline
         echo -e "  用户机器人: $bot_status"
-        echo -e "  轮询任务: $cron_status"
+        echo -e "  消息服务: $service_status"
         echo -e "  已绑定用户: ${G}$binding_count${NC}"
-        echo -e "  Bot Token: ${bot_token:+${G}复用管理员配置${NC}}${bot_token:-${D}未配置${NC}}"
-        [[ "$enabled" != "true" ]] && echo -e "  ${D}提示: 启用后使用 getUpdates 轮询，并移除该 Bot 的现有 webhook${NC}"
+        echo -e "  Bot 配置: $token_status"
+        echo -e "  默认查询口径: $traffic_view（可按用户设置）"
+        echo -e "  ${D}同一个用户 Bot 仅供一台服务器轮询；建议配置专用 Bot。${NC}"
+        echo -e "  ${D}不占用入站端口，无需域名或证书；保留现有 webhook。${NC}"
         _line
         if [[ "$enabled" == "true" ]]; then
             _item "1" "禁用用户机器人"
@@ -29798,42 +30169,29 @@ _configure_tg_user_bot() {
         _item "2" "为用户生成绑定码"
         _item "3" "查看绑定关系"
         _item "4" "解除用户绑定"
-        _item "5" "立即处理机器人消息"
+        _item "5" "重启机器人消息服务"
         _item "6" "查看机器人命令"
+        _item "7" "设置独立用户 Bot Token"
+        _item "8" "设置某个用户的单向/双向显示"
         _item "0" "返回"
         _line
 
-        local choice response bot_username
+        local choice new_token
         read -rp "  请选择: " choice
         case "$choice" in
             1)
                 if [[ "$enabled" == "true" ]]; then
-                    tg_set_config "user_bot_enabled" "false"
-                    remove_tg_user_bot_cron
-                    _ok "用户机器人已禁用；现有绑定关系已保留"
+                    if tg_set_user_bot_enabled false; then _ok "用户机器人已禁用；现有绑定关系已保留"; fi
                 else
                     if [[ -z "$bot_token" ]]; then
-                        _err "请先在上级 TG 通知配置中设置 Bot Token"
+                        _err "请先选择 7 设置用户 Bot Token，或在上级设置管理员 Bot Token"
                     else
-                        _info "验证 Telegram Bot Token..."
-                        response=$(tg_bot_api_request "getMe")
-                        if ! jq -e '.ok == true' >/dev/null 2>&1 <<< "$response"; then
-                            _err "Bot Token 验证失败"
-                        else
-                            bot_username=$(jq -r '.result.username // empty' <<< "$response")
-                            # getUpdates 与 webhook 不能同时使用；启用时切换到轮询模式。
-                            tg_bot_api_request "deleteWebhook" --data-urlencode "drop_pending_updates=false" >/dev/null 2>&1 || true
-                            tg_bot_api_request "setMyCommands" --data-urlencode 'commands=[{"command":"traffic","description":"查询个人流量"},{"command":"status","description":"查询账号状态"},{"command":"bind","description":"绑定代理账号"},{"command":"unbind","description":"解除绑定"},{"command":"help","description":"查看帮助"}]' >/dev/null 2>&1 || true
-                            tg_set_config "user_bot_enabled" "true"
-                            if setup_tg_user_bot_cron; then
-                                _ok "用户机器人已启用${bot_username:+: @${bot_username}}"
-                                if ! crontab -l 2>/dev/null | grep -q "sync-traffic"; then
-                                    _info "启用流量同步任务，供用户查询最新累计流量..."
-                                    setup_traffic_cron "$(get_traffic_interval)" || \
-                                        _warn "流量同步任务启用失败，机器人将显示数据库中的已有统计"
-                                fi
-                            else
-                                tg_set_config "user_bot_enabled" "false"
+                        if tg_set_user_bot_enabled true; then
+                            _ok "用户机器人已启用，收到消息后立即处理"
+                            if ! crontab -l 2>/dev/null | grep -q "sync-traffic"; then
+                                _info "启用流量同步任务，供用户查询最新累计流量..."
+                                setup_traffic_cron "$(get_traffic_interval)" || \
+                                    _warn "自动统计任务启用失败；/traffic 仍会尝试同步，失败时显示已保存用量"
                             fi
                         fi
                     fi
@@ -29846,14 +30204,46 @@ _configure_tg_user_bot() {
             5)
                 if [[ "$enabled" != "true" ]]; then
                     _err "请先启用用户机器人"
-                elif tg_poll_user_bot; then
-                    _ok "机器人消息处理完成"
+                elif tg_user_bot_service_action restart >/dev/null 2>&1 && tg_user_bot_service_action active >/dev/null 2>&1; then
+                    _ok "机器人消息服务已重启"
                 else
-                    _err "机器人消息处理失败，请检查 $CFG/tg-user-bot.log"
+                    _err "机器人服务重启失败；systemd 使用 journalctl -u vless-tg-user-bot 查看日志"
+                fi
+                _pause
+                ;;
+            7)
+                if [[ "$enabled" == true ]]; then
+                    _err "请先禁用用户机器人再更换 Token，避免处理中途切换账号"
+                else
+                    echo -e "  ${D}向 @BotFather 创建专用 Bot；直接回车沿用管理员 Token。${NC}"
+                    read -rsp "  用户 Bot Token: " new_token
+                    echo ""
+                    if tg_change_user_bot_token "$new_token"; then _ok "用户 Bot 配置已保存；现有绑定保留"
+                    else _err "Bot 验证或保存失败，原配置保留"; fi
                 fi
                 _pause
                 ;;
             6) echo ""; tg_user_bot_help_text; _pause ;;
+            8)
+                _select_tg_bind_user "查询口径的用户" || continue
+                echo "  用户: $TG_SELECTED_USER"
+                echo "  1) 单向显示：用户净流量（上传＋下载）"
+                echo "  2) 服务器双向估算（已用、配额、剩余均×2）"
+                echo "  3) 沿用默认显示口径"
+                echo "  显示换算不改变现有配额和停用逻辑；估算不等于官网账单。"
+                local view_choice view_value
+                read -rp "  请选择 [1/2/3，回车保留]: " view_choice
+                case "$view_choice" in
+                    1) view_value=net ;;
+                    2) view_value=server_estimate ;;
+                    3) view_value=default ;;
+                    '') continue ;;
+                    *) _err "无效选择"; _pause; continue ;;
+                esac
+                if db_set_user_tg_traffic_view "$TG_SELECTED_CORE" "$TG_SELECTED_PROTO" "$TG_SELECTED_USER" "$view_value"; then _ok "该用户的查询口径已保存，无需重启节点或 Bot"
+                else _err "保存失败，原口径保留"; fi
+                _pause
+                ;;
             0) return ;;
             *) _err "无效选择" ;;
         esac
@@ -29901,9 +30291,12 @@ _configure_tg_notify() {
         echo -e "  流量检测: $cron_status"
         echo -e "  每日报告: $daily_status"
         echo -e "  用户查询机器人: $user_bot_status"
-        echo -e "  Bot Token: ${bot_token:+${G}已配置${NC}}${bot_token:-${D}未配置${NC}}"
-        echo -e "  Chat ID: ${chat_id:+${G}$chat_id${NC}}${chat_id:-${D}未配置${NC}}"
-        echo -e "  服务器名: ${server_name:+${G}$server_name${NC}}${server_name:-${D}未设置${NC}}"
+        if [[ -n "$bot_token" ]]; then echo -e "  管理员 Bot Token: ${G}已配置${NC}"
+        else echo -e "  管理员 Bot Token: ${D}未配置${NC}"; fi
+        if [[ -n "$chat_id" ]]; then echo -e "  Chat ID: ${G}$chat_id${NC}"
+        else echo -e "  Chat ID: ${D}未配置${NC}"; fi
+        if [[ -n "$server_name" ]]; then echo -e "  服务器名: ${G}$server_name${NC}"
+        else echo -e "  服务器名: ${D}未设置${NC}"; fi
         _line
         
         _item "1" "设置 Bot Token"
@@ -29929,9 +30322,11 @@ _configure_tg_notify() {
                 read -rsp "  Bot Token: " new_token
                 echo ""
                 if [[ -n "$new_token" ]]; then
-                    tg_set_config "bot_token" "$new_token"
-                    bot_token="$new_token"
-                    _ok "Bot Token 已保存"
+                    if [[ "$user_bot_enabled" == true && -z "$(tg_get_config user_bot_token)" ]]; then
+                        _err "用户机器人正在复用此 Token，请先禁用用户机器人再修改"
+                    elif tg_set_config "bot_token" "$new_token"; then
+                        _ok "管理员 Bot Token 已保存"
+                    else _err "Token 保存失败"; fi
                 fi
                 _pause
                 ;;
@@ -31857,7 +32252,9 @@ _snell_sync_traffic() {
                 (( quota > 0 && used >= quota )) && stop_reason=quota
                 db_set_user_enabled xray "$proto" "$name" false "$stop_reason" || return 1
                 if (( quota > 0 && used >= quota )); then
-                    tg_send_over_quota "$name" "$proto" "$used" "$quota" xray
+                    if tg_send_over_quota "$name" "$proto" "$used" "$quota" xray; then
+                        db_set_user_alert_state xray "$proto" "$name" quota_exceeded_notified true
+                    fi
                 else
                     send_tg_expired_notice "$name" "$proto" "$expire" xray
                 fi
@@ -31869,8 +32266,15 @@ _snell_sync_traffic() {
                     if (( percent >= threshold && 10#$last_alert < threshold )); then current_threshold=$threshold; fi
                 done < <(_quota_alert_thresholds)
                 if (( current_threshold > 0 )); then
-                    tg_send_quota_alert "$name" "$proto" "$used" "$quota" "$((used * 100 / quota))" xray
-                    db_set_user_alert_state xray "$proto" "$name" last_alert_percent "$current_threshold"
+                    if tg_send_quota_alert "$name" "$proto" "$used" "$quota" "$((used * 100 / quota))" xray; then
+                        db_set_user_alert_state xray "$proto" "$name" last_alert_percent "$current_threshold"
+                    fi
+                fi
+            elif (( quota > 0 && used >= quota )) &&
+                [[ "$(jq -r '.users[0].disabled_reason // ""' <<< "$row")" == quota &&
+                   "$(jq -r '.users[0].quota_exceeded_notified // false' <<< "$row")" != true ]]; then
+                if tg_send_over_quota "$name" "$proto" "$used" "$quota" xray; then
+                    db_set_user_alert_state xray "$proto" "$name" quota_exceeded_notified true
                 fi
             fi
         done <<< "$(_snell_rows "$proto")"
@@ -32198,11 +32602,17 @@ case "${1:-}" in
         exit 0
         ;;
     --tg-bot-poll)
-        # 处理 Telegram 用户机器人消息（由 cron 每分钟调用）
+        # 单次处理入口，保留兼容；常驻服务使用 --tg-bot-run。
         check_root
         init_db
         init_tg_config
         tg_poll_user_bot
+        exit $?
+        ;;
+    --tg-bot-run)
+        check_root
+        init_db
+        tg_run_user_bot
         exit $?
         ;;
     --check-expire)
@@ -32238,7 +32648,8 @@ case "${1:-}" in
         echo "  --ensure-time-sync  启用并验证持续校时 (可选 VLESS_NTP_SERVERS)"
         echo "  --sync-traffic       同步流量数据到数据库 (用于定时任务)"
         echo "  --show-traffic       显示实时流量统计"
-        echo "  --tg-bot-poll        处理 Telegram 用户机器人消息 (用于定时任务)"
+        echo "  --tg-bot-poll        单次处理 Telegram 用户机器人消息"
+        echo "  --tg-bot-run         常驻处理 Telegram 用户机器人消息 (用于服务)"
         echo "  --check-expire       检查并禁用过期用户 (用于定时任务)"
         echo "  --setup-expire-cron  安装过期检查定时任务"
         echo "  --help, -h           显示帮助信息"

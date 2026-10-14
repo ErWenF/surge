@@ -59,6 +59,22 @@ def main(binary, singbox):
         def database():
             return json.loads((cfg / "db.json").read_text())
 
+        def check_tg_usage(core, protocol, name, used):
+            def fmt(value):
+                for unit, size in [('TiB', 1024**4), ('GiB', 1024**3), ('MiB', 1024**2), ('KiB', 1024)]:
+                    if value >= size:
+                        return f'{value / size:.2f} {unit}'
+                return f'{value} B'
+            before = database()[core][protocol][0]['users'][0]
+            for view, multiplier in [('net', 1), ('server_estimate', 2)]:
+                report = operation('tg-report', core, protocol, name, view).decode()
+                assert f'已使用：{fmt(used * multiplier)}' in report
+                if multiplier == 2:
+                    assert '服务器双向估算（净流量×2）' in report and '可能与官网账单不同' in report
+                after = database()[core][protocol][0]['users'][0]
+                assert after['used'] == before['used'] and after['quota'] == before['quota']
+            print(f'PASS {core} TG report: live user counters -> saved net usage -> 2x server estimate; quota/usage unchanged')
+
         data = {"xray": {"ss2022": [
             {"port": a, "password": master, "method": "2022-blake3-aes-128-gcm", "multi_user": True,
              "users": [{"name": "default-a", "uuid": user_a, "enabled": True, "used": 0, "quota": 0}]},
@@ -122,6 +138,7 @@ def main(binary, singbox):
             assert database()["xray"]["ss2022"][0]["users"][0]["used"] == first
             assert database()["xray"]["ss2022"][1]["users"][0]["used"] == 0
             print("PASS generated SS2022: TCP/UDP, positive uplink/downlink, exact sum, repeated sync and port isolation")
+            check_tg_usage('xray', 'ss2022', 'default-a', first)
 
             operation("disable", "default-a")
             traffic(a, user_a, False)
@@ -180,6 +197,7 @@ def main(binary, singbox):
                 operation("sync")
                 assert database()["singbox"]["trojan"][0]["users"][0]["used"] == used
                 print("PASS real Sing-box gRPC: positive uplink/downlink, exact per-port sum and idempotent cumulative sync")
+                check_tg_usage('singbox', 'trojan', f'default-{trojan_a}', used)
             operation("singbox-disable", f"default-{trojan_a}")
             traffic(trojan_a, "native-a", False, protocol="trojan")
             traffic(trojan_b, "native-b", protocol="trojan")

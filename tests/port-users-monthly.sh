@@ -159,6 +159,7 @@ cmp "$CFG/config.json" "$fixture/before-reset-fail-config"
 _ensure_singbox_default_users() { :; }
 _snell_sync_traffic() { :; }
 check_daily_report() { :; }
+tg_send_over_quota() { :; }
 _snell_any_managed() { return 1; }
 _pgrep() { [[ "$1" == xray ]]; }
 xray() { printf '%s\n' '{"stat":[{"name":"user>>>alice@trojan>>>traffic>>>uplink","value":7}]}'; }

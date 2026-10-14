@@ -41,12 +41,12 @@ setup_traffic_cron 5 true
 [[ -f "$fixture/entry" ]]
 [[ $(cat "$TRAFFIC_INTERVAL_FILE") == 5 ]]
 rm "$fixture/entry" "$fixture/active"
-cron() { return 1; }
+setup_tg_user_bot_service() { return 1; }
 if setup_tg_user_bot_cron true; then exit 1; fi
 [[ ! -f "$fixture/entry" ]]
-cron() { touch "$fixture/active"; }
+setup_tg_user_bot_service() { [[ "$1" == true ]] && touch "$fixture/bot-service"; }
 setup_tg_user_bot_cron true
-[[ -f "$fixture/entry" ]]
+[[ -f "$fixture/bot-service" && ! -f "$fixture/entry" ]]
 echo 'PASS direct cron fallback and no half-enabled scheduled jobs'
 
 install_cron_entry() { return 1; }

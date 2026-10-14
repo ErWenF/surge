@@ -52,6 +52,7 @@ generate_xray_config() {
 }
 check_daily_report() { :; }
 get_traffic_monthly_reset_enabled() { echo false; }
+native_tg_get_config=$(declare -f tg_get_config)
 tg_get_config() { [[ "$1" != notify_quota_percent ]] || echo 80; return 0; }
 case "${1:-}" in
     start) _start_core_service vless-reality xray ss2022 generate_xray_config ;;
@@ -68,5 +69,13 @@ case "${1:-}" in
     singbox-enable) db_set_user_enabled singbox trojan "$2" true ;;
     singbox-route) apply_port_routing_change singbox trojan "$2" "$3" ;;
     singbox-stats) singbox_api_query 'user>>>' false ;;
+    tg-report)
+        eval "$native_tg_get_config"
+        init_tg_config
+        db_set_user_tg_traffic_view "$2" "$3" "$4" "$5"
+        chat=123; [[ "$2" != singbox ]] || chat=456
+        db_set_user_tg_binding "$2" "$3" "$4" "$chat" fixture fixture
+        tg_get_user_report_by_chat "$chat"
+        ;;
     *) exit 2 ;;
 esac

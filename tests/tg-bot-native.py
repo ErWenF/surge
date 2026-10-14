@@ -142,10 +142,10 @@ def exercise(label, main_pid):
     wait_until(lambda: json.loads(config.read_text())['user_bot_update_offset'] == 105)
     assert 'alice' in replies[1][1] and 'bob' not in replies[1][1], replies[1]
     assert 'bob' in replies[2][1] and 'alice' not in replies[2][1], replies[2]
-    assert '服务器双向估算（净流量×2）' in replies[1][1]
+    assert '总配额：1.95 KiB' in replies[1][1] and '剩余流量：1.76 KiB' in replies[1][1]
     assert '已使用：200 B' in replies[1][1] and '已使用：200 B' in replies[2][1]
-    assert '单向显示：用户净流量' in replies[2][1]
-    assert all('说明：' not in text and '估算不含' not in text for _, text, _ in replies)
+    assert '总配额：1000 B' in replies[2][1] and '剩余流量：800 B' in replies[2][1]
+    assert all('统计口径' not in text and '说明：' not in text and '估算不含' not in text for _, text, _ in replies)
     assert '尚未绑定' in replies[3][1]
     assert (work / 'sync').read_text().splitlines() == ['synced']
     fail_send = True

@@ -159,7 +159,7 @@ tg_set_config user_bot_traffic_view server_estimate
 tg_get_user_report_by_chat 123 > "$fixture/report"
 grep -q alice "$fixture/report"
 ! grep -q bob "$fixture/report"
-grep -q '服务器双向估算（净流量×2）' "$fixture/report"
+! grep -q '统计口径' "$fixture/report"
 grep -q '已使用：200 B' "$fixture/report"
 grep -q '总配额：1.95 KiB' "$fixture/report"
 grep -q '剩余流量：1.76 KiB' "$fixture/report"
@@ -168,7 +168,7 @@ grep -q '使用率：10%' "$fixture/report"
 cp "$DB_FILE" "$fixture/before-display-change"
 tg_set_config user_bot_traffic_view net
 tg_get_user_report_by_chat 123 > "$fixture/net-report"
-grep -q '用户净流量（上传＋下载）' "$fixture/net-report"
+! grep -q '统计口径' "$fixture/net-report"
 grep -q '已使用：100 B' "$fixture/net-report"
 grep -q '总配额：1000 B' "$fixture/net-report"
 grep -q '剩余流量：900 B' "$fixture/net-report"
@@ -201,7 +201,7 @@ echo 'PASS independent per-user display flags, default inheritance, single/multi
 cp "$DB_FILE" "$fixture/before-user-command"
 tg_user_bot_handle_update '{"message":{"chat":{"id":123,"type":"private"},"text":"/setview net"}}'
 cmp "$DB_FILE" "$fixture/before-user-command"
-tg_get_user_report_by_chat 123 | grep -q '服务器双向估算'
+tg_get_user_report_by_chat 123 | grep -q '已使用：200 B'
 echo 'PASS user bot cannot change an administrator-selected traffic display policy'
 
 cp "$DB_FILE" "$fixture/before-status-report"

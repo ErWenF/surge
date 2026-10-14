@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.16"
+readonly VERSION="3.7.17"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -2575,12 +2575,11 @@ EOF
     [[ "$used" =~ ^[0-9]+$ ]] || used=0
     [[ "$quota" =~ ^[0-9]+$ ]] || quota=0
 
-    local multiplier=1 traffic_scope="单向显示：用户净流量（上传＋下载）" view
+    local multiplier=1 view
     view=$(db_get_user_field "$core" "$proto" "$name" telegram_traffic_view)
     case "$view" in net|server_estimate) ;; *) view=$(tg_get_config user_bot_traffic_view) ;; esac
     if [[ "$view" == server_estimate ]]; then
         multiplier=2
-        traffic_scope="服务器双向估算（净流量×2）"
     fi
     local quota_text="无限制" remaining_text="无限制" percent_text="--"
     if [[ "$quota" =~ ^[0-9]+$ && "$quota" -gt 0 ]]; then
@@ -2597,7 +2596,6 @@ EOF
 用户：${name}
 协议：${proto_name}
 端口：${port:-未知}
-统计口径：${traffic_scope}
 已使用：$(_tg_format_usage_bytes "$((used * multiplier))")
 总配额：${quota_text}
 剩余流量：${remaining_text}

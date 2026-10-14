@@ -69,9 +69,7 @@ def main(binary, singbox):
             for view, multiplier in [('net', 1), ('server_estimate', 2)]:
                 report = operation('tg-report', core, protocol, name, view).decode()
                 assert f'已使用：{fmt(used * multiplier)}' in report
-                if multiplier == 2:
-                    assert '服务器双向估算（净流量×2）' in report
-                assert '说明：' not in report and '估算不含' not in report
+                assert '统计口径' not in report and '说明：' not in report and '估算不含' not in report
                 after = database()[core][protocol][0]['users'][0]
                 assert after['used'] == before['used'] and after['quota'] == before['quota']
             print(f'PASS {core} TG report: live user counters -> saved net usage -> 2x server estimate; quota/usage unchanged')

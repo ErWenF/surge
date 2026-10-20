@@ -16,7 +16,7 @@ for fn in _ss2022_key_len _ss2022_valid_key _ss2022_share_password gen_xray_ss20
     ensure_flock _flock_ticks flock_wait flock_unlock \
     _db_lock_acquire _db_lock_release _with_db_lock _restore_db_backup \
     _traffic_snapshot _xray_traffic_counters _commit_traffic_snapshots \
-    _user_management_supported _user_change_begin _user_change_apply db_add_user db_del_user \
+    _user_management_supported _user_change_begin _user_change_apply _quota_gb_bytes _valid_expire_date _prepare_user_expiry db_add_user db_del_user \
     db_set_user_enabled db_get_user db_get_user_field db_get_user_alert_state db_set_user_alert_state db_get_users_stats db_list_users \
     gen_xray_vless_clients gen_xray_vmess_clients gen_xray_trojan_clients \
     _traffic_reset_plan _reset_scheduled_user_traffic check_user_traffic_cycles reset_monthly_user_traffic check_monthly_traffic_reset \

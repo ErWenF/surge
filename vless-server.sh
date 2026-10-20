@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.18"
+readonly VERSION="3.7.19"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -1144,6 +1144,10 @@ db_add_user() {
     local reset_days="${10:-0}" cycle='{}'
     [[ "$reset_days" == 0 || "$reset_days" == 30 ]] || return 1
     [[ ! -f "$DB_FILE" ]] && return 1
+    local quota
+    quota=$(_quota_gb_bytes "$quota_gb") || return 1
+    [[ "$expire_date" != never ]] || expire_date=''
+    _valid_expire_date "$expire_date" || { _err "到期日期无效"; return 1; }
     [[ "$name" != default && "$name" != default-* ]] || { _err "default 为系统保留用户名"; return 1; }
     
     # 检查协议是否存在
@@ -1220,11 +1224,8 @@ db_add_user() {
         return 1
     fi
     
-    # 计算配额(字节)
-    local quota=0
-    if [[ "$quota_gb" -gt 0 ]]; then
-        quota=$((quota_gb * 1073741824))  # GB to bytes
-    fi
+    # Prepare expiry enforcement before changing users or the running core.
+    _prepare_user_expiry "$expire_date" || return 1
     
     local created=$(date '+%Y-%m-%d')
     if [[ "$reset_days" == 30 ]]; then
@@ -1273,8 +1274,6 @@ db_add_user() {
     ' || return 1
     fi
     _user_change_apply "$core" "$backup" || return 1
-    # 如果设置了到期日期，自动安装过期检查 cron
-    [[ -n "$expire_date" ]] && ensure_expire_check_cron 2>/dev/null
     return 0
 }
 
@@ -1615,7 +1614,25 @@ db_reset_user_traffic() {
     else
         _flush_core_traffic "$1" || return 1
     fi
-    db_set_user_traffic "$1" "$2" "$3" 0
+    _db_apply --arg c "$1" --arg p "$2" --arg n "$3" '
+        def reset_user: if .name == $n then
+            .used = 0 | del(.last_alert_percent, .quota_exceeded_notified) else . end;
+        if (.[$c][$p] | type) == "array" then
+            .[$c][$p] |= map(.users |= ((. // []) | map(reset_user)))
+        else .[$c][$p].users |= ((. // []) | map(reset_user)) end'
+}
+
+# Keep byte counts within jq IEEE-754's exact integer range; parse GB as decimal.
+_quota_gb_bytes() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+$ ]] || { _err "配额必须为非负整数"; return 1; }
+    value=${value#"${value%%[!0]*}"}
+    value=${value:-0}
+    if (( ${#value} > 7 )) || (( 10#$value > 8388607 )); then
+        _err "配额不能超过 8388607 GB"
+        return 1
+    fi
+    printf '%s\n' "$((10#$value * 1073741824))"
 }
 
 # 设置用户配额 (支持多端口数组格式)
@@ -1624,10 +1641,8 @@ db_set_user_quota() {
     local core="$1" proto="$2" name="$3" quota_gb="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local quota=0
-    if [[ "$quota_gb" -gt 0 ]]; then
-        quota=$((quota_gb * 1073741824))
-    fi
+    local quota
+    quota=$(_quota_gb_bytes "$quota_gb") || return 1
     
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --argjson q "$quota" '
         .[$c][$p] as $cfg |
@@ -1821,12 +1836,49 @@ _format_user_routing() {
 # 设置用户到期日期 (支持多端口数组格式)
 # 用法: db_set_user_expire_date "xray" "vless" "用户名" "2026-02-28"
 # 空字符串或 "never" 表示永不过期
+_valid_expire_date() {
+    [[ -z "$1" ]] && return 0
+    [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && "${1:0:4}" != 0000 ]] || return 1
+    jq -en --arg day "$1" '
+        try (($day + "T00:00:00Z" | fromdateiso8601 | strftime("%Y-%m-%d")) == $day) catch false
+    ' >/dev/null 2>&1
+}
+
+# Normalize the legacy cron result: 0=existing, 1=installed, 2=failure.
+_prepare_user_expiry() {
+    [[ -n "$1" ]] || return 0
+    local rc=0
+    ensure_expire_check_cron || rc=$?
+    if [[ "$rc" != 0 && "$rc" != 1 ]]; then
+        _err "过期检查任务准备失败，未保存新的到期设置"
+        return 1
+    fi
+    return 0
+}
+
+# Convert relative days without silently turning a failed conversion into unlimited.
+_parse_expire_input() {
+    local value="$1" day
+    if [[ -z "$value" || "$value" == never ]]; then return 0; fi
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        value=${value#"${value%%[!0]*}"}; value=${value:-0}
+        (( ${#value} <= 7 )) && (( 10#$value <= 3650000 )) || return 1
+        day=$(date -d "+$value days" '+%Y-%m-%d' 2>/dev/null) ||
+            day=$(date -v+"${value}"d '+%Y-%m-%d' 2>/dev/null) || return 1
+    else day="$value"; fi
+    [[ -n "$day" ]] && _valid_expire_date "$day" || return 1
+    printf '%s\n' "$day"
+}
+
 db_set_user_expire_date() {
+    if [[ "${DB_LOCK_OWNER:-}" != "$BASHPID" ]]; then _with_db_lock db_set_user_expire_date "$@"; return $?; fi
     local core="$1" proto="$2" name="$3" expire_date="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     
     # 处理特殊值
     [[ "$expire_date" == "never" ]] && expire_date=""
+    _valid_expire_date "$expire_date" || { _err "到期日期无效"; return 1; }
+    _prepare_user_expiry "$expire_date" || return 1
     
     _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" --arg e "$expire_date" '
         .[$c][$p] as $cfg |
@@ -1837,8 +1889,7 @@ db_set_user_expire_date() {
         end
     ' || return 1
     
-    # 如果设置了到期日期，自动安装过期检查 cron
-    [[ -n "$expire_date" ]] && ensure_expire_check_cron 2>/dev/null
+    return 0
 }
 
 # 获取用户到期日期
@@ -2116,6 +2167,7 @@ install_expire_check_cron() {
 # 确保过期检查 cron 已安装（设置到期日期时自动调用）
 # 返回: 0=已存在, 1=新安装成功, 2=安装失败
 ensure_expire_check_cron() {
+    ensure_cron_service_running || { _err "cron 服务未运行，无法保证到期检查"; return 2; }
     local script_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
     local cron_cmd="$(build_cron_command "0 3 * * *" "$script_path" "--check-expire --notify" "$CFG/expire.log") # check-expire"
     
@@ -2726,21 +2778,33 @@ _tg_poll_user_bot() {
     local poll_timeout="${1:-0}"
     [[ "$poll_timeout" == 0 || "$poll_timeout" == 20 ]] || return 1
 
-    local lock_dir="$CFG/tg-user-bot.lock" owner
+    # The persistent kernel lock is released even after SIGKILL. Never unlink it:
+    # replacing its inode would allow two pollers to hold different locks.
+    local poll_fd lock_dir="$CFG/tg-user-bot.lock" owner modified now
+    ensure_flock || { _err "用户机器人需要 flock"; return 1; }
+    exec {poll_fd}>"$CFG/.tg-user-bot.poll.lock" || return 1
+    flock_wait 0 "$poll_fd" || return 75
     if ! mkdir "$lock_dir" 2>/dev/null; then
         owner=$(cat "$lock_dir/pid" 2>/dev/null || true)
-        if [[ -n "$owner" && "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
-            rm -f "$lock_dir/pid" 2>/dev/null
-            rmdir "$lock_dir" 2>/dev/null || true
-            mkdir "$lock_dir" 2>/dev/null || return 75
+        if [[ -f "$lock_dir/kernel" ]]; then
+            : # Acquiring the same kernel lock proves this newer owner is gone (even after PID reuse).
+        elif [[ "$owner" =~ ^[0-9]+$ ]]; then
+            kill -0 "$owner" 2>/dev/null && return 75
         else
-            return 75
+            # Allow an older script time to finish creating its PID file.
+            modified=$(stat -c %Y "$lock_dir" 2>/dev/null) || return 75
+            now=$(date +%s)
+            (( now - modified >= 5 )) || return 75
         fi
+        rm -f "$lock_dir/pid" "$lock_dir/kernel" 2>/dev/null || return 1
+        rmdir "$lock_dir" 2>/dev/null || return 75
+        mkdir "$lock_dir" 2>/dev/null || return 75
     fi
     # 服务管理器和主进程可能同时发停止信号，清理期间忽略重复信号。
-    trap 'trap "" TERM INT; rm -f "$CFG/tg-user-bot.lock/pid"; rmdir "$CFG/tg-user-bot.lock" 2>/dev/null || true' EXIT
+    trap 'trap "" TERM INT; rm -f "$CFG/tg-user-bot.lock/pid" "$CFG/tg-user-bot.lock/kernel"; rmdir "$CFG/tg-user-bot.lock" 2>/dev/null || true' EXIT
     trap 'trap "" TERM INT; exit 143' TERM
     trap 'trap "" TERM INT; exit 130' INT
+    : > "$lock_dir/kernel" || return 1
     printf '%s\n' "$BASHPID" > "$lock_dir/pid" || return 1
 
     local offset response update update_id
@@ -3622,10 +3686,11 @@ _sync_all_user_traffic_unlocked() {
                     local percent=$((used * 100 / quota))
                     if [[ "$used" -ge "$quota" ]]; then
                         local exceeded_notified=$(db_get_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified")
+                        # Notification delivery must never gate quota enforcement.
+                        if [[ "$(db_get_user_field xray "$proto" "$user" enabled)" == true ]]; then
+                            db_set_user_enabled "xray" "$proto" "$user" "false" quota || { rm -f "$tmp_stats"; mark_traffic_sync_result "quota_apply_error" "$updated"; return 1; }
+                        elif [[ "$(db_get_user_field xray "$proto" "$user" disabled_reason)" != quota ]]; then continue; fi
                         if [[ "$exceeded_notified" != "true" ]]; then
-                            if [[ "$(db_get_user_field xray "$proto" "$user" enabled)" == true ]]; then
-                                db_set_user_enabled "xray" "$proto" "$user" "false" quota || { rm -f "$tmp_stats"; mark_traffic_sync_result "quota_apply_error" "$updated"; return 1; }
-                            elif [[ "$(db_get_user_field xray "$proto" "$user" disabled_reason)" != quota ]]; then continue; fi
                             if tg_send_over_quota "$user" "$proto" "$used" "$quota" "xray"; then
                                 db_set_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified" "true"
                             fi
@@ -3679,10 +3744,10 @@ _sync_all_user_traffic_unlocked() {
                         local percent=$((used * 100 / quota))
                         if [[ "$used" -ge "$quota" ]]; then
                             local exceeded_notified=$(db_get_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified")
+                            if [[ "$(db_get_user_field singbox "$proto" "$user" enabled)" == true ]]; then
+                                db_set_user_enabled "singbox" "$proto" "$user" "false" quota || { rm -f "$tmp_stats"; mark_traffic_sync_result "quota_apply_error" "$updated"; return 1; }
+                            elif [[ "$(db_get_user_field singbox "$proto" "$user" disabled_reason)" != quota ]]; then continue; fi
                             if [[ "$exceeded_notified" != "true" ]]; then
-                                if [[ "$(db_get_user_field singbox "$proto" "$user" enabled)" == true ]]; then
-                                    db_set_user_enabled "singbox" "$proto" "$user" "false" quota || { rm -f "$tmp_stats"; mark_traffic_sync_result "quota_apply_error" "$updated"; return 1; }
-                                elif [[ "$(db_get_user_field singbox "$proto" "$user" disabled_reason)" != quota ]]; then continue; fi
                                 if tg_send_over_quota "$user" "$proto" "$used" "$quota" "singbox"; then
                                     db_set_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified" "true"
                                 fi
@@ -23124,53 +23189,38 @@ do_uninstall() {
         cleaned_items+=("fake-web服务")
     fi
     
-    # 清理所有脚本生成的 Nginx 配置
-    local nginx_cleaned=false
-    
-    # 删除 sites-available/enabled 配置 (包括 vless-* 和 xhttp-cdn)
+    # Nginx may also serve inline/custom/default sites; preserve its service state.
+    local nginx_files=() nginx_backup='' nginx_running=false nginx_failed=false cfg idx
     for cfg in /etc/nginx/sites-enabled/vless-* /etc/nginx/sites-available/vless-* \
-               /etc/nginx/sites-enabled/xhttp-cdn /etc/nginx/sites-available/xhttp-cdn; do
-        [[ -f "$cfg" || -L "$cfg" ]] && { rm -f "$cfg"; nginx_cleaned=true; }
+               /etc/nginx/sites-enabled/xhttp-cdn /etc/nginx/sites-available/xhttp-cdn \
+               /etc/nginx/conf.d/vless-*.conf /etc/nginx/conf.d/xhttp-cdn.conf \
+               /etc/nginx/http.d/vless-*.conf /etc/nginx/http.d/xhttp-cdn.conf; do
+        [[ ! -f "$cfg" && ! -L "$cfg" ]] || nginx_files+=("$cfg")
     done
-    
-    # 删除 conf.d 配置 (Debian/Ubuntu/CentOS)
-    for cfg in /etc/nginx/conf.d/vless-*.conf /etc/nginx/conf.d/xhttp-cdn.conf; do
-        [[ -f "$cfg" ]] && { rm -f "$cfg"; nginx_cleaned=true; }
-    done
-    
-    # 删除 http.d 配置 (Alpine)
-    for cfg in /etc/nginx/http.d/vless-*.conf /etc/nginx/http.d/xhttp-cdn.conf; do
-        [[ -f "$cfg" ]] && { rm -f "$cfg"; nginx_cleaned=true; }
-    done
-    
-    # 检查是否还有其他站点使用 Nginx
-    local nginx_has_other_sites=false
-    if command -v nginx &>/dev/null; then
-        # 检查是否有非默认的用户配置
-        local other_configs=$(find /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/nginx/http.d \
-            -type f -o -type l 2>/dev/null | grep -v default | wc -l)
-        [[ "$other_configs" -gt 0 ]] && nginx_has_other_sites=true
-    fi
-    
-    # 如果清理了配置
-    if [[ "$nginx_cleaned" == "true" ]]; then
-        if [[ "$nginx_has_other_sites" == "true" ]]; then
-            # 还有其他站点，仅重载
-            if nginx -t 2>/dev/null; then
-                svc reload nginx 2>/dev/null || svc restart nginx 2>/dev/null
-                cleaned_items+=("Nginx配置")
-            fi
-        else
-            # 没有其他站点，停止并禁用 Nginx
-            _info "停止 Nginx 服务..."
-            svc stop nginx 2>/dev/null
-            if [[ "$DISTRO" == "alpine" ]]; then
-                rc-update del nginx default 2>/dev/null
-            else
-                systemctl disable nginx 2>/dev/null
-            fi
-            cleaned_items+=("Nginx服务")
+    if (( ${#nginx_files[@]} > 0 )); then
+        nginx_backup=$(mktemp -d "$CFG/.nginx-uninstall.XXXXXX") || return 1
+        for idx in "${!nginx_files[@]}"; do
+            cp -a "${nginx_files[$idx]}" "$nginx_backup/$idx" || { _err "Nginx 配置备份失败，未清理"; return 1; }
+        done
+        svc status nginx >/dev/null 2>&1 && nginx_running=true
+        for cfg in "${nginx_files[@]}"; do rm -f "$cfg" || { nginx_failed=true; break; }; done
+        if [[ "$nginx_failed" == false ]] && command -v nginx >/dev/null 2>&1; then
+            nginx -t 2>/dev/null || nginx_failed=true
         fi
+        if [[ "$nginx_failed" == false && "$nginx_running" == true ]]; then
+            svc reload nginx 2>/dev/null && svc status nginx >/dev/null 2>&1 || nginx_failed=true
+        fi
+        if [[ "$nginx_failed" == true ]]; then
+            for idx in "${!nginx_files[@]}"; do
+                cp -a "$nginx_backup/$idx" "${nginx_files[$idx]}" || _err "Nginx 配置恢复失败: ${nginx_files[$idx]}"
+            done
+            if [[ "$nginx_running" == true ]]; then
+                svc reload nginx 2>/dev/null || _err "Nginx 原配置重载失败，请检查服务"
+            fi
+            _err "Nginx 配置清理失败，已尝试恢复；备份: $nginx_backup"
+            return 1
+        fi
+        cleaned_items+=("Nginx配置")
     fi
     
     # 显示清理结果
@@ -29574,7 +29624,7 @@ _add_user() {
     while true; do
         read -rp "  配额 [0]: " quota_gb
         quota_gb="${quota_gb:-0}"
-        [[ "$quota_gb" =~ ^[0-9]+$ ]] && break
+        _quota_gb_bytes "$quota_gb" >/dev/null && break
         _err "请输入有效数字"
     done
     
@@ -29584,23 +29634,8 @@ _add_user() {
     local expire_date=""
     local expire_display="永不过期"
     read -rp "  到期 [永不过期]: " expire_input
-    if [[ -n "$expire_input" ]]; then
-        if [[ "$expire_input" =~ ^[0-9]+$ ]]; then
-            # 输入的是天数
-            expire_date=$(date -d "+${expire_input} days" '+%Y-%m-%d' 2>/dev/null)
-            if [[ -z "$expire_date" ]]; then
-                # macOS 兼容
-                expire_date=$(date -v+${expire_input}d '+%Y-%m-%d' 2>/dev/null)
-            fi
-            expire_display="$expire_date (${expire_input}天后)"
-        elif [[ "$expire_input" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-            # 输入的是日期
-            expire_date="$expire_input"
-            expire_display="$expire_date"
-        else
-            _warn "无效日期格式，将设置为永不过期"
-        fi
-    fi
+    expire_date=$(_parse_expire_input "$expire_input") || { _err "无效到期日期，未添加用户"; return 1; }
+    [[ -z "$expire_date" ]] || expire_display="$expire_date"
     
     # 选择路由 (可选)
     local user_routing=""
@@ -29738,13 +29773,13 @@ _set_user_quota() {
             local quota_gb
             while true; do
                 read -rp "  新配额: " quota_gb
-                [[ "$quota_gb" =~ ^[0-9]+$ ]] && break
+                _quota_gb_bytes "$quota_gb" >/dev/null && break
                 _err "请输入有效数字"
             done
             
             if db_set_user_quota "$core" "$proto" "$name" "$quota_gb"; then
                 local quota_fmt="无限制"
-                [[ "$quota_gb" -gt 0 ]] && quota_fmt="${quota_gb} GB"
+                [[ $(_quota_gb_bytes "$quota_gb") == 0 ]] || quota_fmt="${quota_gb} GB"
                 _ok "用户 $name 配额已设置为 $quota_fmt"
             else
                 _err "设置失败"
@@ -29853,9 +29888,10 @@ _reset_user_traffic() {
             [[ ! "$confirm" =~ ^[yY]$ ]] && return
             
             for user in $users; do
-                db_reset_user_traffic "$core" "$proto" "$user"
+                db_reset_user_traffic "$core" "$proto" "$user" || { _err "用户 $user 重置失败，请检查后重试"; return 1; }
             done
             _ok "所有用户流量已重置"
+            _info "账号启停状态保持不变，停用账号需单独启用"
             return
         fi
         
@@ -29867,6 +29903,7 @@ _reset_user_traffic() {
             
             if db_reset_user_traffic "$core" "$proto" "$name"; then
                 _ok "用户 $name 流量已重置"
+                [[ "$(db_get_user_field "$core" "$proto" "$name" enabled)" == true ]] || _info "账号仍停用，请按需单独启用"
             else
                 _err "重置失败"
             fi
@@ -29978,18 +30015,13 @@ _set_user_expire_date() {
             echo -e "  ${D}输入天数(如30) 或日期(2026-03-01)，输入 0 取消到期限制${NC}"
             local expire_input
             read -rp "  新到期: " expire_input
+            [[ -n "$expire_input" ]] || { _err "请输入日期、天数或 0，未修改"; return 1; }
             
             local new_expire=""
             if [[ "$expire_input" == "0" ]]; then
                 new_expire=""
-            elif [[ "$expire_input" =~ ^[0-9]+$ ]]; then
-                new_expire=$(date -d "+${expire_input} days" '+%Y-%m-%d' 2>/dev/null)
-                [[ -z "$new_expire" ]] && new_expire=$(date -v+${expire_input}d '+%Y-%m-%d' 2>/dev/null)
-            elif [[ "$expire_input" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-                new_expire="$expire_input"
             else
-                _err "无效格式"
-                return
+                new_expire=$(_parse_expire_input "$expire_input") || { _err "无效到期日期，未修改"; return 1; }
             fi
             
             if db_set_user_expire_date "$core" "$proto" "$name" "$new_expire"; then
@@ -30004,8 +30036,8 @@ _set_user_expire_date() {
                 if [[ "$enabled" != "true" && -n "$new_expire" ]]; then
                     read -rp "  用户当前已禁用，是否启用? [y/N]: " enable_now
                     if [[ "$enable_now" =~ ^[yY]$ ]]; then
-                        db_set_user_enabled "$core" "$proto" "$name" true
-                        _ok "用户已启用"
+                        if db_set_user_enabled "$core" "$proto" "$name" true; then _ok "用户已启用"
+                        else _err "启用失败，账号仍停用"; fi
                     fi
                 fi
             else
@@ -31651,17 +31683,21 @@ perform_script_update() {
     _info "更新中..."
     
     # 获取当前脚本路径
-    local script_path=$(readlink -f "$0")
-    local script_dir=$(dirname "$script_path")
-    local script_name=$(basename "$script_path")
+    local script_path
+    script_path=$(readlink -f "$0") || { rm -f "$tmp_file"; return 1; }
+    [[ -f "$script_path" ]] || { rm -f "$tmp_file"; _err "当前脚本路径无效"; return 1; }
     
     # 系统目录的脚本路径
     local system_script="/usr/local/bin/vless-server.sh"
+    if [[ -L "$system_script" ]]; then
+        system_script=$(readlink -f "$system_script") || { rm -f "$tmp_file"; return 1; }
+    fi
     
     # 保存可回退的中央备份；无论当前从下载目录还是快捷命令运行，都能找到。
     local backup_dir="$CFG/script-backups"
-    local backup_file="$backup_dir/vless-server-${VERSION}-$(date '+%Y%m%d_%H%M%S').sh"
+    local backup_file
     mkdir -p "$backup_dir" || { rm -f "$tmp_file"; _err "无法创建脚本备份目录"; return 1; }
+    backup_file=$(mktemp "$backup_dir/vless-server-${VERSION}-XXXXXX.sh") || { rm -f "$tmp_file"; return 1; }
     if ! cp "$script_path" "$backup_file" || ! chmod 700 "$backup_file"; then
         rm -f "$tmp_file" "$backup_file"
         _err "当前脚本备份失败，已取消更新"
@@ -31669,29 +31705,53 @@ perform_script_update() {
     fi
     bash -n "$backup_file" 2>/dev/null || { rm -f "$tmp_file" "$backup_file"; _err "当前脚本备份校验失败"; return 1; }
     
-    # 替换当前运行的脚本
-    if mv "$tmp_file" "$script_path" && chmod +x "$script_path"; then
-        echo "$backup_file" > "$backup_dir/previous"
-        # 如果当前脚本不是系统目录的脚本，也更新系统目录
-        if [[ "$script_path" != "$system_script" && -f "$system_script" ]]; then
-            cp -f "$script_path" "$system_script" 2>/dev/null
-            chmod +x "$system_script" 2>/dev/null
-            _info "已同步更新系统目录脚本"
+    # Stage each destination on its own filesystem, with its own original backup.
+    # Neither script nor the previous-version pointer changes until staging succeeds.
+    local targets=("$script_path") stages=() originals=() target stage original idx
+    local update_failed=false attempted=0 previous_tmp
+    [[ "$script_path" == "$system_script" || ! -f "$system_script" ]] || targets+=("$system_script")
+    previous_tmp=$(mktemp "$backup_dir/.previous.XXXXXX") || { rm -f "$tmp_file"; return 1; }
+    printf '%s\n' "$backup_file" > "$previous_tmp" || update_failed=true
+    for target in "${targets[@]}"; do
+        [[ "$update_failed" == false ]] || break
+        original=$(mktemp "$(dirname "$target")/.vless-update-backup.XXXXXX") || { update_failed=true; break; }
+        originals+=("$original")
+        cp -p "$target" "$original" || { update_failed=true; break; }
+        stage=$(mktemp "$(dirname "$target")/.vless-update-new.XXXXXX") || { update_failed=true; break; }
+        stages+=("$stage")
+        if ! cp "$tmp_file" "$stage" || ! chmod 755 "$stage" || ! bash -n "$stage"; then
+            update_failed=true
+            break
         fi
-        
-        _ok "更新成功! v${VERSION} -> v${remote_ver}"
-        echo ""
-        echo -e "  ${C}请重新运行脚本以使用新版本${NC}"
-        echo -e "  ${D}上一版本备份: ${backup_file}${NC}"
-        _line
-        exit 0
-    else
-        # 恢复备份
-        cp -f "$backup_file" "$script_path" 2>/dev/null
-        rm -f "$tmp_file"
-        _err "更新失败"
+    done
+    if [[ "$update_failed" == false ]]; then
+        for idx in "${!targets[@]}"; do
+            attempted=$((idx + 1))
+            mv -f "${stages[$idx]}" "${targets[$idx]}" || { update_failed=true; break; }
+        done
+        if [[ "$update_failed" == false ]]; then
+            mv -f "$previous_tmp" "$backup_dir/previous" || update_failed=true
+        fi
+    fi
+    if [[ "$update_failed" == true ]]; then
+        for ((idx=0; idx<attempted; idx++)); do
+            if mv -f "${originals[$idx]}" "${targets[$idx]}"; then originals[$idx]=''
+            else _err "脚本恢复失败: ${targets[$idx]}；备份: ${originals[$idx]}"; fi
+        done
+        # Retain any backup needed for manual recovery if a rollback itself failed.
+        for ((idx=attempted; idx<${#originals[@]}; idx++)); do rm -f "${originals[$idx]}"; done
+        rm -f "$tmp_file" "$previous_tmp" "${stages[@]}"
+        _err "脚本更新失败，已尝试恢复各目标；未记录为更新成功"
         return 1
     fi
+    rm -f "$tmp_file" "${stages[@]}" "${originals[@]}"
+    (( ${#targets[@]} < 2 )) || _info "已同步更新系统目录脚本"
+    _ok "更新成功! v${VERSION} -> v${remote_ver}"
+    echo ""
+    echo -e "  ${C}请重新运行脚本以使用新版本${NC}"
+    echo -e "  ${D}上一版本备份: ${backup_file}${NC}"
+    _line
+    exit 0
 }
 
 rollback_script_version() {
@@ -32380,6 +32440,7 @@ _snell_add_user_commit() {
     local reset_days="${7:-0}" created cycle='{}'
     [[ "$reset_days" == 0 || "$reset_days" == 30 ]] || return 1
     [[ "$name" =~ ^[A-Za-z0-9_-]{1,32}$ && "$name" != default && "$quota" =~ ^[0-9]{1,6}$ ]] || return 1
+    _valid_expire_date "$expiry" || { _err "到期日期无效"; return 1; }
     _is_valid_port "$port" && [[ "$psk" =~ ^[A-Za-z0-9_+/=-]+$ ]] || return 1
     [[ -z "$(db_get_user xray "$proto" "$name")" ]] || { _err "用户名已被其他操作占用"; return 1; }
     [[ -z "$(is_internal_port_occupied "$port")" ]] || { _err "端口已被其他操作占用"; return 1; }

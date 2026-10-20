@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.17"
+readonly VERSION="3.7.18"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -5103,7 +5103,7 @@ get_standalone_protocols() {
 # 遍历所有用户，为有自定义routing的用户生成Xray routing rules
 # 返回: JSON数组格式的路由规则
 gen_xray_user_routing_rules() {
-    local rules="[]"
+    local rules="[]" expire_date
     
     # 遍历所有 Xray 协议
     local xray_protocols=$(get_xray_protocols)
@@ -5113,7 +5113,8 @@ gen_xray_user_routing_rules() {
         local stats=$(db_get_users_stats "xray" "$proto")
         [[ -z "$stats" ]] && continue
         
-        while IFS='|' read -r name uuid used quota enabled port routing; do
+        # Stats include an eighth expiry field; keep it out of the routing value.
+        while IFS='|' read -r name uuid used quota enabled port routing expire_date; do
             [[ -z "$name" || -z "$routing" || "$routing" == "null" ]] && continue
             [[ "$enabled" != "true" ]] && continue  # 只为启用的用户生成规则
             
@@ -5161,7 +5162,7 @@ gen_xray_user_routing_rules() {
 # 获取用户路由需要的额外outbounds (确保WARP/链式代理等出口存在)
 # 返回: 需要添加的outbound tags列表
 gen_xray_user_routing_outbounds() {
-    local outbounds_needed=""
+    local outbounds_needed="" expire_date
     
     local xray_protocols=$(get_xray_protocols)
     [[ -z "$xray_protocols" ]] && return
@@ -5170,7 +5171,7 @@ gen_xray_user_routing_outbounds() {
         local stats=$(db_get_users_stats "xray" "$proto")
         [[ -z "$stats" ]] && continue
         
-        while IFS='|' read -r name uuid used quota enabled port routing; do
+        while IFS='|' read -r name uuid used quota enabled port routing expire_date; do
             [[ -z "$routing" || "$routing" == "null" ]] && continue
             
             case "$routing" in

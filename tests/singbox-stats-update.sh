@@ -3,6 +3,8 @@ set -e
 repo=$(cd "$(dirname "$0")/.." && pwd)
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
+CFG="$fixture"
+: > "$CFG/singbox.json"
 for fn in _singbox_stats_build_version _update_singbox_preserving_stats _update_core_to_version update_singbox_core install_singbox; do
     eval "$(awk -v fn="$fn" 'index($0,fn"() {")==1 {on=1} on {print} on && $0=="}" {exit}' "$repo/vless-server.sh")"
 done
@@ -42,4 +44,7 @@ _update_singbox_preserving_stats stable 1.15.0
 : > "$fixture/events"
 if _update_singbox_preserving_stats prerelease; then exit 1; fi
 [[ ! -s "$fixture/events" ]]
-echo 'PASS all update entries preserve stats, no stop before build, failures propagate, stopped state restored, preview rejected'
+rm -f "$CFG/singbox.json"
+_update_singbox_preserving_stats stable 1.15.0
+[[ "$(cat "$fixture/events")" == $'status\nbuild:1.15.0' ]]
+echo 'PASS all update entries preserve stats, no stop before build, failures propagate, stopped state restored, preview rejected, no stop without config'

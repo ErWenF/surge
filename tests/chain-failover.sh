@@ -87,8 +87,9 @@ jq -e --arg A "$A" --arg B "$B" --arg s "$secret" '
     (.outbounds[] | select(.tag == "balancer-FO")) == {type:"selector", tag:"balancer-FO", outbounds:[$B, $A, "direct"],
         default:$B, interrupt_exist_connections:true} and
     .experimental.clash_api == {external_controller:"127.0.0.1:10087", secret:$s} and
-    any(.outbounds[]; .tag == "direct")' "$fixture/s1.json" >/dev/null ||
-    fail "sing-box 故障转移 selector / Clash API 不符: $(jq -c '{o:[.outbounds[]|select(.tag=="balancer-FO")], e:.experimental.clash_api}' "$fixture/s1.json")"
+    any(.outbounds[]; .tag == "direct") and
+    any(.route.rules[]; .domain_suffix == ["example.com"] and .outbound == "balancer-FO")' "$fixture/s1.json" >/dev/null ||
+    fail "sing-box 故障转移 selector / Clash API / 规则引用不符: $(jq -c '{o:[.outbounds[]|select(.tag=="balancer-FO")], e:.experimental.clash_api, r:.route.rules}' "$fixture/s1.json")"
 if [[ -n "${SINGBOX_TEST_BIN:-}" ]]; then
     jq 'del(.log)' "$fixture/s1.json" > "$fixture/s1-native.json"
     ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true "$SINGBOX_TEST_BIN" check -c "$fixture/s1-native.json" ||

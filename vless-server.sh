@@ -1077,6 +1077,8 @@ _user_change_apply() {
             [$db[0].xray.ss2022 // empty | (if type == "array" then .[] else . end) |
                 select(.multi_user == true and all(.users[]?; .enabled == false)) | .port] as $closed |
             [$before[0].inbounds[]? | . as $ib |
+                # 故障转移探测入口是内部入站，随故障转移组按需生成，删除组后理应消失
+                select((.tag // "") | startswith("fo-probe-") | not) |
                 select(($removed | index($ib.port // $ib.listen_port)) == null) |
                 select($c != "xray" or .protocol != "shadowsocks" or ($closed | index($ib.port)) == null) |
                 .tag] as $expected |
@@ -17566,19 +17568,41 @@ db_update_balancer_nodes() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 节点按优先级排列：第一优先可用就走它，否则依次走下一个可用节点，全部不可用时走直连；
 # 高优先级节点恢复后需连续 FAILOVER_RECOVER_CHECKS 次检测可用才切回，避免来回抖动。
+# "可用"= 经该节点访问每个检测网址都能收到 HTTP 响应（默认 gstatic + Cloudflare，可在菜单修改）：
+# 只测一个网址会把"能上 Google、上不了 Cloudflare"的半故障节点误判为可用。
 # 两个内核都没有原生的"按顺序故障转移"，由常驻服务 vless-failover 在运行时切换（不重启内核）：
-#   Xray     leastLoad 均衡器 + burstObservatory 健康检查 + fallbackTag=direct；
-#            监控读取 `xray api bi` 的可用节点，按优先级用 `xray api bo` 指定出口；
-#            全部不可用时撤销指定，由 fallbackTag 原生退回直连（监控服务停止时同样成立）。
-#   sing-box selector [节点..., direct]；监控经 Clash API 逐个测速后切换 selector。
+#   Xray     每个节点一个只监听本机、带随机密码的 SOCKS 探测入口（路由只走该节点），监控经它逐个
+#            探测检测网址，再按优先级用 `xray api bo` 指定出口（全部不可用时指定 direct）。
+#            均衡器为 leastLoad + burstObservatory + fallbackTag=direct，作为监控停止时的保底。
+#   sing-box selector [节点..., direct]；监控经 Clash API 对每个网址做延迟测试后切换 selector。
 FAILOVER_CHECK_INTERVAL="${FAILOVER_CHECK_INTERVAL:-10}"
 FAILOVER_RECOVER_CHECKS="${FAILOVER_RECOVER_CHECKS:-3}"
-FAILOVER_XRAY_GRACE="${FAILOVER_XRAY_GRACE:-30}"   # Xray 启动后等待首轮健康检查的秒数
-FAILOVER_TEST_URL="https://www.gstatic.com/generate_204"
+FAILOVER_PROBE_TIMEOUT="${FAILOVER_PROBE_TIMEOUT:-8}"
+FAILOVER_PROBE_PORT_BASE=61800
+FAILOVER_DEFAULT_TEST_URLS=("https://www.gstatic.com/generate_204" "https://cp.cloudflare.com/generate_204")
 
 _failover_state_file() { echo "$CFG/failover-state.json"; }
 _failover_log_file() { echo "$CFG/failover.log"; }
 _failover_clash_secret_file() { echo "$CFG/singbox-clash-api.secret"; }
+_failover_probe_secret_file() { echo "$CFG/failover-probe.secret"; }
+
+# 检测网址：只接受不含空白、引号和反斜杠的 http(s) 地址（会作为 curl 参数和 Clash API 查询参数使用）
+_failover_valid_url() {
+    local url="$1"
+    [[ ${#url} -le 200 && "$url" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~%/?=\&+:@!,;-]*)?$ ]]
+}
+
+# 当前检测网址（每行一个）；数据库未设置或无效时使用默认值
+_failover_test_urls() {
+    local urls=() url
+    if [[ -f "$DB_FILE" ]]; then
+        mapfile -t urls < <(jq -r '.failover_test_urls[]? | strings' "$DB_FILE" 2>/dev/null)
+    fi
+    local valid=()
+    for url in "${urls[@]}"; do _failover_valid_url "$url" && valid+=("$url"); done
+    (( ${#valid[@]} )) || valid=("${FAILOVER_DEFAULT_TEST_URLS[@]}")
+    printf '%s\n' "${valid[@]}"
+}
 
 # 链式节点在均衡器中的出站 tag（与均衡器渲染保持一致，固定 prefer_ipv4）
 _failover_node_tag() { printf 'chain-%s-prefer-ipv4' "$1"; }
@@ -17601,10 +17625,12 @@ _failover_log() {
     (umask 077; printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$file") 2>/dev/null || true
 }
 
-# sing-box Clash API 密钥：首次使用时生成，仅 root 可读
-_failover_clash_secret() {
-    local file secret
-    file=$(_failover_clash_secret_file)
+# 随机密钥：首次使用时生成，仅 root 可读（Clash API 与 Xray 探测入口各用一个文件）
+_failover_clash_secret() { _failover_secret "$(_failover_clash_secret_file)"; }
+_failover_probe_secret() { _failover_secret "$(_failover_probe_secret_file)"; }
+
+_failover_secret() {
+    local file="$1" secret
     if [[ -s "$file" ]]; then
         secret=$(cat "$file") || return 1
     else
@@ -17625,7 +17651,8 @@ _xray_balancer_object() {
             # 组内没有可用节点配置时整组走直连，避免引用不存在的出站
             {selector: ["direct"], strategy: {type: "random"}}
         elif $g.strategy == "failover" then
-            # expected 等于节点数时 bi 会列出全部可用节点，监控据此按优先级选择；
+            # 正常由监控服务用 `xray api bo` 按优先级指定出口；以下为监控未运行时的保底：
+            # 在健康检查判定可用的节点间分配，全部不可用时走 fallbackTag 直连。
             # tolerance 0.4：最近 2 次探测中失败 1 次即视为不可用
             {selector: $tags, fallbackTag: "direct",
              strategy: {type: "leastLoad", settings: {expected: ($tags | length), tolerance: 0.4}}}
@@ -17634,13 +17661,33 @@ _xray_balancer_object() {
         end'
 }
 
-# 按配置中实际存在的均衡器生成健康检查：精确列出需要观测的节点 tag（不再按首个节点名前缀推断），
-# 并在存在故障转移组时开启 RoutingService 供监控服务读写均衡器。
+# 按配置中实际存在的均衡器生成健康检查：精确列出需要观测的节点 tag（不再按首个节点名前缀推断）。
+# 存在故障转移组时：开启 RoutingService 供监控服务指定出口，并为组内每个节点加一个只监听本机、
+# 带随机密码的 SOCKS 探测入口（路由只走该节点），监控经它用全部检测网址判断节点是否可用。
 _xray_apply_balancer_observatory() {
-    local file="$1" failover_tags tmp
+    local file="$1" failover_tags tmp url secret="" probes='[]' probe_tags=()
     failover_tags=$(_failover_group_names | jq -R '"balancer-" + .' | jq -sc .) || return 1
+    url=$(_failover_test_urls | head -n 1)
+    # 故障转移组的节点（去重并保持顺序）
+    mapfile -t probe_tags < <(jq -r --argjson fo "${failover_tags:-[]}" '
+        [.routing.balancers[]? | select(.tag as $t | $fo | index($t) != null) | .selector[] | select(. != "direct")]
+        | reduce .[] as $t ([]; if index($t) then . else . + [$t] end) | .[]' "$file")
+    if (( ${#probe_tags[@]} )); then
+        secret=$(_failover_probe_secret) || { _err "无法生成故障转移探测密钥"; return 1; }
+        # 探测端口从 FAILOVER_PROBE_PORT_BASE 起分配，避开数据库与当前配置中已用的端口
+        local used t port=$FAILOVER_PROBE_PORT_BASE
+        used=" $(jq -r '[.. | objects | .port? | (numbers, (strings | select(test("^[0-9]+$")) | tonumber))]
+                        | unique | map(tostring) | join(" ")' "$DB_FILE" 2>/dev/null)"
+        used+=" $(jq -r '[.inbounds[]?.port | numbers] | map(tostring) | join(" ")' "$file") "
+        for t in "${probe_tags[@]}"; do
+            while [[ "$used" == *" $port "* ]]; do port=$((port + 1)); done
+            probes=$(jq -c --arg t "$t" --argjson p "$port" '. + [{tag: $t, port: $p}]' <<< "$probes")
+            used+="$port "
+            port=$((port + 1))
+        done
+    fi
     tmp=$(mktemp "${file}.obs.XXXXXX") || return 1
-    if jq --argjson fo "${failover_tags:-[]}" --arg url "$FAILOVER_TEST_URL" '
+    if jq --argjson fo "${failover_tags:-[]}" --arg url "$url" --argjson probes "$probes" --arg secret "$secret" '
         ([.routing.balancers[]? | select(.strategy.type == "leastPing" or .strategy.type == "leastLoad")
           | .selector[] | select(. != "direct")] | unique) as $subjects |
         (if ($subjects | length) > 0 then
@@ -17649,6 +17696,15 @@ _xray_apply_balancer_observatory() {
          else del(.burstObservatory) end) |
         (if any(.routing.balancers[]?; .tag as $t | $fo | index($t) != null) then
             .api.services = ((.api.services // []) + ["RoutingService"] | unique)
+         else . end) |
+        (if ($probes | length) > 0 then
+            .inbounds = ((.inbounds // []) + [$probes[] | {tag: ("fo-probe-" + .tag), listen: "127.0.0.1", port: .port,
+                protocol: "socks", settings: {auth: "password", accounts: [{user: "probe", pass: $secret}], udp: false}}]) |
+            # api 规则保持第一（多 IP 路由在 rules[0] 之后插入），探测规则紧随其后、先于其他分流规则
+            .routing.rules = (
+                [(.routing.rules // [])[] | select(.inboundTag == ["api"])] +
+                [$probes[] | {type: "field", inboundTag: ["fo-probe-" + .tag], outboundTag: .tag}] +
+                [(.routing.rules // [])[] | select(.inboundTag != ["api"])])
          else . end)
     ' "$file" > "$tmp" && cat "$tmp" > "$file"; then
         # 写回原文件而不是 mv，保留原文件权限（BusyBox chmod 不支持 --reference）
@@ -17657,23 +17713,6 @@ _xray_apply_balancer_observatory() {
         rm -f "$tmp"
         return 1
     fi
-}
-
-# 进程已运行秒数（未运行返回失败）。直接读 /proc，兼容 BusyBox（其 ps 不支持 -o etimes）
-_failover_proc_uptime() {
-    local name="$1" dir comm pid="" stat start ticks up
-    for dir in /proc/[0-9]*; do
-        IFS= read -r comm < "$dir/comm" 2>/dev/null || continue
-        [[ "$comm" == "$name" ]] && { pid="${dir#/proc/}"; break; }
-    done
-    [[ -n "$pid" ]] || return 1
-    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
-    stat="${stat##*) }"                          # 去掉 "pid (comm) "，原第 22 字段（启动时刻）变为第 20 个
-    start=$(awk '{print $20}' <<< "$stat")
-    ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
-    up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null); up="${up%.*}"
-    [[ "$start" =~ ^[0-9]+$ && "$ticks" =~ ^[0-9]+$ && "$up" =~ ^[0-9]+$ ]] || return 1
-    echo $(( up - start / ticks ))
 }
 
 # Xray：输出 "S<TAB>可用节点tag"（按 bi 顺序）与 "O<TAB>当前指定tag"
@@ -17713,11 +17752,59 @@ _failover_clash_request() {
 
 _failover_uri() { jq -rn --arg s "$1" '$s | @uri'; }
 
-# sing-box：经 Clash API 测试单个出站是否可用
-_failover_singbox_alive() {
-    local resp
-    resp=$(_failover_clash_request GET "/proxies/$(_failover_uri "$1")/delay?url=$(_failover_uri "$FAILOVER_TEST_URL")&timeout=5000") || return 1
-    jq -e '(.delay // 0) > 0' <<< "$resp" >/dev/null 2>&1
+# 节点探测结果：ok（每个检测网址都收到 HTTP 响应）/ fail / unknown（探测设施未就绪，不能据此判定节点）
+# Xray：经该节点的本机探测入口访问每个网址；密码经 stdin 交给 curl。
+# curl 7 = 探测入口未监听（如 Xray 正在重启），97 = SOCKS 认证失败，均视为 unknown。
+_failover_xray_probe() {
+    local port="$1" secret="$2" url code rc
+    while IFS= read -r url; do
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$FAILOVER_PROBE_TIMEOUT" --config - "$url" 2>/dev/null \
+            <<< "proxy = \"socks5h://127.0.0.1:${port}\""$'\n'"proxy-user = \"probe:${secret}\"")
+        rc=$?
+        case "$rc" in 7|97) echo unknown; return 0 ;; esac
+        [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] || { echo fail; return 0; }
+    done < <(_failover_test_urls)
+    echo ok
+}
+
+# sing-box：经 Clash API 对每个网址做一次延迟测试（API 不可达或无密钥视为 unknown）
+_failover_singbox_probe() {
+    local tag="$1" url resp rc
+    while IFS= read -r url; do
+        resp=$(_failover_clash_request GET "/proxies/$(_failover_uri "$tag")/delay?url=$(_failover_uri "$url")&timeout=$((FAILOVER_PROBE_TIMEOUT * 1000))")
+        rc=$?
+        case "$rc" in 0) ;; 1|7) echo unknown; return 0 ;; *) echo fail; return 0 ;; esac
+        jq -e '(.delay // 0) > 0' <<< "$resp" >/dev/null 2>&1 || { echo fail; return 0; }
+    done < <(_failover_test_urls)
+    echo ok
+}
+
+# 并行探测组内全部节点；输出每行 "tag<TAB>结果"，顺序与参数一致
+_failover_probe_all() {
+    local core="$1" cfg="$2" dir t i=0 port secret=""
+    shift 2
+    dir=$(mktemp -d) || return 1
+    [[ "$core" == xray ]] && secret=$(cat "$(_failover_probe_secret_file)" 2>/dev/null)
+    for t in "$@"; do
+        if [[ "$core" == xray ]]; then
+            port=$(jq -r --arg t "fo-probe-$t" '.inbounds[]? | select(.tag == $t) | .port' "$cfg" 2>/dev/null)
+            if [[ "$port" =~ ^[0-9]+$ && "$secret" =~ ^[0-9a-f]{32}$ ]]; then
+                _failover_xray_probe "$port" "$secret" > "$dir/$i" &
+            else
+                echo unknown > "$dir/$i"
+            fi
+        else
+            _failover_singbox_probe "$t" > "$dir/$i" &
+        fi
+        i=$((i + 1))
+    done
+    wait
+    i=0
+    for t in "$@"; do
+        printf '%s\t%s\n' "$t" "$(cat "$dir/$i" 2>/dev/null || echo unknown)"
+        i=$((i + 1))
+    done
+    rm -rf "$dir"
 }
 
 _failover_singbox_now() {
@@ -17793,22 +17880,25 @@ _failover_step() {
         t=$(_failover_node_tag "$t")
         jq -e --arg t "$t" 'any(.outbounds[]?; .tag == $t)' "$cfg_file" >/dev/null 2>&1 && tags+=("$t")
     done
+    # 读取内核当前实际选择（Xray 的指定 / sing-box selector 的当前项）；读不到说明内核未运行或 API 未开启
     if [[ "$core" == xray ]]; then
-        local up
-        up=$(_failover_proc_uptime xray) || { printf '%s' "$state"; return 0; }
-        (( up >= FAILOVER_XRAY_GRACE )) || { printf '%s' "$state"; return 0; }
         local status
-        status=$(_failover_xray_status "$balancer") || { _failover_log "${group}/xray: 读取均衡器状态失败"; printf '%s' "$state"; return 0; }
-        while IFS=$'\t' read -r kind line; do
-            case "$kind" in S) alive+="${line}"$'\n' ;; O) applied="$line" ;; esac
-        done <<< "$status"
+        status=$(_failover_xray_status "$balancer") || { _failover_log "${group}/xray: 读取均衡器状态失败（Xray 未运行或未开启 RoutingService）"; printf '%s' "$state"; return 0; }
+        applied=$(awk -F'\t' '$1 == "O" {print $2; exit}' <<< "$status")
     else
-        _failover_proc_uptime sing-box >/dev/null || { printf '%s' "$state"; return 0; }
         applied=$(_failover_singbox_now "$balancer") || applied=""
         [[ -n "$applied" ]] || { _failover_log "${group}/singbox: Clash API 不可用"; printf '%s' "$state"; return 0; }
-        for t in "${tags[@]}"; do
-            _failover_singbox_alive "$t" && alive+="${t}"$'\n'
-        done
+    fi
+    # 用全部检测网址判断各节点；任何节点结果未知时整组跳过本轮，避免内核重启期间误判为全部不可用
+    local results res unknown=false
+    results=$(_failover_probe_all "$core" "$cfg_file" "${tags[@]}") || { printf '%s' "$state"; return 0; }
+    while IFS=$'\t' read -r t res; do
+        [[ -n "$t" ]] || continue
+        case "$res" in ok) alive+="${t}"$'\n' ;; unknown) unknown=true ;; esac
+    done <<< "$results"
+    if [[ "$unknown" == true ]]; then
+        _failover_log "${group}/${core}: 探测入口未就绪，本轮跳过"
+        printf '%s' "$state"; return 0
     fi
     alive="${alive%$'\n'}"
 
@@ -17823,7 +17913,8 @@ _failover_step() {
 
     # 与内核当前实际状态比较；内核重启会丢失指定，此时静默补上
     if [[ "$core" == xray ]]; then
-        [[ "$target" == direct ]] && want="" || want="$target"
+        # 全部不可用时显式指定 direct：均衡器自身的健康检查只测一个网址，交给 fallbackTag 可能仍选中半故障节点
+        want="$target"
         if [[ "$applied" != "$want" ]] && ! _failover_xray_apply "$balancer" "$want"; then
             _failover_log "${group}/xray: 切换到 $(_failover_tag_label "$target") 失败，下轮重试"
             printf '%s' "$state"; return 0
@@ -17904,6 +17995,8 @@ failover_print_status() {
     local state_file state
     state_file=$(_failover_state_file)
     state=$(cat "$state_file" 2>/dev/null) || state='{}'
+    echo "  检测网址（全部可访问才算节点可用）:"
+    _failover_test_urls | sed 's/^/    /'
     if ! _failover_json_object "$state" || ! jq -e 'length > 0' <<< "$state" >/dev/null 2>&1; then
         echo "  暂无检测结果（监控服务尚未运行或组未在分流规则中使用）"; return 0
     fi
@@ -18048,6 +18141,62 @@ failover_sync_service() {
     else
         stop_failover_service
     fi
+}
+
+# 设置故障转移检测网址（$@ 为网址；不带参数恢复默认）
+db_set_failover_test_urls() {
+    local url urls_json='[]'
+    for url in "$@"; do
+        _failover_valid_url "$url" || { _err "网址格式无效: $url"; return 1; }
+        urls_json=$(jq -c --arg u "$url" 'if index($u) then . else . + [$u] end' <<< "$urls_json")
+    done
+    (( $(jq 'length' <<< "$urls_json") <= 5 )) || { _err "最多 5 个检测网址"; return 1; }
+    if [[ "$urls_json" == '[]' ]]; then
+        _db_apply 'del(.failover_test_urls)'
+    else
+        _db_apply --argjson u "$urls_json" '.failover_test_urls = $u'
+    fi
+}
+
+manage_failover_test_urls() {
+    _header
+    echo -e "  ${W}故障转移检测网址${NC}"
+    _line
+    echo -e "  ${D}经节点访问以下每个网址都能收到 HTTP 响应，才认为该节点可用。${NC}"
+    echo -e "  ${D}只测一个网址时，\"能上 Google、上不了 Cloudflare\"的半故障节点会被误判为可用。${NC}"
+    echo -e "  ${D}第一个网址同时用于 Xray 内置健康检查（监控服务未运行时的保底）。${NC}"
+    echo ""
+    echo -e "  ${Y}当前:${NC}"
+    _failover_test_urls | sed 's/^/    /'
+    _line
+    _item "1" "修改检测网址"
+    _item "2" "恢复默认 (gstatic + Cloudflare)"
+    _item "0" "返回"
+    _line
+    read -rp "  请选择: " url_choice
+    local changed=false
+    case "$url_choice" in
+        1)
+            echo -e "  ${Y}输入网址，空格分隔，最多 5 个 (如: https://www.gstatic.com/generate_204 https://cp.cloudflare.com/generate_204):${NC}"
+            local input urls=()
+            read -rp "  > " input
+            read -r -a urls <<< "$input"
+            (( ${#urls[@]} )) || { _err "未输入网址"; _pause; return; }
+            db_set_failover_test_urls "${urls[@]}" && changed=true
+            ;;
+        2)
+            db_set_failover_test_urls && changed=true
+            ;;
+        *) return ;;
+    esac
+    if [[ "$changed" == true ]]; then
+        _ok "检测网址已更新，监控服务下一轮检查即生效"
+        # 第一个网址写入 Xray 内置健康检查，需要重建配置
+        if _has_failover_groups; then
+            _regenerate_proxy_configs
+        fi
+    fi
+    _pause
 }
 
 # 获取可用的出口列表
@@ -22037,6 +22186,7 @@ manage_chain_proxy() {
         _item "9" "测试所有节点延迟"
         _item "10" "删除节点"
         _item "11" "删除负载均衡组"
+        _item "12" "故障转移检测网址"
         _item "0" "返回"
         _line
 
@@ -22271,6 +22421,9 @@ manage_chain_proxy() {
                     fi
                 fi
                 _pause
+                ;;
+            12)
+                manage_failover_test_urls
                 ;;
             0) return ;;
         esac

@@ -44,8 +44,22 @@ jq -e --arg A "$A" --arg B "$B" --arg C "$C" '
     any(.routing.rules[]; .balancerTag == "balancer-FO") and
     any(.outbounds[]; .tag == "direct")' "$fixture/x1.json" >/dev/null ||
     fail "全局分流路径的均衡器/健康检查不符: $(jq -c '{b:.routing.balancers, o:.burstObservatory, api:.api}' "$fixture/x1.json")"
+probe_secret=$(cat "$CFG/failover-probe.secret")
+[[ "$probe_secret" =~ ^[0-9a-f]{32}$ && "$(stat -c %a "$CFG/failover-probe.secret")" == 600 ]] || fail "探测密钥格式或权限不符"
+# 探测入口：只为故障转移组的节点（B、A）生成，只监听本机、带密码，端口避开协议端口；路由紧跟 api 规则
+jq -e --arg A "$A" --arg B "$B" --arg s "$probe_secret" '
+    [.inbounds[] | select(.tag | startswith("fo-probe-"))] as $p |
+    ($p | map(.tag)) == ["fo-probe-" + $B, "fo-probe-" + $A] and
+    all($p[]; .listen == "127.0.0.1" and .protocol == "socks" and .settings.auth == "password"
+              and .settings.accounts == [{user:"probe", pass:$s}] and .port >= 61800 and .port != 24199) and
+    ($p | map(.port) | unique | length) == 2 and
+    .routing.rules[0].inboundTag == ["api"] and
+    .routing.rules[1] == {type:"field", inboundTag:["fo-probe-" + $B], outboundTag:$B} and
+    .routing.rules[2] == {type:"field", inboundTag:["fo-probe-" + $A], outboundTag:$A} and
+    .burstObservatory.pingConfig.destination == "https://www.gstatic.com/generate_204"' "$fixture/x1.json" >/dev/null ||
+    fail "故障转移探测入口不符: $(jq -c '{p:[.inbounds[]|select(.tag|startswith("fo-probe-"))], r:.routing.rules[0:3]}' "$fixture/x1.json")"
 native_xray "$fixture/x1.json"
-echo 'PASS Xray global routing: failover balancer keeps priority order, skips missing nodes, falls back to direct, exact health checks'
+echo 'PASS Xray global routing: failover balancer keeps priority order, skips missing nodes, loopback probe inbounds per node, exact health checks'
 
 # ── 2. Xray：只有用户路由（原先该路径完全不生成健康检查）──
 base_db '[]' "balancer:LP"
@@ -54,6 +68,7 @@ jq -e --arg A "$A" --arg C "$C" '
     ((.routing.balancers[] | select(.tag == "balancer-LP")) | .selector == [$A, $C]) and
     .burstObservatory.subjectSelector == [$A, $C] and
     (.api.services | index("RoutingService") == null) and
+    ([.inbounds[] | select(.tag | startswith("fo-probe-"))] | length) == 0 and
     any(.routing.rules[]; .user == ["alice@ss2022"] and .balancerTag == "balancer-LP")' "$fixture/x2.json" >/dev/null ||
     fail "用户路由路径缺少健康检查或误开 RoutingService: $(jq -c '{b:.routing.balancers, o:.burstObservatory, api:.api}' "$fixture/x2.json")"
 native_xray "$fixture/x2.json"
@@ -106,17 +121,15 @@ expect "$(decide "$A" "$B" 2 "$A"$'\n'"$B")" "$B"$'\t\t0\trecover' "稳定后切
 expect "$(decide chain-Gone-prefer-ipv4 '' 0 "$A")" "$A"$'\t\t0\tfailover' "当前出口已不在组内"
 echo 'PASS decision: priority order, immediate failover, direct when all down, recovery needs consecutive checks'
 
-# ── 5. 监控服务（Xray）：bi / bo 驱动切换、内核重启后补指定、通知 ──
+# ── 5. 监控服务（Xray）：经探测入口用全部检测网址判断，bo 按优先级指定 ──
 base_db '[{"id":"custom_1","type":"custom","outbound":"balancer:FO","domains":"example.com"}]' ""
 cp "$fixture/x1.json" "$CFG/config.json"
-_failover_proc_uptime() { echo 100; }
 tg_send_message() { printf '%s\n---\n' "$1" >> "$fixture/tg"; }
-bi_selects="" bo_fail=false
 # 模拟内核的"当前指定"存文件：_failover_step 在命令替换的子 shell 中运行，变量改动带不回来
 : > "$fixture/bi_override"
+bo_fail=false probe_ok="" probe_half="" probe_infra_down=false
 xray() {
-    [[ "$1 $2" == "api bi" ]] && { printf '  - Selecting Override:\n    1   %s\n  - Selects:\n' "$(cat "$fixture/bi_override")"
-        local i=1 t; for t in $bi_selects; do printf '    %d   %s\n' "$i" "$t"; i=$((i + 1)); done; return 0; }
+    [[ "$1 $2" == "api bi" ]] && { printf '  - Selecting Override:\n    1   %s\n  - Selects:\n' "$(cat "$fixture/bi_override")"; return 0; }
     if [[ "$1 $2" == "api bo" ]]; then
         echo "bo ${*: -1}" >> "$fixture/xray-calls"
         [[ "$bo_fail" == true ]] && return 1
@@ -125,14 +138,32 @@ xray() {
     fi
     return 1
 }
-cycle() { bi_selects="$1"; : > "$fixture/xray-calls"; failover_check_once || fail "检查失败"; }
+# 探测：按探测端口找到节点；probe_ok 全部网址可用，probe_half 只有 gstatic 可用（半故障节点）
+curl() {
+    local stdin port tag url="${*: -1}"
+    stdin=$(cat)
+    [[ "$*" != *"$probe_secret"* ]] || fail "探测密码出现在 curl 参数中"
+    [[ "$probe_infra_down" == true ]] && { echo -n 000; return 7; }
+    [[ "$stdin" == *"proxy-user = \"probe:$probe_secret\""* ]] || { echo -n 000; return 97; }
+    port=$(grep -o '127.0.0.1:[0-9]*' <<< "$stdin" | cut -d: -f2)
+    tag=$(jq -r --argjson p "$port" '.inbounds[] | select(.port == $p) | .tag' "$CFG/config.json")
+    [[ -n "$tag" ]] || { echo -n 000; return 7; }
+    tag="${tag#fo-probe-}"
+    echo "$tag $url" >> "$fixture/probes"
+    if [[ " $probe_ok " == *" $tag "* ]] || { [[ " $probe_half " == *" $tag "* ]] && [[ "$url" == *gstatic* ]]; }; then
+        echo -n 204; return 0
+    fi
+    echo -n 000; return 28
+}
+cycle() { probe_ok="$1" probe_half="${2:-}"; : > "$fixture/xray-calls"; : > "$fixture/probes"; failover_check_once || fail "检查失败"; }
 # 状态文件存在但为空（jq 1.6 对空输入配合 -e 返回 0，曾导致状态被写成空文件、每轮都当作首次）
 : > "$CFG/failover-state.json"
 target() { jq -r '."xray|FO".target' "$CFG/failover-state.json"; }
 cycle "$A $B";  [[ $(target) == "$B" && $(cat "$fixture/xray-calls") == "bo $B" && ! -s "$fixture/tg" ]] || fail "首轮应指定最高优先级 B 且不通知"
-cycle "$A";     [[ $(target) == "$A" && $(cat "$fixture/xray-calls") == "bo $A" ]] || fail "B 不可用应切到 A"
+[[ $(grep -c gstatic "$fixture/probes") == 2 && $(grep -c cloudflare "$fixture/probes") == 2 ]] || fail "每个节点都应探测全部检测网址: $(cat "$fixture/probes")"
+cycle "$A" "$B"; [[ $(target) == "$A" && $(cat "$fixture/xray-calls") == "bo $A" ]] || fail "B 只能访问 gstatic（半故障）时应判为不可用并切到 A"
 grep -q 'B 不可用，已切换到 A' "$fixture/tg" || fail "缺少故障转移通知"
-cycle "";       [[ $(target) == direct && $(cat "$fixture/xray-calls") == "bo -r" ]] || fail "全部不可用应撤销指定走直连"
+cycle "";       [[ $(target) == direct && $(cat "$fixture/xray-calls") == "bo direct" ]] || fail "全部不可用应显式指定 direct"
 grep -q '所有节点均不可用，已改为直连' "$fixture/tg" || fail "缺少直连通知"
 cycle "$B $A";  [[ $(target) == direct && ! -s "$fixture/xray-calls" ]] || fail "恢复第 1 次不应切换"
 cycle "$B $A";  [[ $(target) == direct ]] || fail "恢复第 2 次不应切换"
@@ -147,20 +178,25 @@ cycle "$A";     [[ $(target) == "$B" ]] || fail "切换失败时应保留原状�
 [[ $(grep -c '^---$' "$fixture/tg") == "$notices" ]] || fail "切换失败时不应通知"
 bo_fail=false
 cycle "$A";     [[ $(target) == "$A" ]] || fail "下一轮应重试成功"
-_failover_proc_uptime() { echo 5; }
-cycle "";       [[ $(target) == "$A" && ! -s "$fixture/xray-calls" ]] || fail "Xray 刚启动时应等待首轮健康检查"
-_failover_proc_uptime() { echo 100; }
-failover_print_status | grep -q 'FO（Xray）当前出口: A' || fail "状态展示不符: $(failover_print_status)"
-echo 'PASS Xray monitor: bi/bo switching, direct fallback, stable recovery, silent re-apply after restart, retry on failure, startup grace'
+probe_infra_down=true
+cycle "";       [[ $(target) == "$A" && ! -s "$fixture/xray-calls" ]] || fail "探测入口未就绪（如 Xray 重启中）时不应判为全部不可用"
+grep -q '探测入口未就绪' "$CFG/failover.log" || fail "未就绪应记录日志"
+probe_infra_down=false
+status_out=$(failover_print_status)
+grep -q 'FO（Xray）当前出口: A' <<< "$status_out" && grep -q 'cp.cloudflare.com/generate_204' <<< "$status_out" ||
+    fail "状态展示不符: $status_out"
+unset -f curl
+echo 'PASS Xray monitor: all test URLs per node via probe inbounds, half-broken node rejected, explicit direct, stable recovery, re-apply after restart, retry, not-ready skip'
 
-# ── 6. 监控服务（sing-box）：Clash API 测速与切换，密钥不出现在 curl 参数中 ──
+# ── 6. 监控服务（sing-box）：Clash API 对每个网址测速，密钥只经 stdin ──
 rm -f "$CFG/failover-state.json" "$CFG/config.json" "$fixture/tg"
 cp "$fixture/s1.json" "$CFG/singbox.json"
-sb_alive=""
 printf '%s' "$B" > "$fixture/sb_now"   # 同样存文件，跨子 shell 保留 selector 当前选择
+sb_ok="" sb_half="" sb_api_down=false
 curl() {
     local stdin; stdin=$(cat)
     [[ "$*" != *"$secret"* ]] || fail "Clash API 密钥出现在 curl 参数中"
+    [[ "$sb_api_down" == true ]] && return 7
     [[ "$stdin" == *"Bearer $secret"* ]] || return 22
     local url="${*: -1}" method=GET i
     for ((i = 1; i <= $#; i++)); do [[ "${!i}" == -X ]] && { i=$((i + 1)); method="${!i}"; }; done
@@ -170,20 +206,26 @@ curl() {
             grep -o '"name":"[^"]*"' <<< "$*" | cut -d'"' -f4 | tr -d '\n' > "$fixture/sb_now"
             echo "put $(cat "$fixture/sb_now")" >> "$fixture/sb-calls" ;;
         "GET "*"/delay?"*)
-            local tag; tag=$(jq -rn --arg u "${url#*/proxies/}" '$u | split("/delay")[0] | @text "\(.)" ')
-            [[ " $sb_alive " == *" $tag "* ]] && echo '{"delay":120}' || { echo '{"message":"An error occurred in the delay test"}'; return 22; } ;;
+            local tag="${url#*/proxies/}"; tag="${tag%%/delay*}"
+            if [[ " $sb_ok " == *" $tag "* ]] || { [[ " $sb_half " == *" $tag "* ]] && [[ "$url" == *gstatic* ]]; }; then
+                echo '{"delay":120}'
+            else
+                echo '{"message":"An error occurred in the delay test"}'; return 22
+            fi ;;
         *) return 22 ;;
     esac
 }
-_failover_proc_uptime() { echo 100; }
-sb_cycle() { sb_alive="$1"; : > "$fixture/sb-calls"; failover_check_once || fail "检查失败"; }
+sb_cycle() { sb_ok="$1" sb_half="${2:-}"; : > "$fixture/sb-calls"; failover_check_once || fail "检查失败"; }
 sb_target() { jq -r '."singbox|FO".target' "$CFG/failover-state.json"; }
-sb_cycle "$A $B"; [[ $(sb_target) == "$B" && ! -s "$fixture/sb-calls" ]] || fail "sing-box 首轮已是 B，不应重复切换"
-sb_cycle "$A";    [[ $(sb_target) == "$A" && $(cat "$fixture/sb-calls") == "put $A" ]] || fail "sing-box B 不可用应切到 A"
-sb_cycle "";      [[ $(sb_target) == direct && $(cat "$fixture/sb-calls") == "put direct" ]] || fail "sing-box 全部不可用应切到 direct"
+sb_cycle "$A $B";   [[ $(sb_target) == "$B" && ! -s "$fixture/sb-calls" ]] || fail "sing-box 首轮已是 B，不应重复切换"
+sb_cycle "$A" "$B"; [[ $(sb_target) == "$A" && $(cat "$fixture/sb-calls") == "put $A" ]] || fail "sing-box B 半故障应切到 A"
+sb_cycle "";        [[ $(sb_target) == direct && $(cat "$fixture/sb-calls") == "put direct" ]] || fail "sing-box 全部不可用应切到 direct"
 grep -q 'Sing-box' "$fixture/tg" || fail "sing-box 切换应通知"
+sb_api_down=true
+sb_cycle "$A $B";   [[ $(sb_target) == direct && ! -s "$fixture/sb-calls" ]] || fail "Clash API 不可用时应保持原状态"
+sb_api_down=false
 unset -f curl
-echo 'PASS sing-box monitor: Clash API delay tests, selector switching to direct, secret passed only via stdin'
+echo 'PASS sing-box monitor: delay test for every URL, half-broken node rejected, selector to direct, API-down skip, secret only via stdin'
 
 # ── 7. 服务定义 ──
 _failover_write_service systemd "$fixture/unit" /usr/local/bin/vless-server.sh /usr/bin/bash || fail "systemd 服务生成失败"
@@ -193,3 +235,36 @@ _failover_write_service openrc "$fixture/rc" /usr/local/bin/vless-server.sh /bin
 grep -q 'command_args="/usr/local/bin/vless-server.sh --failover-run"' "$fixture/rc" || fail "OpenRC 服务内容不符"
 if _failover_write_service systemd "$fixture/bad" '/usr/local/bin/x;rm' /usr/bin/bash; then fail "应拒绝带特殊字符的路径"; fi
 echo 'PASS service definitions for systemd/OpenRC reject unsafe paths'
+
+# ── 8. 检测网址设置与校验 ──
+for u in "https://www.gstatic.com/generate_204" "http://cp.cloudflare.com/generate_204" "https://example.com:8443/a/b?x=1&y=2"; do
+    _failover_valid_url "$u" || fail "应接受合法网址: $u"
+done
+for u in "ftp://example.com" "https://exa mple.com" 'https://example.com/"x' 'https://example.com/\x' "https://"; do
+    if _failover_valid_url "$u"; then fail "应拒绝网址: $u"; fi
+done
+db_set_failover_test_urls "https://a.example/1" "https://b.example/2" "https://a.example/1" || fail "设置检测网址失败"
+[[ "$(_failover_test_urls | paste -sd ' ' -)" == "https://a.example/1 https://b.example/2" ]] || fail "检测网址应去重并保持顺序"
+if db_set_failover_test_urls "https://a.example/bad url" 2>/dev/null; then fail "非法网址应拒绝"; fi
+if db_set_failover_test_urls https://e.example/{1..6} 2>/dev/null; then fail "超过 5 个应拒绝"; fi
+db_set_failover_test_urls || fail "恢复默认失败"
+[[ "$(_failover_test_urls | paste -sd ' ' -)" == "${FAILOVER_DEFAULT_TEST_URLS[*]}" ]] || fail "恢复默认后应为默认网址"
+jq -e 'has("failover_test_urls") | not' "$DB_FILE" >/dev/null || fail "恢复默认应删除自定义字段"
+echo 'PASS test URL validation, dedupe, limit of 5 and reset to defaults'
+
+# ── 9. 删除故障转移组后，配置事务不应因探测入口消失而拒绝应用（真机发现的回归）──
+svc() { return 1; }
+printf '#!/bin/sh\nexit 0\n' > "$fixture/xray-ok"; chmod +x "$fixture/xray-ok"
+base_db '[{"id":"custom_1","type":"custom","outbound":"balancer:FO","domains":"example.com"}]' ""
+cp "$fixture/x1.json" "$CFG/config.json"   # 运行中的配置带有探测入口
+jq '.balancer_groups = [] | .routing_rules = []' "$DB_FILE" > "$fixture/db" && mv "$fixture/db" "$DB_FILE"
+bk=$(_user_change_begin xray) || fail "无法创建事务备份"
+XRAY_BIN="$fixture/xray-ok" _user_change_apply xray "$bk" validate ||
+    fail "删除故障转移组后候选配置被拒绝：探测入口不应计入必须保留的入站"
+jq -e '[.inbounds[] | select(.tag | startswith("fo-probe-"))] | length == 0' "$bk/candidate.json" >/dev/null ||
+    fail "删除组后候选配置不应再有探测入口"
+# 对照：普通入站缺失仍应被拒绝（原有保护不变）
+jq '.inbounds += [{tag:"keep-me", port:30999, protocol:"socks", listen:"127.0.0.1"}]' "$fixture/x1.json" > "$CFG/config.json"
+bk=$(_user_change_begin xray) || fail "无法创建事务备份"
+if XRAY_BIN="$fixture/xray-ok" _user_change_apply xray "$bk" validate 2>/dev/null; then fail "普通入站缺失时仍应拒绝"; fi
+echo 'PASS removing failover groups drops probe inbounds through the transaction; other missing inbounds still rejected'

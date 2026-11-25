@@ -113,16 +113,30 @@ JSON
         esac
     }
     report=$(VLESS_PING0_KEY=demo_key test_routing)
-    for expected in 'claude.ai → 组 FO' 'Xray → 备用节点 备' 'sing-box → 主节点 主' \
-        'IPv4  198.51.100.2（与直连不同）' 'IPv4  192.0.2.1（与直连相同）' \
-        'IPv6  2001:0db8:0:0:0:0:0:1（与直连相同）' '广告屏蔽 → 拦截' '动态选路'; do
+    for expected in 'claude.ai → 组 FO → Xray → 备用节点 备 → 出口 IPv4 198.51.100.2（与直连不同）' \
+        'claude.ai → 组 FO → sing-box → 主节点 主 → 出口 IPv4 192.0.2.1（与直连相同） / IPv6 2001:0db8:0:0:0:0:0:1（与直连相同）' \
+        'example.com [仅 IPv4] → 备 → 出口 IPv4 198.51.100.2' \
+        '广告屏蔽 → 拦截' '动态选路' '候选 备 → 出口 IPv4 198.51.100.2'; do
         [[ "$report" == *"$expected"* ]] || fail "$expected"
     done
     openai=${report#*'OpenAI/ChatGPT [仅 IPv6]'}; openai=${openai%%example.com*}
     [[ "$openai" == *'未取得对应地址族的出口 IP'* && "$openai" != *IPv4* ]] || fail '只匹配 IPv6'
     [[ $(wc -l < "$fixture/apis") == 2 && $(wc -l < "$fixture/probes") == 3 && ! -e "$fixture/paid" ]] || fail '重复探测或付费查询'
     report=$(xray_now=direct sb_now=unrecognized test_routing)
-    [[ "$report" == *'Xray → 回落直连'* && "$report" == *'sing-box → 当前出口未确认'* ]] || fail '直连回落与未知状态'
+    [[ "$report" == *'Xray → 回落直连 → 出口 IPv4 192.0.2.1'* && "$report" == *'sing-box → 当前出口未确认，IP 未知'* ]] || fail '直连回落与未知状态'
+
+    _header() { :; }
+    _line() { :; }
+    _item() { :; }
+    warp_status() { echo not_configured; }
+    : > "$fixture/probes"
+    report=$(manage_routing <<<'8
+
+7
+0')
+    expected='example.com [仅 IPv4] → 备 → 出口 IPv4 198.51.100.2'
+    [[ $(grep -Fc "$expected" <<< "$report") == 3 && $(wc -l < "$fixture/probes") == 6 ]] ||
+        fail '首页首次显示 IP、返回复用结果、选择 7 重新探测'
 )
 
 # 实际 SOCKS 落地收到指定域名后返回标记。测试不依赖公网或任何评分服务。

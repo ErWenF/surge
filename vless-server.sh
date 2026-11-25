@@ -19097,6 +19097,11 @@ show_routing_status() {
     fi
     
     _line
+    if [[ "${1:-}" == paths ]]; then
+        _show_routing_paths
+        _line
+        return
+    fi
     echo -e "  ${C}分流规则${NC}"
     _line
     
@@ -19181,7 +19186,9 @@ _sample_routing_exit() {
 }
 
 _print_routing_ips() {
-    local out="$1" version="$2" ip family key note shown=false
+    local out="$1" version="$2" caption="$3" ip family key note
+    local -a addresses=()
+    printf '%s → ' "$caption"
     _sample_routing_exit "$out"
     while IFS= read -r ip; do
         key=$(_quality_ip_key "$ip") || continue
@@ -19195,10 +19202,15 @@ _print_routing_ips() {
         elif [[ -z "${direct_keys[$family]:-}" ]]; then note='（缺少同族直连对照）'
         elif [[ "${direct_keys[$family]}" == "$key" ]]; then note='（与直连相同）'
         else note='（与直连不同）'; fi
-        printf '      IPv%s  %s%s\n' "$family" "$ip" "$note"
-        shown=true
+        addresses+=("IPv$family $ip$note")
     done < <(jq -r '.ip // empty' <<< "${routing_samples[$out]}")
-    [[ "$shown" == true ]] || printf '      未取得对应地址族的出口 IP\n'
+    if (( ${#addresses[@]} )); then
+        printf '出口 %s' "${addresses[0]}"
+        if (( ${#addresses[@]} > 1 )); then printf ' / %s' "${addresses[@]:1}"; fi
+        printf '\n'
+    else
+        printf '未取得对应地址族的出口 IP\n'
+    fi
 }
 
 # 顺序以内核配置为准，当前选中项来自只读 API。空返回或意外的 tag 都保留为未知。
@@ -19231,8 +19243,7 @@ _routing_group_selection() {
 _show_routing_paths() {
     local rules rule type out name version group strategy target role core group_json
     local -A direct_keys=() selections=()
-    printf '\n  服务器直连对照\n'
-    _print_routing_ips direct as_is
+    _print_routing_ips direct as_is '  服务器直连'
     rules=$(db_get_routing_rules)
     if [[ -z "$rules" || "$rules" == '[]' ]]; then
         printf '  未配置全局分流规则\n'
@@ -19249,29 +19260,32 @@ _show_routing_paths() {
         case "$out" in
             block) printf '  %s → 拦截\n' "$name" ;;
             direct|warp|chain:*)
-                printf '  %s → %s\n' "$name" "$(_get_outbound_display_name "$out")"
-                _print_routing_ips "$out" "$version" ;;
+                _print_routing_ips "$out" "$version" "  $name → $(_get_outbound_display_name "$out")" ;;
             balancer:*)
                 group="${out#balancer:}"
-                printf '  %s → 组 %s\n' "$name" "$group"
+                local caption="  $name → 组 $group" member
                 group_json=$(db_get_balancer_group "$group") || group_json=''
                 strategy=$(jq -r '.strategy // empty' <<< "$group_json")
                 if [[ "$strategy" != failover ]]; then
-                    if [[ -z "$strategy" ]]; then printf '      组配置未找到\n'
-                    elif ! jq -e '.nodes | length > 0' <<< "$group_json" >/dev/null; then printf '      组内无节点\n'
-                    else printf '      %s 动态选路，单次连接出口未确认\n' "$strategy"; fi
+                    if [[ -z "$strategy" ]]; then printf '%s → 组配置未找到\n' "$caption"
+                    elif ! jq -e '.nodes | length > 0' <<< "$group_json" >/dev/null; then printf '%s → 组内无节点\n' "$caption"
+                    else
+                        printf '%s（%s 动态选路，以下为候选出口）\n' "$caption" "$strategy"
+                        while IFS= read -r member; do
+                            _print_routing_ips "chain:$member" "$version" "    候选 $member"
+                        done < <(jq -r '.nodes[] | strings' <<< "$group_json")
+                    fi
                     continue
                 fi
                 if [[ -z "${selections[$out]+set}" ]]; then selections[$out]=$(_routing_group_selection "$group"); fi
-                if [[ -z "${selections[$out]}" ]]; then printf '      当前出口未确认\n'; continue; fi
+                if [[ -z "${selections[$out]}" ]]; then printf '%s → 当前出口未确认，IP 未知\n' "$caption"; continue; fi
                 while IFS=$'\t' read -r core role target; do
                     case "$role" in
                         主节点|备用节点)
                             target=$(_failover_tag_label "$target")
-                            printf '    %s → %s %s\n' "$core" "$role" "$target"
-                            _print_routing_ips "chain:$target" "$version" ;;
-                        回落直连) printf '    %s → 回落直连\n' "$core"; _print_routing_ips direct "$version" ;;
-                        *) printf '    %s → 当前出口未确认\n' "$core" ;;
+                            _print_routing_ips "chain:$target" "$version" "$caption → $core → $role $target" ;;
+                        回落直连) _print_routing_ips direct "$version" "$caption → $core → 回落直连" ;;
+                        *) printf '%s → %s → 当前出口未确认，IP 未知\n' "$caption" "$core" ;;
                     esac
                 done <<< "${selections[$out]}" ;;
             *) printf '  %s → %s（出口未探测）\n' "$name" "$out" ;;
@@ -20504,7 +20518,8 @@ _quality_print_route() {
 
 show_egress_quality() {
     local ping0_key="${VLESS_PING0_KEY:-}" nodes node name
-    local -A ip99_cache=() ping0_cache=() routing_samples=()
+    local -A ip99_cache=() ping0_cache=()
+    if [[ "${1:-}" != menu ]]; then local -A routing_samples=(); fi
     if [[ -n "$ping0_key" && ! "$ping0_key" =~ ^[a-zA-Z0-9._~-]+$ ]]; then
         _warn "Ping0 密钥格式无效，本轮仅查免费来源"
         ping0_key=''
@@ -20529,10 +20544,12 @@ show_egress_quality() {
 
 # 分流管理主菜单
 manage_routing() {
+    local -A routing_samples=()
+    local choice
     while true; do
         _header
         echo -e "  ${W}分流管理${NC}"
-        show_routing_status
+        show_routing_status paths
         
         _item "1" "WARP 管理"
         _item "2" "链式代理"
@@ -20540,14 +20557,15 @@ manage_routing() {
         _item "4" "直连出口设置"
         _item "5" "多IP入出站配置"
         _item "6" "访问限制"
-        _item "7" "测试分流效果"
+        _item "7" "测试分流效果（刷新出口 IP）"
         _item "8" "查看当前配置"
         _item "9" "按入站端口指定出口"
         _item "10" "出口 IP 质量评分"
         _item "0" "返回"
         _line
         
-        read -rp "  请选择: " choice
+        read -rp "  请选择: " choice || return 0
+        case "$choice" in 1|2|3|4|5|6|7|9|10) routing_samples=() ;; esac
         
         case "$choice" in
             1) manage_warp ;;
@@ -20556,12 +20574,7 @@ manage_routing() {
             4) configure_direct_outbound ;;
             5) manage_ip_routing ;;
             6) manage_access_restrictions ;;
-            7)
-                _header
-                echo -e "  ${W}测试分流效果${NC}"
-                test_routing
-                _pause
-                ;;
+            7) continue ;;
             8)
                 _header
                 echo -e "  ${W}当前分流配置${NC}"
@@ -20576,7 +20589,7 @@ manage_routing() {
                 read -rp "  按回车返回..." _
                 ;;
             9) manage_port_routing ;;
-            10) show_egress_quality; _pause ;;
+            10) show_egress_quality menu; _pause ;;
             0) return ;;
             *) _err "无效选择"; _pause ;;
         esac

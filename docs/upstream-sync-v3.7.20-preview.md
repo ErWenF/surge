@@ -152,6 +152,13 @@
 - 没有验证"真实证书 + sing-box 接管 VLESS REALITY"的组合。
 - po0fw 模块只跑了 Node 回归，没有在 Surge 里运行。
 
+### 测试环境清理复核（2026-11-25）
+
+- 在 Debian 12 测试机上已确认，`/usr/local/bin` 下的 `sing-box`、`grpcurl` 和 `mita` 已清理。`mita` 用户、组及数据目录已移除，systemd 中已无 `vless-singbox`、`vless-mieru` 和 `mita` 单元。
+- 清理时曾误删测试前的 Xray 配置快照，随后从当天 11:18:59 的备份恢复。逐项对照该备份，`backups/user-changes/` 下原有的 24 个快照目录、文件内容、属主、属组和权限均一致。当前 Xray `config.json` 也与该备份逐字节一致。
+- `/etc/vless-reality` 保留了测试前的全部路径。新增的 6 个文件分别是 cron 锁、IP 检测日志和基准地址、升级前的 3.7.19 脚本备份，以及两个版本缓存标记。测试前和复测前的两份服务器备份仍在。
+- 服务器安装的脚本与预览提交 `516f633` 的脚本逐字节一致。Xray、watchdog、Nginx、Docker、fail2ban 均在运行，`nginx -t` 通过，Nginx 正在监听 80 和 443，Xray 正在监听入站端口。此次清理后复核覆盖服务、配置和监听状态，客户端连接结果见前面的真机验证。
+
 ## 预览版安装
 
 预览分支：[codex/upstream-sync-v3.7.20](https://github.com/ErWenF/surge/tree/codex/upstream-sync-v3.7.20)。按项目约定，预览版不创建 GitHub Release，也不标记为最新正式版。以 root 执行以下命令，已安装的节点和用户数据会保留：

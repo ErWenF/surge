@@ -17796,7 +17796,7 @@ _failover_clash_request() {
     [[ "$secret" =~ ^[0-9a-f]{32}$ ]] || return 1
     local args=(-fsS --max-time 10 -X "$method")
     [[ -z "$body" ]] || args+=(-H 'Content-Type: application/json' --data "$body")
-    curl "${args[@]}" --config - "http://127.0.0.1:${SINGBOX_CLASH_API_PORT}${path}" 2>/dev/null \
+    curl -q --noproxy '*' "${args[@]}" --config - "http://127.0.0.1:${SINGBOX_CLASH_API_PORT}${path}" 2>/dev/null \
         <<< "header = \"Authorization: Bearer ${secret}\""
 }
 
@@ -19154,65 +19154,139 @@ show_routing_status() {
     _line
 }
 
+# 以出口标识为键缓存本轮探测，包括失败的线路。评分页与规则页共用。
+_sample_routing_exit() {
+    local out="$1" node="${2:-}" type core
+    [[ -z "${routing_samples[$out]+set}" ]] || return 0
+    routing_samples[$out]=''
+    case "$out" in
+        direct) routing_samples[$out]=$(_quality_observe ''); return ;;
+        warp)
+            case "$(warp_status)" in
+                connected) _is_valid_port "$WARP_OFFICIAL_PORT" || return 0
+                    routing_samples[$out]=$(_quality_observe "$WARP_OFFICIAL_PORT"); return ;;
+                configured) [[ "$(db_get_warp_mode)" == wgcf ]] || return 0
+                    node=warp; type=socks ;;
+                *) return 0 ;;
+            esac ;;
+        chain:*)
+            [[ -n "$node" ]] || node=$(db_get_chain_node "${out#chain:}") || return 0
+            type=$(jq -er '.type | strings' <<< "$node") || return 0
+            case "$type" in socks5) type=socks ;; hy2) type=hysteria2 ;; esac
+            node=$(jq -c --arg t "$type" '.type=$t' <<< "$node") || return 0 ;;
+        *) return 0 ;;
+    esac
+    core=$(_pick_latency_core "$type") || return 0
+    routing_samples[$out]=$(_with_probe_proxy "$core" "$node" as_is _quality_observe) || routing_samples[$out]=''
+}
+
+_print_routing_ips() {
+    local out="$1" version="$2" ip family key note shown=false
+    _sample_routing_exit "$out"
+    while IFS= read -r ip; do
+        key=$(_quality_ip_key "$ip") || continue
+        family=4
+        [[ "$ip" != *:* ]] || family=6
+        [[ "$version" != ipv4_only || "$family" == 4 ]] || continue
+        [[ "$version" != ipv6_only || "$family" == 6 ]] || continue
+        note=''
+        if [[ "$out" == direct ]]; then
+            direct_keys[$family]="$key"
+        elif [[ -z "${direct_keys[$family]:-}" ]]; then note='（缺少同族直连对照）'
+        elif [[ "${direct_keys[$family]}" == "$key" ]]; then note='（与直连相同）'
+        else note='（与直连不同）'; fi
+        printf '      IPv%s  %s%s\n' "$family" "$ip" "$note"
+        shown=true
+    done < <(jq -r '.ip // empty' <<< "${routing_samples[$out]}")
+    [[ "$shown" == true ]] || printf '      未取得对应地址族的出口 IP\n'
+}
+
+# 顺序以内核配置为准，当前选中项来自只读 API。空返回或意外的 tag 都保留为未知。
+_routing_group_selection() {
+    local group="$1" core candidates selected index role
+    for core in Xray sing-box; do
+        if [[ "$core" == Xray ]]; then
+            [[ -s "$CFG/config.json" ]] || continue
+            candidates=$(jq -ce --arg g "balancer-$group" '.routing.balancers[]? | select(.tag==$g) | .selector' "$CFG/config.json") || continue
+            selected=$(_failover_xray_override "balancer-$group") || selected=''
+        else
+            [[ -s "$CFG/singbox.json" ]] || continue
+            candidates=$(jq -ce --arg g "balancer-$group" '.outbounds[]? | select(.tag==$g and .type=="selector") | .outbounds' "$CFG/singbox.json") || continue
+            selected=$(_failover_singbox_now "balancer-$group") || selected=''
+        fi
+        role='当前出口未确认'
+        case "$selected" in
+            direct) role='回落直连' ;;
+            chain-*-prefer-ipv4)
+                if index=$(jq -er --arg t "$selected" 'index($t) // empty' <<< "$candidates"); then
+                    role='主节点'
+                    (( index == 0 )) || role='备用节点'
+                fi ;;
+        esac
+        printf '%s\t%s\t%s\n' "$core" "$role" "$selected"
+    done
+    return 0
+}
+
+_show_routing_paths() {
+    local rules rule type out name version group strategy target role core group_json
+    local -A direct_keys=() selections=()
+    printf '\n  服务器直连对照\n'
+    _print_routing_ips direct as_is
+    rules=$(db_get_routing_rules)
+    if [[ -z "$rules" || "$rules" == '[]' ]]; then
+        printf '  未配置全局分流规则\n'
+        return
+    fi
+    printf '\n  全局分流规则 → 配置出口（IP 来自线路回显探测）\n'
+    while IFS= read -r rule; do
+        type=$(jq -r '.type' <<< "$rule")
+        out=$(jq -r '.outbound' <<< "$rule")
+        version=$(jq -r '.ip_version // "prefer_ipv4"' <<< "$rule")
+        name="${ROUTING_PRESET_NAMES[$type]:-$type}"
+        case "$type" in custom) name=$(jq -r '.domains // "自定义"' <<< "$rule") ;; all) name='所有流量' ;; esac
+        case "$version" in ipv4_only) name+=' [仅 IPv4]' ;; ipv6_only) name+=' [仅 IPv6]' ;; esac
+        case "$out" in
+            block) printf '  %s → 拦截\n' "$name" ;;
+            direct|warp|chain:*)
+                printf '  %s → %s\n' "$name" "$(_get_outbound_display_name "$out")"
+                _print_routing_ips "$out" "$version" ;;
+            balancer:*)
+                group="${out#balancer:}"
+                printf '  %s → 组 %s\n' "$name" "$group"
+                group_json=$(db_get_balancer_group "$group") || group_json=''
+                strategy=$(jq -r '.strategy // empty' <<< "$group_json")
+                if [[ "$strategy" != failover ]]; then
+                    if [[ -z "$strategy" ]]; then printf '      组配置未找到\n'
+                    elif ! jq -e '.nodes | length > 0' <<< "$group_json" >/dev/null; then printf '      组内无节点\n'
+                    else printf '      %s 动态选路，单次连接出口未确认\n' "$strategy"; fi
+                    continue
+                fi
+                if [[ -z "${selections[$out]+set}" ]]; then selections[$out]=$(_routing_group_selection "$group"); fi
+                if [[ -z "${selections[$out]}" ]]; then printf '      当前出口未确认\n'; continue; fi
+                while IFS=$'\t' read -r core role target; do
+                    case "$role" in
+                        主节点|备用节点)
+                            target=$(_failover_tag_label "$target")
+                            printf '    %s → %s %s\n' "$core" "$role" "$target"
+                            _print_routing_ips "chain:$target" "$version" ;;
+                        回落直连) printf '    %s → 回落直连\n' "$core"; _print_routing_ips direct "$version" ;;
+                        *) printf '    %s → 当前出口未确认\n' "$core" ;;
+                    esac
+                done <<< "${selections[$out]}" ;;
+            *) printf '  %s → %s（出口未探测）\n' "$name" "$out" ;;
+        esac
+    done < <(jq -c '.[]' <<< "$rules")
+    printf '  目标网站实际命中情况需结合客户端请求核实。\n'
+}
+
 # 测试分流是否生效
 test_routing() {
-    local rules=$(db_get_routing_rules)
-    
-    # 检查是否有规则
-    if [[ -z "$rules" || "$rules" == "[]" ]]; then
-        _info "未配置分流规则"
-        return 0
-    fi
-    
-    echo ""
-    _info "测试分流效果..."
-    _line
-    
-    # 获取本机直连 IP
-    local direct_ip=$(curl -s --connect-timeout 5 https://api.ipify.org 2>/dev/null)
-    [[ -z "$direct_ip" ]] && direct_ip=$(curl -s --connect-timeout 5 https://ifconfig.me 2>/dev/null)
-    echo -e "  直连出口 IP: ${C}${direct_ip:-获取失败}${NC}"
-    
-    # 测试 WARP 出口
-    local warp_st=$(warp_status)
-    if [[ "$warp_st" == "connected" ]]; then
-        local warp_ip=$(curl -s --connect-timeout 10 --socks5 127.0.0.1:$WARP_OFFICIAL_PORT https://api.ipify.org 2>/dev/null)
-        [[ -n "$warp_ip" ]] && echo -e "  WARP 出口 IP: ${G}${warp_ip}${NC}"
-    elif [[ "$warp_st" == "configured" ]]; then
-        echo -e "  WARP: ${G}已配置${NC} (WGCF/UDP)"
-    fi
-    
-    _line
-    
-    # 显示规则测试信息
-    echo -e "  ${Y}已配置的分流规则:${NC}"
-    while IFS= read -r rule; do
-        [[ -z "$rule" ]] && continue
-        local rule_type=$(echo "$rule" | jq -r '.type')
-        local outbound=$(echo "$rule" | jq -r '.outbound')
-        local domains=$(echo "$rule" | jq -r '.domains // ""')
-        
-        local rule_name="${ROUTING_PRESET_NAMES[$rule_type]:-$rule_type}"
-        [[ "$rule_type" == "custom" ]] && rule_name="自定义"
-        [[ "$rule_type" == "all" ]] && rule_name="所有流量"
-        local outbound_name=$(_get_outbound_display_name "$outbound")
-        
-        # 获取测试域名
-        if [[ "$rule_type" == "all" ]]; then
-            echo -e "  ${G}●${NC} ${rule_name} → ${outbound_name}"
-        else
-            local test_domain=""
-            [[ -n "$domains" && "$domains" != "null" ]] && test_domain=$(echo "$domains" | cut -d',' -f1)
-            echo -e "  ${G}●${NC} ${rule_name} → ${outbound_name} (${test_domain:-N/A})"
-        fi
-    done < <(echo "$rules" | jq -c '.[]')
-    
-    echo ""
-    echo -e "  ${G}✓${NC} 分流规则已配置"
-    _line
-    echo -e "  ${Y}验证方法:${NC}"
-    echo -e "  • 手机访问 ${C}https://ip.sb${NC} 查看出口 IP"
-    echo ""
+    local -A routing_samples=()
+    _show_routing_paths
+}
+
+_routing_debug_help() {
     echo -e "  ${Y}调试命令 (Xray):${NC}"
     echo -e "  • 检查配置语法: ${C}xray run -test -c /etc/vless-reality/config.json${NC}"
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -19462,6 +19536,7 @@ configure_routing_rules() {
         _item "2" "删除分流规则"
         _item "3" "清空所有规则"
         _item "4" "测试分流效果"
+        _item "d" "查看分流调试命令"
         _item "0" "返回"
         _line
         
@@ -19485,6 +19560,7 @@ configure_routing_rules() {
                 test_routing
                 _pause
                 ;;
+            d|D) _routing_debug_help; _pause ;;
             0) return ;;
         esac
     done
@@ -20427,8 +20503,8 @@ _quality_print_route() {
 }
 
 show_egress_quality() {
-    local ping0_key="${VLESS_PING0_KEY:-}" nodes node name type core records
-    local -A ip99_cache=() ping0_cache=()
+    local ping0_key="${VLESS_PING0_KEY:-}" nodes node name
+    local -A ip99_cache=() ping0_cache=() routing_samples=()
     if [[ -n "$ping0_key" && ! "$ping0_key" =~ ^[a-zA-Z0-9._~-]+$ ]]; then
         _warn "Ping0 密钥格式无效，本轮仅查免费来源"
         ping0_key=''
@@ -20436,27 +20512,19 @@ show_egress_quality() {
     _header
     printf '  出口 IP 质量评分（0–100，越高风险越高）\n'
     printf '  线路 | 实测出口 IP | 地区 | 网络类型 | IPPure | IP99%s\n' "${ping0_key:+ | Ping0}"
-    _quality_print_route '服务器直连' "$(_quality_observe '')"
-    if [[ "$(warp_status)" == connected ]]; then
-        _quality_print_route WARP "$(_quality_observe "$WARP_OFFICIAL_PORT")"
-    elif [[ -s "$WARP_CONF_FILE" && "$(db_get_warp_mode)" == wgcf ]]; then
-        core=$(_pick_latency_core socks) || core=''
-        records=''
-        [[ -z "$core" ]] || records=$(_with_probe_proxy "$core" warp as_is _quality_observe) || records=''
-        _quality_print_route WARP "$records"
-    fi
+    _sample_routing_exit direct
+    _quality_print_route '服务器直连' "${routing_samples[direct]}"
+    case "$(warp_status)" in
+        connected|configured) _sample_routing_exit warp; _quality_print_route WARP "${routing_samples[warp]}" ;;
+    esac
     nodes=$(db_get_chain_nodes)
     while IFS= read -r node; do
         name=$(jq -r '.name' <<< "$node")
-        type=$(jq -r '.type' <<< "$node")
-        case "$type" in socks5) type=socks ;; hy2) type=hysteria2 ;; esac
-        node=$(jq -c --arg t "$type" '.type=$t' <<< "$node")
-        core=$(_pick_latency_core "$type") || core=''
-        records=''
-        [[ -z "$core" ]] || records=$(_with_probe_proxy "$core" "$node" as_is _quality_observe) || records=''
-        _quality_print_route "$name" "$records"
+        _sample_routing_exit "chain:$name" "$node"
+        _quality_print_route "$name" "${routing_samples[chain:$name]}"
     done < <(jq -c '.[]?' <<< "$nodes")
     echo '  IPLark 人工复核：在 https://iplark.com 输入表中的出口 IP。'
+    _show_routing_paths
 }
 
 # 分流管理主菜单

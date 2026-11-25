@@ -87,6 +87,44 @@ fail() { echo "FAIL $*" >&2; exit 1; }
         fail '备用回显只能补充实测地址'
 )
 
+# 分流规则页保留配置顺序。双内核可以选中不同节点；相同 IP 不等于直连回落。
+(
+    cat > "$DB_FILE" <<'JSON'
+{"chain_proxy":{"nodes":[{"name":"主","type":"socks"},{"name":"备","type":"socks"}]},
+ "balancer_groups":[{"name":"FO","strategy":"failover","nodes":["主","备"]},{"name":"LB","strategy":"random","nodes":["主","备"]}],
+ "routing_rules":[{"type":"custom","domains":"claude.ai","outbound":"balancer:FO"},
+ {"type":"openai","outbound":"balancer:FO","ip_version":"ipv6_only"},
+ {"type":"custom","domains":"example.com","outbound":"chain:备","ip_version":"ipv4_only"},
+ {"type":"ads","outbound":"block"},{"type":"google","outbound":"balancer:LB"}]}
+JSON
+    printf '%s' '{"routing":{"balancers":[{"tag":"balancer-FO","selector":["chain-主-prefer-ipv4","chain-备-prefer-ipv4"]}]}}' > "$CFG/config.json"
+    printf '%s' '{"outbounds":[{"type":"selector","tag":"balancer-FO","outbounds":["chain-主-prefer-ipv4","chain-备-prefer-ipv4","direct"]}]}' > "$CFG/singbox.json"
+    _failover_xray_override() { echo Xray >> "$fixture/apis"; echo "${xray_now:-chain-备-prefer-ipv4}"; }
+    _failover_singbox_now() { echo sing-box >> "$fixture/apis"; echo "${sb_now:-chain-主-prefer-ipv4}"; }
+    _pick_latency_core() { echo xray; }
+    _with_probe_proxy() { "$4" "$(jq -r .name <<< "$2")"; }
+    _quality_lookup() { echo '意外查分' >> "$fixture/paid"; return 1; }
+    _quality_observe() {
+        echo "probe:${1:-direct}" >> "$fixture/probes"
+        case "$1" in
+            '') printf '%s\n' '{"ip":"192.0.2.1"}' '{"ip":"2001:db8::1"}' ;;
+            主) printf '%s\n' '{"ip":"192.0.2.1"}' '{"ip":"2001:0db8:0:0:0:0:0:1"}' ;;
+            备) printf '%s\n' '{"ip":"198.51.100.2"}' ;;
+        esac
+    }
+    report=$(VLESS_PING0_KEY=demo_key test_routing)
+    for expected in 'claude.ai → 组 FO' 'Xray → 备用节点 备' 'sing-box → 主节点 主' \
+        'IPv4  198.51.100.2（与直连不同）' 'IPv4  192.0.2.1（与直连相同）' \
+        'IPv6  2001:0db8:0:0:0:0:0:1（与直连相同）' '广告屏蔽 → 拦截' '动态选路'; do
+        [[ "$report" == *"$expected"* ]] || fail "$expected"
+    done
+    openai=${report#*'OpenAI/ChatGPT [仅 IPv6]'}; openai=${openai%%example.com*}
+    [[ "$openai" == *'未取得对应地址族的出口 IP'* && "$openai" != *IPv4* ]] || fail '只匹配 IPv6'
+    [[ $(wc -l < "$fixture/apis") == 2 && $(wc -l < "$fixture/probes") == 3 && ! -e "$fixture/paid" ]] || fail '重复探测或付费查询'
+    report=$(xray_now=direct sb_now=unrecognized test_routing)
+    [[ "$report" == *'Xray → 回落直连'* && "$report" == *'sing-box → 当前出口未确认'* ]] || fail '直连回落与未知状态'
+)
+
 # 实际 SOCKS 落地收到指定域名后返回标记。测试不依赖公网或任何评分服务。
 for native_path in "${XRAY_BIN:-}" "${SINGBOX_TEST_BIN:-}"; do
     [[ -x "$native_path" ]] || continue

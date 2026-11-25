@@ -20330,6 +20330,135 @@ manage_port_routing() {
     done
 }
 
+# 明确设置代理和 NO_PROXY，避免 VPS 的 curl 配置或环境变量改变被测线路。
+_quality_http() {
+    local port="$1"
+    shift
+    local -a route=(--noproxy '*')
+    [[ -z "$port" ]] || route=(--noproxy '' --socks5-hostname "127.0.0.1:$port")
+    curl -qfsS --proto '=https' --connect-timeout 4 --max-time 9 --max-filesize 65536 \
+        "${route[@]}" "$@" 2>/dev/null
+}
+
+_quality_ip_key() {
+    if _is_valid_ipv4_literal "$1"; then printf '%s' "$1"; else _server_ipv6_key "$1"; fi
+}
+
+# 每行是一条绑定到实测 IP 的 JSON 记录。IPPure 缺分或不可达时仍可按 IP 查询其他来源。
+_quality_observe() {
+    local port="$1" pure ip family url record
+    local -A observed=()
+    local -a families=(-4 -6) flags=()
+    # SOCKS 代理自己解析目标域名；curl 的 -4/-6 只约束连接代理时使用的地址族。
+    [[ -z "$port" ]] || families=(auto)
+    for family in "${families[@]}"; do
+        [[ "$family" == auto ]] || flags=("$family")
+        pure=$(_quality_http "$port" https://my.ippure.com/v1/info "${flags[@]}") || continue
+        ip=$(jq -er '.ip | strings' <<< "$pure" 2>/dev/null) || continue
+        if _is_valid_ipv4_literal "$ip"; then family=4
+        elif _is_valid_ipv6_literal "$ip"; then family=6
+        else continue; fi
+        [[ -z "${observed[$family]:-}" ]] || continue
+        record=$(jq -c '{ip, pure:.fraudScore, country:.countryCode, residential:.isResidential}' <<< "$pure") || continue
+        observed[$family]=1
+        printf '%s\n' "$record"
+    done
+    for family in 4 6; do
+        [[ -z "${observed[$family]:-}" ]] || continue
+        local -a urls=(https://api.ipify.org https://ipv4.icanhazip.com)
+        [[ "$family" == 4 ]] || urls=(https://api6.ipify.org https://ipv6.icanhazip.com)
+        for url in "${urls[@]}"; do
+            ip=$(_quality_http "$port" "$url") || continue
+            if [[ "$family" == 4 ]]; then _is_valid_ipv4_literal "$ip" || continue
+            else _is_valid_ipv6_literal "$ip" || continue; fi
+            jq -cn --arg ip "$ip" '{ip:$ip}'
+            break
+        done
+    done
+    return 0
+}
+
+# 只有服务回显的 IP 与实测 IP 相同才接受结果，允许 IPv6 的等价写法。
+_quality_lookup() {
+    local ip="$1" key="$2" provider="$3" data reported
+    case "$provider" in
+        IP99) data=$(_quality_http '' "https://ip99.com/v1/ip/$ip") || return 1 ;;
+        Ping0)
+            # 付费密钥通过 stdin 交给 curl，不写入配置文件或命令行。
+            data=$(printf 'url = "https://api.ping0.cc/%s/json/%s"\n' "$ping0_key" "$ip" |
+                _quality_http '' --config -) || return 1 ;;
+        *) return 1 ;;
+    esac
+    reported=$(jq -er '.ip | strings' <<< "$data" 2>/dev/null) || return 1
+    [[ "$(_quality_ip_key "$reported")" == "$key" ]] || return 1
+    if [[ "$provider" == IP99 ]]; then
+        jq -c '{score:.risk.score,country:.geo.country,network:.network.usage_type}' <<< "$data"
+    else
+        jq -c '{score:(.iprisk | if type=="string" then sub("%$";"") | tonumber? else . end)}' <<< "$data"
+    fi
+}
+
+_quality_print_route() {
+    local name="$1" records="$2" record ip key row
+    name=$(printf '%s' "$name" | tr -d '[:cntrl:]')
+    if [[ -z "$records" ]]; then
+        printf '  %s | 未取得出口 IP\n' "$name"
+        return
+    fi
+    while IFS= read -r record; do
+        ip=$(jq -er '.ip' <<< "$record") || continue
+        key=$(_quality_ip_key "$ip") || continue
+        if [[ -z "${ip99_cache[$key]+set}" ]]; then
+            ip99_cache[$key]=$(_quality_lookup "$ip" "$key" IP99) || ip99_cache[$key]=''
+            if [[ -n "$ping0_key" ]]; then
+                ping0_cache[$key]=$(_quality_lookup "$ip" "$key" Ping0) || ping0_cache[$key]=''
+            fi
+        fi
+        row=$(jq -r --argjson db "${ip99_cache[$key]:-null}" --argjson ping "${ping0_cache[$key]:-null}" \
+            --arg paid "${ping0_key:+yes}" '
+            def score: if type=="number" and .>=0 and .<=100 then tostring else "未取得评分" end;
+            def display_text: if type=="string" and length>0 then gsub("[[:cntrl:]]";"") else "未知" end;
+            [.ip, ((.country // $db.country)|display_text),
+             ((if .residential==true then "住宅" else $db.network end)|display_text),
+             (.pure|score), ($db.score|score)] + (if $paid=="yes" then [($ping.score|score)] else [] end)
+            | join(" | ")' <<< "$record") || continue
+        printf '  %s | %s\n' "$name" "$row"
+    done <<< "$records"
+}
+
+show_egress_quality() {
+    local ping0_key="${VLESS_PING0_KEY:-}" nodes node name type core records
+    local -A ip99_cache=() ping0_cache=()
+    if [[ -n "$ping0_key" && ! "$ping0_key" =~ ^[a-zA-Z0-9._~-]+$ ]]; then
+        _warn "Ping0 密钥格式无效，本轮仅查免费来源"
+        ping0_key=''
+    fi
+    _header
+    printf '  出口 IP 质量评分（0–100，越高风险越高）\n'
+    printf '  线路 | 实测出口 IP | 地区 | 网络类型 | IPPure | IP99%s\n' "${ping0_key:+ | Ping0}"
+    _quality_print_route '服务器直连' "$(_quality_observe '')"
+    if [[ "$(warp_status)" == connected ]]; then
+        _quality_print_route WARP "$(_quality_observe "$WARP_OFFICIAL_PORT")"
+    elif [[ -s "$WARP_CONF_FILE" && "$(db_get_warp_mode)" == wgcf ]]; then
+        core=$(_pick_latency_core socks) || core=''
+        records=''
+        [[ -z "$core" ]] || records=$(_with_probe_proxy "$core" warp as_is _quality_observe) || records=''
+        _quality_print_route WARP "$records"
+    fi
+    nodes=$(db_get_chain_nodes)
+    while IFS= read -r node; do
+        name=$(jq -r '.name' <<< "$node")
+        type=$(jq -r '.type' <<< "$node")
+        case "$type" in socks5) type=socks ;; hy2) type=hysteria2 ;; esac
+        node=$(jq -c --arg t "$type" '.type=$t' <<< "$node")
+        core=$(_pick_latency_core "$type") || core=''
+        records=''
+        [[ -z "$core" ]] || records=$(_with_probe_proxy "$core" "$node" as_is _quality_observe) || records=''
+        _quality_print_route "$name" "$records"
+    done < <(jq -c '.[]?' <<< "$nodes")
+    echo '  IPLark 人工复核：在 https://iplark.com 输入表中的出口 IP。'
+}
+
 # 分流管理主菜单
 manage_routing() {
     while true; do
@@ -20346,6 +20475,7 @@ manage_routing() {
         _item "7" "测试分流效果"
         _item "8" "查看当前配置"
         _item "9" "按入站端口指定出口"
+        _item "10" "出口 IP 质量评分"
         _item "0" "返回"
         _line
         
@@ -20378,6 +20508,7 @@ manage_routing() {
                 read -rp "  按回车返回..." _
                 ;;
             9) manage_port_routing ;;
+            10) show_egress_quality; _pause ;;
             0) return ;;
             *) _err "无效选择"; _pause ;;
         esac
@@ -20437,67 +20568,54 @@ _wait_local_port() {
     return 1
 }
 
-_core_latency_test() {
-    local core="$1" node_json="$2" ip_mode="${3:-prefer_ipv4}"
-    local tmp_dir cfg_file proxy_port outbound pid latency=""
-    
-    tmp_dir=$(mktemp -d) || return 1
-    cfg_file="${tmp_dir}/core.json"
-    proxy_port=$(gen_port)
-    
-    if [[ "$core" == "xray" ]]; then
-        outbound=$(gen_xray_chain_outbound "$node_json" "proxy" "$ip_mode")
-        if [[ -z "$outbound" ]]; then
-            rm -rf "$tmp_dir"
-            return 1
-        fi
-        cat > "$cfg_file" <<EOF
-{
-  "log": {"loglevel": "none"},
-  "inbounds": [
-    {"listen": "127.0.0.1", "port": $proxy_port, "protocol": "socks", "settings": {"udp": true}}
-  ],
-  "outbounds": [
-    $outbound
-  ]
-}
-EOF
-        xray run -c "$cfg_file" >/dev/null 2>&1 &
-        pid=$!
+# 在独立进程中仅装载指定出口；回调接收临时 SOCKS 端口。
+_with_probe_proxy() (
+    local core="$1" node="$2" ip_mode="$3" callback="$4"
+    local tmp_dir proxy_port pid='' outbound='' warp='' final=proxy binary=xray
+    local via_warp=false
+    if [[ "$node" == warp ]]; then
+        final=warp
     else
-        outbound=$(gen_singbox_chain_outbound "$node_json" "proxy" "$ip_mode")
-        if [[ -z "$outbound" ]]; then
-            rm -rf "$tmp_dir"
-            return 1
-        fi
-        cat > "$cfg_file" <<EOF
-{
-  "log": {"level": "error"},
-  "inbounds": [
-    {"type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": $proxy_port}
-  ],
-  "outbounds": [
-    $outbound
-  ],
-  "route": {"final": "proxy"}
+        via_warp=$(jq -r '.via_warp // false' <<< "$node") || return 1
+        outbound=$("gen_${core}_chain_outbound" "$node" proxy "$ip_mode") || return 1
+        [[ -n "$outbound" ]] || return 1
+    fi
+    if [[ "$node" == warp || "$via_warp" == true ]]; then
+        warp=$("gen_${core}_warp_outbound") || return 1
+        [[ -n "$warp" ]] || return 1
+    fi
+    proxy_port=$(gen_port) || return 1
+    tmp_dir=$(mktemp -d) || return 1
+    trap 'if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; fi; rm -f -- "$tmp_dir/core.json"; rmdir -- "$tmp_dir"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    if [[ "$core" == xray ]]; then
+        printf '%s\n' "$outbound" "$warp" | jq -es --argjson port "$proxy_port" '{
+            log:{loglevel:"none"}, inbounds:[{listen:"127.0.0.1",port:$port,protocol:"socks",settings:{udp:true}}],
+            outbounds: .}' > "$tmp_dir/core.json" || return 1
+    else
+        binary=sing-box
+        printf '%s\n' "$outbound" "$warp" | jq -es --argjson port "$proxy_port" --arg final "$final" --arg via "$via_warp" '{
+            log:{level:"error"}, inbounds:[{type:"socks",tag:"in",listen:"127.0.0.1",listen_port:$port}],
+            dns:{servers:[{type:"local",tag:"local"}]}, route:{final:$final,default_domain_resolver:"local"},
+            endpoints:[.[] | .endpoint // empty],
+            outbounds:[.[] | select(.endpoint == null) | if .domain_strategy then
+                .domain_resolver={server:"local",strategy:.domain_strategy} | del(.domain_strategy) else . end |
+                if .tag=="proxy" and $via=="true" then .detour="warp" | del(.domain_resolver) else . end]
+        }' > "$tmp_dir/core.json" || return 1
+    fi
+    "$binary" run -c "$tmp_dir/core.json" >/dev/null 2>&1 &
+    pid=$!
+    _wait_local_port "$proxy_port" && kill -0 "$pid" 2>/dev/null || return 1
+    "$callback" "$proxy_port"
+)
+
+_core_latency_test() {
+    _with_probe_proxy "$1" "$2" "${3:-prefer_ipv4}" _measure_probe_latency
 }
-EOF
-        sing-box run -c "$cfg_file" >/dev/null 2>&1 &
-        pid=$!
-    fi
-    
-    if [[ -z "$pid" ]]; then
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-    
-    if ! _wait_local_port "$proxy_port"; then
-        kill "$pid" 2>/dev/null
-        wait "$pid" 2>/dev/null
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-    
+
+_measure_probe_latency() {
+    local proxy_port="$1" latency=""
     local -a samples=()
     local probe_total=""
     local probe_count="$LATENCY_PROBES"
@@ -20524,10 +20642,6 @@ EOF
         local mid=$(( (${#samples[@]} + 1) / 2 ))
         latency=$(printf '%s\n' "${samples[@]}" | sort -n | awk -v m="$mid" 'NR==m {print; exit}')
     fi
-    
-    kill "$pid" 2>/dev/null
-    wait "$pid" 2>/dev/null
-    rm -rf "$tmp_dir"
     
     [[ -n "$latency" ]] && { echo "$latency"; return 0; }
     return 1

@@ -6,6 +6,12 @@
 
 本版新增链式代理主备故障转移、Mieru、HY2 Salamander 和公网 IP 变化检测。sing-box 全局分流规则引用空负载均衡组时，仅拒绝命中该规则的流量。详见[主备故障转移](docs/chain-failover.md)和[负载均衡组行为](docs/singbox-balancer-strategies.md)。
 
+### 出口 IP 质量评分
+
+运行 `vless`，选择「分流管理 → 10 出口 IP 质量评分」，可比较服务器直连、WARP 和各链式节点。主备组可按成员名称对照。检测通过指定出口请求 IPPure，按实测地址补查 IP99。缺少某个地址族时，会通过同一线路访问 ipify 或 icanhazip 补测。每行只显示属于该 IP 的评分，0–100 分越高表示该来源评估的风险越高。网站限流、缺少字段或线路故障会显示为未取得评分或出口 IP。评分仅供查看。
+
+Ping0 按 IP 计费。要临时启用它，可在 Bash 中执行 `read -rsp 'Ping0 key: ' VLESS_PING0_KEY; echo; VLESS_PING0_KEY="$VLESS_PING0_KEY" vless; unset VLESS_PING0_KEY`。同一轮内多个节点共用一个出口 IP 时，IP99 和 Ping0 各只查询一次。IPLark 可在官网手动输入表中的 IP 复核。
+
 首次安装请在 Alpine、Debian、Ubuntu 或 CentOS 上以 root 运行以下命令。
 
 ```sh

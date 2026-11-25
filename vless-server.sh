@@ -13252,6 +13252,99 @@ _build_singbox_ruleset_defs() {
     echo "$defs"
 }
 
+# 为一个负载均衡组追加 sing-box 出站：先确保组内节点出站存在，再追加组出站（tag: balancer-组名）。
+# 分流规则和用户路由共用，保证两处生成的组一致；节点 tag 固定 prefer_ipv4，与故障转移监控（_failover_node_tag）一致。
+# 用法: outbounds=$(_singbox_append_balancer_outbounds "$outbounds" "$group_json")
+# 输出追加后的出站数组；组出站已存在时原样输出；jq 处理失败返回 1。
+_singbox_append_balancer_outbounds() {
+    local outbounds="$1" group_json="$2"
+    local group_name strategy
+    group_name=$(echo "$group_json" | jq -r '.name') || return 1
+    strategy=$(echo "$group_json" | jq -r '.strategy') || return 1
+    if echo "$outbounds" | jq -e --arg tag "balancer-${group_name}" 'any(.[]; .tag == $tag)' >/dev/null 2>&1; then
+        printf '%s\n' "$outbounds"
+        return 0
+    fi
+
+    # 构建节点 outbound 数组
+    local node_outbounds="[]"
+    local balancer_ip_version="prefer_ipv4"
+    local tag_suffix=""
+    case "$balancer_ip_version" in
+        ipv4_only) tag_suffix="-ipv4" ;;
+        ipv6_only) tag_suffix="-ipv6" ;;
+        prefer_ipv6) tag_suffix="-prefer-ipv6" ;;
+        prefer_ipv4|*) tag_suffix="-prefer-ipv4" ;;
+    esac
+
+    while IFS= read -r node_name; do
+        [[ -z "$node_name" ]] && continue
+        local node_tag="chain-${node_name}${tag_suffix}"
+
+        # 确保节点 outbound 存在；只引用成功生成的出站（sing-box check 不校验引用，引用不存在的出站会在启动时失败）
+        if ! echo "$outbounds" | jq -e --arg tag "$node_tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+            local chain_out=$(gen_singbox_chain_outbound "$node_name" "$node_tag" "$balancer_ip_version")
+            if [[ -n "$chain_out" ]]; then
+                outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]') || return 1
+            fi
+        fi
+        if echo "$outbounds" | jq -e --arg tag "$node_tag" 'any(.[]; .tag == $tag)' >/dev/null 2>&1; then
+            node_outbounds=$(echo "$node_outbounds" | jq --arg tag "$node_tag" '. + [$tag]') || return 1
+        fi
+    done < <(echo "$group_json" | jq -r '.nodes[]?')
+
+    # 根据策略生成不同类型的 sing-box outbound
+    local balancer_out=""
+    case "$strategy" in
+        failover)
+            # 故障转移：默认第一优先节点，末尾追加 direct 作为全部不可用时的出口；
+            # 监控服务经 Clash API 按优先级切换，切换时中断旧连接使其立即经新出口重建
+            balancer_out=$(jq -n \
+                --arg tag "balancer-${group_name}" \
+                --argjson outbounds "$node_outbounds" \
+                '{
+                    type: "selector",
+                    tag: $tag,
+                    outbounds: ($outbounds + ["direct"]),
+                    default: ($outbounds[0] // "direct"),
+                    interrupt_exist_connections: true
+                }')
+            ;;
+        leastPing)
+            # sing-box 使用 urltest 实现最低延迟选择
+            balancer_out=$(jq -n \
+                --arg tag "balancer-${group_name}" \
+                --argjson outbounds "$node_outbounds" \
+                '{
+                    type: "urltest",
+                    tag: $tag,
+                    outbounds: $outbounds,
+                    url: "https://www.gstatic.com/generate_204",
+                    interval: "10s",
+                    tolerance: 50,
+                    idle_timeout: "30m"
+                }')
+            ;;
+        random|roundRobin|*)
+            # sing-box 使用 selector 实现手动/随机选择
+            balancer_out=$(jq -n \
+                --arg tag "balancer-${group_name}" \
+                --argjson outbounds "$node_outbounds" \
+                '{
+                    type: "selector",
+                    tag: $tag,
+                    outbounds: $outbounds,
+                    default: ($outbounds[0] // "direct")
+                }')
+            ;;
+    esac
+
+    # 添加负载均衡器 outbound
+    [[ -n "$balancer_out" ]] || return 1
+    outbounds=$(echo "$outbounds" | jq --argjson out "$balancer_out" '. + [$out]') || return 1
+    printf '%s\n' "$outbounds"
+}
+
 # 生成 Sing-box 统一配置（所有选用 Sing-box 的协议共用一个进程）
 generate_singbox_config() {
     if [[ -z "${SINGBOX_CONFIG_OUTPUT:-}" ]]; then _rebuild_core_config singbox false; else _render_singbox_config; fi
@@ -13457,85 +13550,11 @@ _render_singbox_config() {
             fi
         fi
 
-        # 生成负载均衡器 (sing-box 使用 urltest/selector outbound)
+        # 生成负载均衡器 (sing-box 使用 urltest/selector outbound)，用户路由引用的组也由此提供
         local balancer_groups=$(db_get_balancer_groups)
         if [[ -n "$balancer_groups" && "$balancer_groups" != "[]" ]]; then
             while IFS= read -r group_json; do
-                local group_name=$(echo "$group_json" | jq -r '.name')
-                local strategy=$(echo "$group_json" | jq -r '.strategy')
-
-                # 构建节点 outbound 数组
-                local node_outbounds="[]"
-                local balancer_ip_version="prefer_ipv4"
-                local tag_suffix=""
-                case "$balancer_ip_version" in
-                    ipv4_only) tag_suffix="-ipv4" ;;
-                    ipv6_only) tag_suffix="-ipv6" ;;
-                    prefer_ipv6) tag_suffix="-prefer-ipv6" ;;
-                    prefer_ipv4|*) tag_suffix="-prefer-ipv4" ;;
-                esac
-
-                while IFS= read -r node_name; do
-                    [[ -z "$node_name" ]] && continue
-                    local node_tag="chain-${node_name}${tag_suffix}"
-
-                    # 确保节点 outbound 存在；只引用成功生成的出站（引用不存在的出站会让 sing-box check 失败）
-                    if ! echo "$outbounds" | jq -e --arg tag "$node_tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
-                        local chain_out=$(gen_singbox_chain_outbound "$node_name" "$node_tag" "$balancer_ip_version")
-                        [[ -n "$chain_out" ]] && outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
-                    fi
-                    echo "$outbounds" | jq -e --arg tag "$node_tag" 'any(.[]; .tag == $tag)' >/dev/null 2>&1 &&
-                        node_outbounds=$(echo "$node_outbounds" | jq --arg tag "$node_tag" '. + [$tag]')
-                done < <(echo "$group_json" | jq -r '.nodes[]?')
-
-                # 根据策略生成不同类型的 sing-box outbound
-                local balancer_out=""
-                case "$strategy" in
-                    failover)
-                        # 故障转移：默认第一优先节点，末尾追加 direct 作为全部不可用时的出口；
-                        # 监控服务经 Clash API 按优先级切换，切换时中断旧连接使其立即经新出口重建
-                        balancer_out=$(jq -n \
-                            --arg tag "balancer-${group_name}" \
-                            --argjson outbounds "$node_outbounds" \
-                            '{
-                                type: "selector",
-                                tag: $tag,
-                                outbounds: ($outbounds + ["direct"]),
-                                default: ($outbounds[0] // "direct"),
-                                interrupt_exist_connections: true
-                            }')
-                        ;;
-                    leastPing)
-                        # sing-box 使用 urltest 实现最低延迟选择
-                        balancer_out=$(jq -n \
-                            --arg tag "balancer-${group_name}" \
-                            --argjson outbounds "$node_outbounds" \
-                            '{
-                                type: "urltest",
-                                tag: $tag,
-                                outbounds: $outbounds,
-                                url: "https://www.gstatic.com/generate_204",
-                                interval: "10s",
-                                tolerance: 50,
-                                idle_timeout: "30m"
-                            }')
-                        ;;
-                    random|roundRobin|*)
-                        # sing-box 使用 selector 实现手动/随机选择
-                        balancer_out=$(jq -n \
-                            --arg tag "balancer-${group_name}" \
-                            --argjson outbounds "$node_outbounds" \
-                            '{
-                                type: "selector",
-                                tag: $tag,
-                                outbounds: $outbounds,
-                                default: ($outbounds[0] // "direct")
-                            }')
-                        ;;
-                esac
-
-                # 添加负载均衡器 outbound
-                [[ -n "$balancer_out" ]] && outbounds=$(echo "$outbounds" | jq --argjson out "$balancer_out" '. + [$out]')
+                outbounds=$(_singbox_append_balancer_outbounds "$outbounds" "$group_json") || return 1
             done < <(echo "$balancer_groups" | jq -c '.[]')
         fi
 
@@ -13932,8 +13951,34 @@ _render_singbox_config() {
                         fi
                     fi
                     ;;
+                balancer:*)
+                    # 负载均衡组（含主备故障转移）：有全局分流规则时组出站已在上面生成；
+                    # 否则在此补生成组及其节点出站，直接并入 base_config，与已有出站一起去重
+                    local group_name="${urouting#balancer:}"
+                    outbound_name="balancer-${group_name}"
+                    if ! echo "$base_config" | jq -e --arg tag "$outbound_name" 'any(.outbounds[]?; .tag == $tag)' >/dev/null 2>&1; then
+                        local group_json
+                        group_json=$(db_get_balancer_groups | jq -c --arg name "$group_name" '.[]? | select(.name == $name)') || return 1
+                        if [[ -z "$group_json" ]]; then
+                            _warn "Sing-box 用户 ${uname}（${proto}）的路由指向不存在的负载均衡组 ${group_name}，该用户暂按全局规则"
+                            continue
+                        fi
+                        local merged_outbounds
+                        merged_outbounds=$(echo "$base_config" | jq -c '.outbounds // []') || return 1
+                        merged_outbounds=$(_singbox_append_balancer_outbounds "$merged_outbounds" "$group_json") || return 1
+                        # 组内节点全部无效时候选为空（故障转移组总带 direct，不会为空），sing-box 会拒绝整份配置：
+                        # 不并入，该用户改按全局规则，避免一个用户的路由卡住所有配置变更
+                        if ! echo "$merged_outbounds" | jq -e --arg tag "$outbound_name" \
+                            'any(.[]; .tag == $tag and ((.outbounds // []) | length) > 0)' >/dev/null 2>&1; then
+                            _warn "负载均衡组 ${group_name} 没有可用节点，Sing-box 用户 ${uname}（${proto}）暂按全局规则"
+                            continue
+                        fi
+                        base_config=$(echo "$base_config" | jq --argjson outs "$merged_outbounds" '.outbounds = $outs') || return 1
+                    fi
+                    ;;
                 *)
-                    # 其他路由类型暂不支持
+                    # 其他路由类型暂不支持：明确提示，不静默忽略
+                    _warn "Sing-box 用户 ${uname}（${proto}）的路由 ${urouting} 不受支持，该用户暂按全局规则"
                     continue
                     ;;
             esac

@@ -7,7 +7,12 @@ CFG="$fixture/cfg"
 mkdir -p "$CFG" "$fixture/bin"
 eval "$(awk 'index($0,"_singbox_stats_build_version() {")==1 {on=1} on {print} on && $0=="}" {exit}' "$repo/vless-server.sh")"
 # 核心路径改到 fixture，避免读写真实 /usr/local/bin。
-eval "$(awk 'index($0,"_build_singbox_stats_core() (")==1 {on=1} on {print} on && $0==")" {exit}' "$repo/vless-server.sh" | sed "s#/usr/local/bin/#$fixture/bin/#g")"
+# 本 Fork 中该函数是 { } 函数体，经 _with_db_lock（子 shell）持锁执行，清理逻辑挂在 EXIT trap 上。
+eval "$(awk 'index($0,"_build_singbox_stats_core() {")==1 {on=1} on {print} on && $0=="}" {exit}' "$repo/vless-server.sh" | sed "s#/usr/local/bin/#$fixture/bin/#g")"
+declare -F _build_singbox_stats_core >/dev/null || { echo 'FAIL: 未能提取 _build_singbox_stats_core'; exit 1; }
+# 与真实 _with_db_lock 一致：在子 shell 中持锁执行，trap 只作用于子 shell。
+_with_db_lock() ( DB_LOCK_OWNER=$BASHPID; "$@" )
+_db_lock_release() { :; }
 _info() { :; }
 _ok() { echo "ok:$*" >> "$fixture/events"; }
 _err() { echo "err:$*" >> "$fixture/events"; }

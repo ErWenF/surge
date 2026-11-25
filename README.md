@@ -2,9 +2,9 @@
   
 [![Telegram](https://img.shields.io/badge/Telegram-@vless__vaio-26A5E4?logo=telegram&logoColor=white)](https://t.me/vless_vaio)  
 
-**已有安装升级到 v3.7.21**。运行 `VLESS_SCRIPT_SOURCE_REF=main vless`，选择「检查脚本更新」→「1 检查并更新脚本」，确认更新后重新运行 `vless`。3.7.19 正式版和 3.7.20 预览版均可使用这个入口，更新会备份旧脚本。
+**已有安装升级到 v3.7.22**。运行 `VLESS_SCRIPT_SOURCE_REF=main vless`，选择「检查脚本更新」→「1 检查并更新脚本」。看到目标版本 `v3.7.22` 后确认，更新器会备份旧脚本。重新运行 `vless`，进入「分流管理」查看各条规则的出口公网 IP，按 `10` 比较出口 IP 质量。
 
-本版新增链式代理主备故障转移、Mieru、HY2 Salamander 和公网 IP 变化检测。sing-box 全局分流规则引用空负载均衡组时，仅拒绝命中该规则的流量。详见[主备故障转移](docs/chain-failover.md)和[负载均衡组行为](docs/singbox-balancer-strategies.md)。
+v3.7.21 新增链式代理主备故障转移、Mieru、HY2 Salamander 和公网 IP 变化检测。sing-box 全局分流规则引用空负载均衡组时，仅拒绝命中该规则的流量。详见[主备故障转移](docs/chain-failover.md)和[负载均衡组行为](docs/singbox-balancer-strategies.md)。
 
 ### 出口 IP 质量评分
 

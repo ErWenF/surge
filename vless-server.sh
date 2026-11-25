@@ -3959,6 +3959,10 @@ cron_service_is_active() {
     if command -v systemctl >/dev/null 2>&1; then
         systemctl is-active --quiet cron 2>/dev/null && return 0
         systemctl is-active --quiet crond 2>/dev/null && return 0
+        # systemd-cron（Debian 等可选的 cron-daemon 实现）没有常驻 cron 进程，
+        # 由 cron-update.path 监视 crontab 并生成 systemd 定时器。它与 cron 包互相冲突，
+        # 必须识别为可用，否则 ensure_cron_service_running 会尝试安装 cron 把它替换掉。
+        systemctl is-active --quiet cron-update.path 2>/dev/null && return 0
     fi
     if command -v rc-service >/dev/null 2>&1; then
         rc-service cronie status >/dev/null 2>&1 && return 0

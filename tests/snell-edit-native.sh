@@ -14,6 +14,14 @@ _listen_addr() { echo 127.0.0.1; }
 _snell_write_service() { [[ ! -f "$fixture/fail-unit" ]]; }
 _snell_user_share() { :; }
 _snell_binary() { echo "$SNELL_TEST_BIN"; }
+wait_for_listener() {
+    local attempt
+    for attempt in {1..40}; do
+        ss -H -lnt "( sport = :$1 )" | grep -q . && return 0
+        sleep .05
+    done
+    return 1
+}
 svc() {
     local pid
     case "$1" in
@@ -50,7 +58,7 @@ for runtime in stopped running; do
     _snell_edit_user_commit snell-v5 alice "$row" 32152 newpassword system ''
     if [[ "$runtime" == running ]]; then
         svc status "$service"
-        ss -H -lnt '( sport = :32152 )' | grep -q .
+        wait_for_listener 32152
         ! ss -H -lnt '( sport = :32151 )' | grep -q .
     else
         ! svc status "$service"
@@ -62,7 +70,7 @@ for runtime in stopped running; do
     if _snell_edit_user_commit snell-v5 alice "$row" 32153 brokenpassword '' ''; then exit 1; fi
     rm "$fixture/fail-unit"
     [[ $(jq -r '.xray["snell-v5"][0].port' "$DB_FILE") == 32152 ]]
-    if [[ "$runtime" == running ]]; then svc status "$service"; ss -H -lnt '( sport = :32152 )' | grep -q .
+    if [[ "$runtime" == running ]]; then svc status "$service"; wait_for_listener 32152
     else ! svc status "$service"; fi
     nft -j list chain inet vless_snell_users input | jq -e --arg id "$id" \
         'any(.nftables[].rule?; .comment == $id and any(.expr[]?.match?; .right == 32152))' >/dev/null
@@ -86,7 +94,7 @@ rm "$fixture/fail-cycle-start"
 check_user_traffic_cycles
 svc status "$service"
 svc is-enabled "$service"
-ss -H -lnt '( sport = :32152 )' | grep -q .
+wait_for_listener 32152
 jq -e '.xray["snell-v5"][0].users[0] | .enabled == true and .used == 0 and .traffic_reset.last_period == 1' "$DB_FILE" >/dev/null
 cp "$DB_FILE" "$fixture/cycle-after.json"
 check_user_traffic_cycles

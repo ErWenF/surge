@@ -18,6 +18,10 @@
 - **下载校验提示**：区分"校验值不一致"和"取不到校验值"。取不到时提示可能是 API 限流；不一致时警告可能被篡改，不再提示用 `ALLOW_UNVERIFIED_DOWNLOADS` 跳过。
 - **po0fw Surge 模块**：指定代理 HEAD 连通性检测与失败重试、日志分级、写入 Logbook；面板支持固定槽 / FIFO 命名和「← 当前」标记。链接仍指向本 Fork，命中判断仍用 /24 匹配。说明见 [po0fw-proxy-check.md](../scripts/po0fw-proxy-check.md)。
 
+## 本 Fork 修复（真机验证中发现）
+
+- **识别 systemd-cron**：部分 Debian 机器用 systemd-cron 代替 cron。它没有 cron 守护进程，由 `cron-update.path` 把 crontab 转成 systemd 定时器。原先的检测只认 cron/crond，于是公网 IP 检测任务放弃写入；流量同步、到期检查等入口还会尝试 `apt-get install cron`，而 cron 与 systemd-cron 互相冲突，会把现有实现替换掉。现在把运行中的 `cron-update.path` 视为可用 cron。
+
 ## 本 Fork 已有、未重复移植
 
 - 配额执行、超额恢复、月度重置（上游 v3.7.3）：本 Fork 已有自己的实现与测试（独立 30 天周期、策略执行、事务回滚）。这次另外用真实内核验证了"用户全部停用"时的配置：Xray 生成空 `clients`、sing-box 生成空 `users`，都能通过校验，不会退回默认凭据。
@@ -55,10 +59,28 @@
 
 已知不稳定：`flock-compat.sh` 要求 30 秒锁超时的实测耗时在 29～31 秒之间，WSL 负载高时 main 上也出现过 32 秒的失败。本轮两边都通过。
 
+### 真机验证（2026-11-25）
+
+服务器：Debian 12（1 核 / 1 GB，systemd + systemd-cron），原有 v3.7.19，运行着 VLESS REALITY、SS2022、2 个链式节点、nginx 真实证书。测试前对脚本、`/etc/vless-reality`、服务文件、nginx、crontab 和防火墙规则做了完整备份。客户端在本地 WSL 运行。
+
+- **升级**：按上面的预览版安装方式升级，3.7.19 自动备份到 `script-backups/`。升级前在隔离目录里用新旧两版渲染 Xray 配置做对比：旧版渲染结果与线上 `config.json` 一致，新版与旧版一致，所以升级不改变运行中的配置。整个验证过程中 Xray 进程始终没有重启。
+- **watchdog** 按新逻辑重写并正常运行。
+- **公网 IP 检测**：首次运行记录基准地址，数据库里的地址和实际公网 IP 一致，所以没有改写任何内容。在 systemd-cron 上发现检测问题并修复（见上文），修复后 crontab 写入 `*/30` 任务，systemd-cron 生成对应定时器。
+- **Mieru**：菜单安装（mita 3.40.0 通过发布方校验），用 Mieru 官方客户端 3.40.0 解析服务器生成的 `mierus://` 链接，参数正确；实际连接后出口 IP 为服务器地址；错误密码被拒绝。
+- **HY2 + Salamander**：菜单安装（同时装入 sing-box 1.14.4、grpcurl），用 sing-box 1.14.0 客户端实际连接，出口 IP 为服务器地址；混淆密码错误或不带混淆时都无法连接。
+- **REALITY 链接**带 `support-x25519mlkem768=true`；Surge 订阅新增 VLESS REALITY 行，HY2 行带 `salamander-password`；Clash 订阅带 ML-KEM 开关。
+- **原有 VLESS REALITY 节点**在全过程后实际连接正常。
+- **卸载**两个临时协议后，`db.json`、Xray `config.json`、nginx 配置与测试前完全一致。
+
+真机上观察到的原有行为（非本次改动引入）：
+- 安装协议时的"安装依赖"步骤会把 openssl、libssl3、jq、dnsutils 升级到最新安全更新。
+- 卸载 HY2 / Mieru 后，sing-box、grpcurl、mita 二进制，`mita` 系统用户和已禁用的 `vless-singbox` 服务单元仍保留。
+
 **未验证**：
-- 6 项因缺少运行条件而跳过：mieru-live（无 mita/mieru）、nft-native、server-ipv6-native、singbox-stats-live（无 grpcurl）、snell-edit-native（无 Snell）、tg-bot-native。
-- 没有在真实 VPS 上安装，也没有用真实客户端连接 Mieru、Salamander、Surge VLESS 节点。
-- 公网 IP 变化检测只做了模拟测试，没有真实换 IP。
+- 本地 6 项因缺少运行条件而跳过：mieru-live、nft-native、server-ipv6-native、singbox-stats-live（无 grpcurl）、snell-edit-native（无 Snell）、tg-bot-native。
+- 公网 IP 变化检测只做了模拟测试和真机首次运行，没有真实换 IP。
+- 没有用 Surge / mihomo 客户端实际导入订阅。
+- 没有验证"真实证书 + sing-box 接管 VLESS REALITY"的组合。
 - po0fw 模块只跑了 Node 回归，没有在 Surge 里运行。
 
 ## 预览版安装
@@ -72,7 +94,7 @@ wget -O vless-server-preview.sh https://raw.githubusercontent.com/ErWenF/surge/c
 以预览分支运行时，"检查并更新"会从预览分支取脚本。预览分支的版本号就是正式版号 3.7.20（脚本自更新只接受纯数字版本），预览身份由分支名标明。
 
 建议在测试机上依次验证：
-1. 安装 Mieru（菜单 16），用 mihomo 导入链接实际连接；
+1. 用 mihomo 导入 Mieru 订阅实际连接（官方 Mieru 客户端已在真机验证）；
 2. 新装一个启用 Salamander 的 HY2，用 Surge / mihomo 实际连接；
 3. 已有 REALITY 节点重新导出链接，mihomo 导入后能连接；
 4. 打开菜单后确认 `crontab -l` 中出现 `# check-ip` 条目；需要关闭时执行 `vless --check-ip off`；

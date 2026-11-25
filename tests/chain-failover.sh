@@ -281,7 +281,30 @@ grep -qx 'ExecStart=/usr/bin/bash /usr/local/bin/vless-server.sh --failover-run'
 _failover_write_service openrc "$fixture/rc" /usr/local/bin/vless-server.sh /bin/bash || fail "OpenRC 服务生成失败"
 grep -q 'command_args="/usr/local/bin/vless-server.sh --failover-run"' "$fixture/rc" || fail "OpenRC 服务内容不符"
 if _failover_write_service systemd "$fixture/bad" '/usr/local/bin/x;rm' /usr/bin/bash; then fail "应拒绝带特殊字符的路径"; fi
-echo 'PASS service definitions for systemd/OpenRC reject unsafe paths'
+# 常驻监控在脚本更新后重新加载（同版本更新不会改变服务定义，真机发现监控一直运行旧代码）
+printf '%s\n' '#!/usr/bin/env bash' 'echo "reloaded $*" > "${0%/*}/reloaded"' > "$fixture/self.sh"
+rm -f "$CFG/failover.log"; : > "$fixture/rounds"
+( FAILOVER_CHECK_INTERVAL=0
+  failover_check_once() {  # 第 1 轮"升级"脚本；没有重新加载时第 5 轮退出，避免死循环
+      echo x >> "$fixture/rounds"
+      [[ $(wc -l < "$fixture/rounds") == 1 ]] && echo '# 新版本' >> "$fixture/self.sh"
+      [[ $(wc -l < "$fixture/rounds") -lt 5 ]] || exit 0
+  }
+  failover_monitor_run "$fixture/self.sh" )
+[[ "$(cat "$fixture/reloaded" 2>/dev/null)" == "reloaded --failover-run" ]] || fail "脚本更新后监控应重新加载自身"
+grep -q '检测到脚本已更新，重新加载' "$CFG/failover.log" || fail "重新加载应记录日志"
+# 新脚本语法错误（如正在写入）：不重新加载，继续用旧代码，同一版本只记一次日志
+rm -f "$fixture/reloaded" "$CFG/failover.log"; : > "$fixture/rounds"
+( FAILOVER_CHECK_INTERVAL=0
+  failover_check_once() {
+      echo x >> "$fixture/rounds"
+      [[ $(wc -l < "$fixture/rounds") == 1 ]] && echo 'if then' >> "$fixture/self.sh"
+      [[ $(wc -l < "$fixture/rounds") -lt 4 ]] || exit 0
+  }
+  failover_monitor_run "$fixture/self.sh" )
+[[ ! -e "$fixture/reloaded" && $(wc -l < "$fixture/rounds") == 4 ]] || fail "语法错误的新脚本不应被加载，监控应继续运行"
+[[ $(grep -c '语法检查未通过' "$CFG/failover.log") == 1 ]] || fail "语法检查失败应只记录一次: $(cat "$CFG/failover.log")"
+echo 'PASS service definitions for systemd/OpenRC reject unsafe paths; monitor reloads itself after the script is updated'
 
 # ── 8. 检测网址设置与校验 ──
 for u in "https://www.gstatic.com/generate_204" "http://cp.cloudflare.com/generate_204" "https://example.com:8443/a/b?x=1&y=2"; do

@@ -18053,13 +18053,31 @@ failover_check_once() {
     fi
 }
 
+# 脚本文件指纹（inode、大小、修改时间）；读不到时输出为空
+_failover_script_fingerprint() { stat -c '%i %s %Y' "$1" 2>/dev/null; }
+
+# 常驻监控；$1 为脚本路径（用于脚本更新后重新加载）
 failover_monitor_run() {
+    local self="${1:-$0}" started now bad=""
+    self=$(readlink -f "$self" 2>/dev/null) || self="${1:-$0}"
+    started=$(_failover_script_fingerprint "$self")
     _failover_log "监控服务启动（间隔 ${FAILOVER_CHECK_INTERVAL}s，切回需连续 ${FAILOVER_RECOVER_CHECKS} 次可用）"
     trap '_failover_log "监控服务停止"; exit 0' TERM INT
     while true; do
         failover_check_once || _failover_log "本轮检查失败"
         sleep "$FAILOVER_CHECK_INTERVAL" &
         wait $!
+        # 脚本被更新时重新加载：常驻进程只运行启动时读入内存的函数，服务定义只在版本号变化时才变，
+        # 同版本更新（如预览版迭代）不会触发重启。exec 保持 PID 不变，服务管理器无感知
+        now=$(_failover_script_fingerprint "$self")
+        [[ -n "$started" && -n "$now" && "$now" != "$started" ]] || continue
+        if "$BASH" -n "$self" 2>/dev/null; then
+            _failover_log "检测到脚本已更新，重新加载"
+            exec "$BASH" "$self" --failover-run
+        fi
+        # 语法检查不通过（如文件正在写入）：继续用旧代码，下轮再试；同一版本只记一次日志
+        [[ "$bad" == "$now" ]] || _failover_log "检测到脚本已更新，但语法检查未通过，暂不重新加载"
+        bad="$now"
     done
 }
 
@@ -34166,7 +34184,7 @@ case "${1:-}" in
     --failover-run)
         # 链式代理故障转移常驻监控 (用于 vless-failover 服务)
         check_root
-        failover_monitor_run
+        failover_monitor_run "$0"
         exit $?
         ;;
     --failover-check)

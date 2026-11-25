@@ -11,6 +11,9 @@ sed -e 's|^readonly CFG="/etc/vless-reality"$|readonly CFG="$TEST_CFG"|' \
     -e '/^case "\${1:-}" in$/,$d' "$script" > "$fixture/lib.sh"
 source "$fixture/lib.sh"
 set +e
+# 本 Fork 的 generate_singbox_config 默认走事务（候选配置 + sing-box check 校验后落盘）；
+# 本测试只关心渲染结果，直接渲染到固定输出文件，不依赖真实 sing-box 二进制。
+export SINGBOX_CONFIG_OUTPUT="$fixture/singbox.json"
 _info() { :; }; _warn() { :; }; _ok() { :; }; _err() { echo "$*" >&2; }
 _listen_addr() { echo "::"; }
 _ensure_nginx_https_for_reality() { echo "$1" > "$fixture/nginx_called"; }

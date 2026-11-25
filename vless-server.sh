@@ -18768,6 +18768,10 @@ gen_singbox_routing_rules() {
                 prefer_ipv6) tag="chain-${node_name}-prefer-ipv6" ;;
                 *) tag="chain-${node_name}-prefer-ipv4" ;;
             esac
+        elif [[ "$outbound" == balancer:* ]]; then
+            # 组出站的 tag 是 balancer-组名（与 Xray 一致）。原先 "balancer:组名" 原样写入：
+            # sing-box check 不校验规则引用的出站，运行时命中规则的连接报 outbound not found 而失败。
+            tag="balancer-${outbound#balancer:}"
         fi
         
         if [[ "$rule_type" == "all" ]]; then

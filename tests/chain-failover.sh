@@ -58,6 +58,13 @@ jq -e --arg A "$A" --arg B "$B" --arg s "$probe_secret" '
     .routing.rules[2] == {type:"field", inboundTag:["fo-probe-" + $A], outboundTag:$A} and
     .burstObservatory.pingConfig.destination == "https://www.gstatic.com/generate_204"' "$fixture/x1.json" >/dev/null ||
     fail "故障转移探测入口不符: $(jq -c '{p:[.inbounds[]|select(.tag|startswith("fo-probe-"))], r:.routing.rules[0:3]}' "$fixture/x1.json")"
+# 引用完整性：规则指向的出站/均衡器、均衡器的节点与 fallbackTag 都必须存在
+jq -e '[.outbounds[].tag] as $o | [.routing.balancers[]?.tag] as $b |
+    all(.routing.rules[]; ((.outboundTag // null) as $t | $t == null or ($o | index($t) != null)) and
+                          ((.balancerTag // null) as $t | $t == null or ($b | index($t) != null))) and
+    all(.routing.balancers[]; all(.selector[]; . as $s | $o | index($s) != null) and
+                              ((.fallbackTag // null) as $f | $f == null or ($o | index($f) != null)))' "$fixture/x1.json" >/dev/null ||
+    fail "Xray 规则或均衡器引用了不存在的对象"
 native_xray "$fixture/x1.json"
 echo 'PASS Xray global routing: failover balancer keeps priority order, skips missing nodes, loopback probe inbounds per node, exact health checks'
 
@@ -87,8 +94,14 @@ jq -e --arg A "$A" --arg B "$B" --arg s "$secret" '
     (.outbounds[] | select(.tag == "balancer-FO")) == {type:"selector", tag:"balancer-FO", outbounds:[$B, $A, "direct"],
         default:$B, interrupt_exist_connections:true} and
     .experimental.clash_api == {external_controller:"127.0.0.1:10087", secret:$s} and
-    any(.outbounds[]; .tag == "direct")' "$fixture/s1.json" >/dev/null ||
-    fail "sing-box 故障转移 selector / Clash API 不符: $(jq -c '{o:[.outbounds[]|select(.tag=="balancer-FO")], e:.experimental.clash_api}' "$fixture/s1.json")"
+    any(.outbounds[]; .tag == "direct") and
+    any(.route.rules[]; .domain_suffix == ["example.com"] and .outbound == "balancer-FO")' "$fixture/s1.json" >/dev/null ||
+    fail "sing-box 故障转移 selector / Clash API / 规则引用不符: $(jq -c '{o:[.outbounds[]|select(.tag=="balancer-FO")], e:.experimental.clash_api, r:.route.rules}' "$fixture/s1.json")"
+# 引用完整性：sing-box check 不校验规则和分组引用的出站，引用不存在的 tag 要到运行时才报 outbound not found
+jq -e '[.outbounds[].tag] as $t |
+    all((.route.rules[]? | .outbound | strings), (.outbounds[] | .outbounds[]?), (.route.final // empty);
+        . as $o | $t | index($o) != null)' "$fixture/s1.json" >/dev/null ||
+    fail "sing-box 规则或分组引用了不存在的出站: $(jq -c '[.outbounds[].tag] as $t | [(.route.rules[]?.outbound | strings), (.outbounds[] | .outbounds[]?)] | map(select(. as $o | $t | index($o) == null))' "$fixture/s1.json")"
 if [[ -n "${SINGBOX_TEST_BIN:-}" ]]; then
     jq 'del(.log)' "$fixture/s1.json" > "$fixture/s1-native.json"
     ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true "$SINGBOX_TEST_BIN" check -c "$fixture/s1-native.json" ||

@@ -17775,10 +17775,17 @@ _failover_notify() {
     tg_send_message "$msg" >/dev/null 2>&1 || _failover_log "TG 通知发送失败"
 }
 
-# 处理一个内核中的一个组；读入并输出完整状态 JSON
+# 是否为 JSON 对象。必须先判断非空：jq 1.6 对空输入配合 -e 仍返回 0（1.7 返回 4），
+# 只靠 jq -e 会把空串当作合法状态。
+_failover_json_object() {
+    [[ -n "$1" ]] && jq -e 'type == "object"' <<< "$1" >/dev/null 2>&1
+}
+
+# 处理一个内核中的一个组；读入并输出完整状态 JSON（任何异常都原样返回输入状态）
 _failover_step() {
     local core="$1" group="$2" state="$3"
     shift 3
+    _failover_json_object "$state" || state='{}'
     local key="${core}|${group}" balancer="balancer-${group}" cfg_file tags=() t alive="" applied="" line
     [[ "$core" == xray ]] && cfg_file="$CFG/config.json" || cfg_file="$CFG/singbox.json"
     # 只考虑配置中实际生成了出站的节点，保持组内优先级顺序
@@ -17830,10 +17837,17 @@ _failover_step() {
     [[ -n "$prev" && "$prev" != "$target" ]] && _failover_notify "$core" "$group" "$prev" "$target" "$reason"
     [[ -z "$prev" ]] && _failover_log "${group}/${core}: 初始出口 $(_failover_tag_label "$target")"
 
-    jq -c --arg k "$key" --arg target "$target" --arg pending "$new_pending" --argjson count "${new_count:-0}" \
+    local updated
+    updated=$(jq -c --arg k "$key" --arg target "$target" --arg pending "$new_pending" --argjson count "${new_count:-0}" \
         --arg alive "$alive" --arg at "$(date '+%Y-%m-%d %H:%M:%S')" \
         '.[$k] = {target: $target, pending: $pending, count: $count,
-                  alive: ($alive | split("\n") | map(select(. != ""))), checked_at: $at}' <<< "$state"
+                  alive: ($alive | split("\n") | map(select(. != ""))), checked_at: $at}' <<< "$state")
+    if _failover_json_object "$updated"; then
+        printf '%s' "$updated"
+    else
+        _failover_log "${group}/${core}: 状态更新失败"
+        printf '%s' "$state"
+    fi
 }
 
 # 执行一轮检查（持锁，避免常驻服务与手动执行同时改写状态）
@@ -17846,9 +17860,10 @@ failover_check_once() {
     groups=$(jq -c '[.balancer_groups[]? | select(.strategy == "failover")]' "$DB_FILE" 2>/dev/null) || return 1
     state_file=$(_failover_state_file)
     state=$(cat "$state_file" 2>/dev/null)
-    jq -e 'type == "object"' <<< "$state" >/dev/null 2>&1 || state='{}'
+    _failover_json_object "$state" || state='{}'
     # 已删除的组不再保留状态
     state=$(jq -c --argjson g "$groups" 'with_entries(select(.key | split("|")[1] as $n | any($g[]; .name == $n)))' <<< "$state")
+    _failover_json_object "$state" || state='{}'
     while IFS= read -r group; do
         [[ -n "$group" ]] || continue
         local name
@@ -17863,9 +17878,11 @@ failover_check_once() {
             state=$(_failover_step singbox "$name" "$state" "${nodes[@]}")
         fi
     done < <(jq -c '.[]' <<< "$groups")
+    # 写入前校验：空串经 jq 会得到空文件而不报错，绝不能覆盖已有状态
+    _failover_json_object "$state" || { _failover_log "状态异常，本轮未写入"; return 1; }
     local tmp
     tmp=$(mktemp "${state_file}.XXXXXX") || return 1
-    if printf '%s\n' "$state" | jq . > "$tmp" 2>/dev/null; then
+    if printf '%s\n' "$state" | jq . > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
         chmod 600 "$tmp" && mv -f "$tmp" "$state_file"
     else
         rm -f "$tmp"; return 1
@@ -17887,7 +17904,9 @@ failover_print_status() {
     local state_file state
     state_file=$(_failover_state_file)
     state=$(cat "$state_file" 2>/dev/null) || state='{}'
-    jq -e 'type == "object" and length > 0' <<< "$state" >/dev/null 2>&1 || { echo "  暂无检测结果（监控服务尚未运行或组未在分流规则中使用）"; return 0; }
+    if ! _failover_json_object "$state" || ! jq -e 'length > 0' <<< "$state" >/dev/null 2>&1; then
+        echo "  暂无检测结果（监控服务尚未运行或组未在分流规则中使用）"; return 0
+    fi
     # 字段用 \x1f、可用节点用 \x1e 分隔：都不是 IFS 空白字符，空字段不会被合并，节点名里的逗号也不受影响
     jq -r 'to_entries[] | [(.key | split("|")[1]), (.key | split("|")[0]), .value.target,
             (.value.alive | join("\u001e")), .value.pending, (.value.count | tostring), .value.checked_at] | join("\u001f")' <<< "$state" |

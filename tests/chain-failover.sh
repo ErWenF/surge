@@ -126,6 +126,8 @@ xray() {
     return 1
 }
 cycle() { bi_selects="$1"; : > "$fixture/xray-calls"; failover_check_once || fail "检查失败"; }
+# 状态文件存在但为空（jq 1.6 对空输入配合 -e 返回 0，曾导致状态被写成空文件、每轮都当作首次）
+: > "$CFG/failover-state.json"
 target() { jq -r '."xray|FO".target' "$CFG/failover-state.json"; }
 cycle "$A $B";  [[ $(target) == "$B" && $(cat "$fixture/xray-calls") == "bo $B" && ! -s "$fixture/tg" ]] || fail "首轮应指定最高优先级 B 且不通知"
 cycle "$A";     [[ $(target) == "$A" && $(cat "$fixture/xray-calls") == "bo $A" ]] || fail "B 不可用应切到 A"

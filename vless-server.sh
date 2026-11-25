@@ -13259,7 +13259,7 @@ _build_singbox_ruleset_defs() {
 }
 
 # 为一个负载均衡组追加 sing-box 出站：先确保组内节点出站存在，再追加组出站（tag: balancer-组名）。
-# 分流规则和用户路由共用，保证两处生成的组一致；节点 tag 固定 prefer_ipv4，与故障转移监控（_failover_node_tag）一致。
+# 分流规则和用户路由共用，保证两处生成的组一致；节点 tag 固定 prefer_ipv4（故障转移监控直接读取组出站的候选列表）。
 # 用法: outbounds=$(_singbox_append_balancer_outbounds "$outbounds" "$group_json")
 # 输出追加后的出站数组；组出站已存在时原样输出；jq 处理失败返回 1。
 _singbox_append_balancer_outbounds() {
@@ -17646,7 +17646,6 @@ _failover_test_urls() {
 }
 
 # 链式节点在均衡器中的出站 tag（与均衡器渲染保持一致，固定 prefer_ipv4）
-_failover_node_tag() { printf 'chain-%s-prefer-ipv4' "$1"; }
 _failover_tag_label() { local t="${1#chain-}"; t="${t%-prefer-ipv4}"; [[ "$1" == direct ]] && t="直连"; printf '%s' "$t"; }
 
 _failover_group_names() {
@@ -17933,16 +17932,19 @@ _failover_step_skip() {
 # 处理一个内核中的一个组；读入并输出完整状态 JSON（任何异常都返回输入状态，只附加 note）
 _failover_step() {
     local core="$1" group="$2" state="$3"
-    shift 3
     _failover_json_object "$state" || state='{}'
-    local key="${core}|${group}" balancer="balancer-${group}" cfg_file tags=() t alive="" applied="" outbound_tags
+    local key="${core}|${group}" balancer="balancer-${group}" cfg_file tags=() t alive="" applied=""
     [[ "$core" == xray ]] && cfg_file="$CFG/config.json" || cfg_file="$CFG/singbox.json"
-    # 只考虑配置中实际生成了出站的节点，保持组内优先级顺序（一次读出全部出站 tag）
-    outbound_tags=$'\n'"$(jq -r '.outbounds[]?.tag // empty' "$cfg_file" 2>/dev/null)"$'\n'
-    for t in "$@"; do
-        t=$(_failover_node_tag "$t")
-        [[ "$outbound_tags" == *$'\n'"$t"$'\n'* ]] && tags+=("$t")
-    done
+    # 组内节点及优先级以内核配置为准：均衡器候选只含成功生成出站的节点，顺序即优先级。
+    # 不读数据库的节点列表：数据库先于配置更新（如节点改名后、配置重建完成前），
+    # 两者不一致时新名字的节点会被当作不存在，监控会误切到低优先级节点
+    if [[ "$core" == xray ]]; then
+        mapfile -t tags < <(jq -r --arg b "$balancer" '.routing.balancers[]? | select(.tag == $b)
+                                | .selector[]? | select(. != "direct")' "$cfg_file" 2>/dev/null)
+    else
+        mapfile -t tags < <(jq -r --arg b "$balancer" '.outbounds[]? | select(.tag == $b and .type == "selector")
+                                | .outbounds[]? | select(. != "direct")' "$cfg_file" 2>/dev/null)
+    fi
     # 读取内核当前实际选择（Xray 的指定 / sing-box selector 的当前项）；读不到说明内核未运行或 API 未开启
     if [[ "$core" == xray ]]; then
         applied=$(_failover_xray_override "$balancer") ||
@@ -18014,7 +18016,7 @@ failover_check_once() {
     if [[ "${TASK_FAILOVER_LOCK_OWNER:-}" != "$BASHPID" ]]; then
         _with_named_lock failover failover_check_once "$@"; return $?
     fi
-    local groups state_file state group nodes
+    local groups state_file state group
     [[ -f "$DB_FILE" ]] || return 0
     groups=$(jq -c '[.balancer_groups[]? | select(.strategy == "failover")]' "$DB_FILE" 2>/dev/null) || return 1
     state_file=$(_failover_state_file)
@@ -18025,15 +18027,14 @@ failover_check_once() {
         [[ -n "$group" ]] || continue
         local name
         name=$(jq -r '.name' <<< "$group")
-        mapfile -t nodes < <(jq -r '.nodes[]?' <<< "$group")
         if [[ -f "$CFG/config.json" ]] &&
            jq -e --arg t "balancer-$name" 'any(.routing.balancers[]?; .tag == $t)' "$CFG/config.json" >/dev/null 2>&1; then
-            state=$(_failover_step xray "$name" "$state" "${nodes[@]}")
+            state=$(_failover_step xray "$name" "$state")
             processed+=("xray|$name")
         fi
         if [[ -f "$CFG/singbox.json" ]] &&
            jq -e --arg t "balancer-$name" 'any(.outbounds[]?; .tag == $t and .type == "selector")' "$CFG/singbox.json" >/dev/null 2>&1; then
-            state=$(_failover_step singbox "$name" "$state" "${nodes[@]}")
+            state=$(_failover_step singbox "$name" "$state")
             processed+=("singbox|$name")
         fi
     done < <(jq -c '.[]' <<< "$groups")

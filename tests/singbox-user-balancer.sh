@@ -96,9 +96,9 @@ echo 'PASS sing-box user routing with global rules: groups reused, no duplicate 
 # ── 3. 只被用户路由引用的故障转移组能被监控识别 ──
 cp "$fixture/s1.json" "$CFG/singbox.json"
 rm -f "$CFG/config.json" "$fixture/steps"
-_failover_step() { echo "$1 $2 ${*:4}" >> "$fixture/steps"; printf '%s' "$3"; }
+_failover_step() { echo "$1 $2" >> "$fixture/steps"; printf '%s' "$3"; }
 failover_check_once || fail "监控检查失败"
-[[ "$(cat "$fixture/steps" 2>/dev/null)" == "singbox FO B A Missing" ]] ||
+[[ "$(cat "$fixture/steps" 2>/dev/null)" == "singbox FO" ]] ||
     fail "监控应识别 sing-box 故障转移组 FO（且只识别故障转移组）: $(cat "$fixture/steps" 2>/dev/null)"
 unset -f _failover_step
 echo 'PASS failover monitor recognizes a sing-box failover group referenced only by user routing'

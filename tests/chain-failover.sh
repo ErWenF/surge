@@ -224,6 +224,14 @@ cycle "$A"; [[ $(target) == "$A" ]] || fail "原出口不在组内时应重新�
 [[ $(grep -c '^---$' "$fixture/tg") == "$notices" ]] || fail "原出口不在组内时不应发送通知"
 grep -q 'Renamed 已不在组内' "$CFG/failover.log" || fail "原出口不在组内应记录日志"
 [[ $(jq -c 'keys' "$CFG/failover-state.json") == '["xray|FO"]' ]] || fail "应清除未处理组的状态: $(jq -c keys "$CFG/failover-state.json")"
+# 数据库先于配置更新（节点改名后、配置重建前）：节点与优先级以配置中的均衡器为准，不能误切到低优先级节点（真机发现）
+cycle "$B $A"; cycle "$B $A"; cycle "$B $A"; [[ $(target) == "$B" ]] || fail "前置：应已切回 B"
+cp "$DB_FILE" "$fixture/db.bak"
+jq '(.balancer_groups[] | select(.name == "FO") | .nodes) = ["B-renamed", "A"]' "$fixture/db.bak" > "$DB_FILE"
+notices=$(grep -c '^---$' "$fixture/tg")
+cycle "$B $A"; [[ $(target) == "$B" && ! -s "$fixture/xray-calls" ]] || fail "配置未重建前应继续按配置使用 B: $(target)"
+[[ $(grep -c '^---$' "$fixture/tg") == "$notices" ]] || fail "数据库与配置不一致时不应通知"
+cp "$fixture/db.bak" "$DB_FILE"
 unset -f curl
 echo 'PASS Xray monitor: all test URLs per node via probe inbounds, half-broken node rejected, explicit direct, stable recovery, re-apply after restart, retry, not-ready skip, log dedup, rename re-init, stale state cleanup'
 

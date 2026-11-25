@@ -1,6 +1,6 @@
 # sing-box 负载均衡组：random / roundRobin 与分流规则引用
 
-基于 `feature/chain-failover`（6afd2c8）。Xray 侧的 random / roundRobin 不在本次范围。
+基于 `feature/chain-failover`（a782a8c）。Xray 侧的 random / roundRobin 不在本次范围。
 
 ## 问题
 
@@ -75,10 +75,10 @@
 
 | | 通过 | 失败 | 跳过 |
 |---|---|---|---|
-| 基线 feature/chain-failover（6afd2c8） | 59 | 3 | 6 |
+| 基线 feature/chain-failover（a782a8c） | 59 | 3 | 6 |
 | 本分支 | 60 | 3 | 6 |
 
-多出的一项通过是新测试。失败和跳过项和基线逐项相同，都是环境原因（`reality-target.sh`、`core-native.py`、`ss2022-native.py`，见 [upstream-sync-v3.7.20-preview.md](upstream-sync-v3.7.20-preview.md)）。只在第一个修复提交（`6f772de`）上单独跑 `singbox-balancer-strategies.sh` 和 `chain-failover.sh`，也都通过。
+多出的一项通过是新测试。失败和跳过项和基线逐项相同，都是环境原因（`reality-target.sh`、`core-native.py`、`ss2022-native.py`，见 [upstream-sync-v3.7.20-preview.md](upstream-sync-v3.7.20-preview.md)）。只在第一个修复提交（`7a2f66a`）上单独跑 `singbox-balancer-strategies.sh` 和 `chain-failover.sh`，也都通过。
 
 ## 已知限制（未在本次修改）
 

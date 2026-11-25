@@ -4315,6 +4315,10 @@ repair_scheduled_jobs() {
     if [[ ! -f "$CFG/ip-check.disabled" ]] && _has_installed_protocols; then
         setup_ip_check_cron || _log "WARN" "公网 IP 检测定时任务自动修复失败"
     fi
+    # 有故障转移组时确保监控服务运行（脚本升级后服务定义变化会重启以加载新代码）
+    if _has_failover_groups; then
+        setup_failover_service true || _log "WARN" "故障转移监控服务自动修复失败"
+    fi
 }
 
 get_traffic_monthly_reset_enabled() {
@@ -5003,6 +5007,8 @@ fi
 
 # 协议分类定义 (重构: Sing-box 接管独立协议)
 SINGBOX_V2RAY_API_PORT="10086"
+# 仅监听本机，供链式代理故障转移监控服务测速并切换 selector（带随机密钥）
+SINGBOX_CLASH_API_PORT="10087"
 XRAY_PROTOCOLS="vless vless-xhttp vless-xhttp-cdn vless-ws vless-ws-notls vmess-ws vless-vision trojan trojan-ws socks ss2022 ss-legacy"
 # Sing-box 可管理的协议。首个内核切换预览版开放 VLESS Reality、Trojan
 # 和 Shadowsocks；其他共同协议待兼容性回归完成后再开放。
@@ -5565,21 +5571,19 @@ _render_xray_config() {
                 while IFS= read -r node_name; do
                     [[ -z "$node_name" ]] && continue
                     local node_tag="chain-${node_name}${tag_suffix}"
-                    selectors=$(echo "$selectors" | jq --arg tag "$node_tag" '. + [$tag]')
-                    
-                    # 确保节点 outbound 存在
+
+                    # 确保节点 outbound 存在；只把成功生成出站的节点放进均衡器（节点已删除时跳过）
                     if ! echo "$outbounds" | jq -e --arg tag "$node_tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
                         local chain_out=$(gen_xray_chain_outbound "$node_name" "$node_tag" "$balancer_ip_version")
                         [[ -n "$chain_out" ]] && outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
                     fi
+                    echo "$outbounds" | jq -e --arg tag "$node_tag" 'any(.[]; .tag == $tag)' >/dev/null 2>&1 &&
+                        selectors=$(echo "$selectors" | jq --arg tag "$node_tag" '. + [$tag]')
                 done < <(echo "$group_json" | jq -r '.nodes[]?')
-                
-                # 生成 balancer 配置
-                local balancer=$(jq -n \
-                    --arg tag "balancer-${group_name}" \
-                    --arg strategy "$strategy" \
-                    --argjson selector "$selectors" \
-                    '{tag: $tag, selector: $selector, strategy: {type: $strategy}}')
+
+                # 生成 balancer 配置（故障转移组见 _xray_balancer_object）
+                local balancer
+                balancer=$(_xray_balancer_object "$group_json" "$selectors") || return 1
 
                 balancers=$(echo "$balancers" | jq --argjson b "$balancer" '. + [$b]')
             done < <(echo "$balancer_groups" | jq -c '.[]')
@@ -5735,54 +5739,7 @@ _render_xray_config() {
             local tmp=$(mktemp)
             jq '.routing.rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]' "$xray_output_file" > "$tmp" && mv "$tmp" "$xray_output_file"
         fi
-
-        # 检查是否使用了leastPing或leastLoad策略,添加burstObservatory配置
-        local needs_observatory=false
-        if [[ -n "$balancer_groups" && "$balancer_groups" != "[]" ]]; then
-            while IFS= read -r group_json; do
-                local strategy=$(echo "$group_json" | jq -r '.strategy')
-                if [[ "$strategy" == "leastPing" || "$strategy" == "leastLoad" ]]; then
-                    needs_observatory=true
-                    break
-                fi
-            done < <(echo "$balancer_groups" | jq -c '.[]')
-        fi
-
-        if [[ "$needs_observatory" == "true" ]]; then
-            # 构建subjectSelector: 使用通配符匹配所有链式代理出站
-            # 示例: ["chain-Alice-TW-SOCKS5-"] 将匹配所有Alice节点
-            local subject_selectors="[]"
-            while IFS= read -r group_json; do
-                local strategy=$(echo "$group_json" | jq -r '.strategy')
-                if [[ "$strategy" == "leastPing" || "$strategy" == "leastLoad" ]]; then
-                    # 提取节点名前缀用于通配
-                    local first_node=$(echo "$group_json" | jq -r '.nodes[0] // ""')
-                    if [[ -n "$first_node" ]]; then
-                        # 提取公共前缀 (例如 Alice-TW-SOCKS5-01 -> Alice-TW-SOCKS5)
-                        local prefix=$(echo "$first_node" | sed 's/-[0-9][0-9]*$//')
-                        local tag_prefix="chain-${prefix}-"
-                        # 避免重复添加相同前缀
-                        if ! echo "$subject_selectors" | jq -e --arg p "$tag_prefix" '.[] | select(. == $p)' >/dev/null 2>&1; then
-                            subject_selectors=$(echo "$subject_selectors" | jq --arg p "$tag_prefix" '. + [$p]')
-                        fi
-                    fi
-                fi
-            done < <(echo "$balancer_groups" | jq -c '.[]')
-
-            # 添加burstObservatory配置
-            local tmp=$(mktemp)
-            jq --argjson selectors "$subject_selectors" '
-                .burstObservatory = {
-                    subjectSelector: $selectors,
-                    pingConfig: {
-                        destination: "https://www.gstatic.com/generate_204",
-                        interval: "10s",
-                        sampling: 2,
-                        timeout: "5s"
-                    }
-                }
-            ' "$xray_output_file" > "$tmp" && mv "$tmp" "$xray_output_file"
-        fi
+        # 健康检查（burstObservatory）在两条路径之后统一生成，见 _xray_apply_balancer_observatory
     else
         # 无全局分流规则时，仍然需要检查用户级路由规则和负载均衡器
         local user_routing_rules=$(gen_xray_user_routing_rules)
@@ -5821,19 +5778,17 @@ _render_xray_config() {
                                 while IFS= read -r node_name; do
                                     [[ -z "$node_name" ]] && continue
                                     local node_tag="chain-${node_name}-prefer-ipv4"
-                                    selectors=$(echo "$selectors" | jq --arg tag "$node_tag" '. + [$tag]')
-                                    # 确保节点 outbound 存在
+                                    # 确保节点 outbound 存在；只把成功生成出站的节点放进均衡器
                                     if ! echo "$user_outbounds" | jq -e --arg tag "$node_tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
                                         local chain_out=$(gen_xray_chain_outbound "$node_name" "$node_tag" "prefer_ipv4")
                                         [[ -n "$chain_out" ]] && user_outbounds=$(echo "$user_outbounds" | jq --argjson out "$chain_out" '. + [$out]')
                                     fi
+                                    echo "$user_outbounds" | jq -e --arg tag "$node_tag" 'any(.[]; .tag == $tag)' >/dev/null 2>&1 &&
+                                        selectors=$(echo "$selectors" | jq --arg tag "$node_tag" '. + [$tag]')
                                 done < <(echo "$group_json" | jq -r '.nodes[]?')
-                                
-                                local balancer=$(jq -n \
-                                    --arg tag "balancer-${group_name}" \
-                                    --arg strategy "$strategy" \
-                                    --argjson selector "$selectors" \
-                                    '{tag: $tag, selector: $selector, strategy: {type: $strategy}}')
+
+                                local balancer
+                                balancer=$(_xray_balancer_object "$group_json" "$selectors") || return 1
                                 user_balancers=$(echo "$user_balancers" | jq --argjson b "$balancer" '. + [$b]')
                             fi
                         fi
@@ -5899,6 +5854,9 @@ _render_xray_config() {
         fi
     fi
     
+    # 两条路径（有/无全局分流规则）生成的均衡器统一补充健康检查与 RoutingService
+    _xray_apply_balancer_observatory "$xray_output_file" || { _err "均衡器健康检查配置生成失败"; return 1; }
+
     # 为每个 Xray 协议添加 inbound，并统计成功数量
     local success_count=0
     local failed_protocols=""
@@ -13518,18 +13476,33 @@ _render_singbox_config() {
                 while IFS= read -r node_name; do
                     [[ -z "$node_name" ]] && continue
                     local node_tag="chain-${node_name}${tag_suffix}"
-                    node_outbounds=$(echo "$node_outbounds" | jq --arg tag "$node_tag" '. + [$tag]')
 
-                    # 确保节点 outbound 存在
+                    # 确保节点 outbound 存在；只引用成功生成的出站（引用不存在的出站会让 sing-box check 失败）
                     if ! echo "$outbounds" | jq -e --arg tag "$node_tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
                         local chain_out=$(gen_singbox_chain_outbound "$node_name" "$node_tag" "$balancer_ip_version")
                         [[ -n "$chain_out" ]] && outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
                     fi
+                    echo "$outbounds" | jq -e --arg tag "$node_tag" 'any(.[]; .tag == $tag)' >/dev/null 2>&1 &&
+                        node_outbounds=$(echo "$node_outbounds" | jq --arg tag "$node_tag" '. + [$tag]')
                 done < <(echo "$group_json" | jq -r '.nodes[]?')
 
                 # 根据策略生成不同类型的 sing-box outbound
                 local balancer_out=""
                 case "$strategy" in
+                    failover)
+                        # 故障转移：默认第一优先节点，末尾追加 direct 作为全部不可用时的出口；
+                        # 监控服务经 Clash API 按优先级切换，切换时中断旧连接使其立即经新出口重建
+                        balancer_out=$(jq -n \
+                            --arg tag "balancer-${group_name}" \
+                            --argjson outbounds "$node_outbounds" \
+                            '{
+                                type: "selector",
+                                tag: $tag,
+                                outbounds: ($outbounds + ["direct"]),
+                                default: ($outbounds[0] // "direct"),
+                                interrupt_exist_connections: true
+                            }')
+                        ;;
                     leastPing)
                         # sing-box 使用 urltest 实现最低延迟选择
                         balancer_out=$(jq -n \
@@ -14010,6 +13983,23 @@ _render_singbox_config() {
                     users: $users
                 }
             }')
+    fi
+
+    # 故障转移组需要 Clash API 供监控服务测速与切换 selector；只监听本机并带随机密钥。
+    # 内核未编入 with_clash_api 时不写入（否则配置校验失败），组退化为固定使用第一优先节点。
+    local failover_tags
+    failover_tags=$(_failover_group_names | jq -R '"balancer-" + .' | jq -sc .) || failover_tags='[]'
+    if echo "$base_config" | jq -e --argjson fo "${failover_tags:-[]}" \
+        'any(.outbounds[]?; .type == "selector" and (.tag as $t | $fo | index($t) != null))' >/dev/null 2>&1; then
+        if sing-box version 2>/dev/null | grep -q 'with_clash_api'; then
+            local clash_secret
+            clash_secret=$(_failover_clash_secret) || { _err "无法生成 Clash API 密钥"; return 1; }
+            base_config=$(echo "$base_config" | jq \
+                --arg controller "127.0.0.1:${SINGBOX_CLASH_API_PORT}" --arg secret "$clash_secret" \
+                '.experimental.clash_api = {external_controller: $controller, secret: $secret}')
+        else
+            _warn "当前 sing-box 未编入 Clash API，故障转移组将固定使用第一优先节点"
+        fi
     fi
 
     # 私有临时文件完成渲染和分流后再发布，避免凭据暴露和半份配置。
@@ -17569,6 +17559,476 @@ db_update_balancer_nodes() {
     local nodes_json=$(printf '%s\n' "${nodes[@]}" | jq -R . | jq -s .)
     _db_apply --arg name "$name" --argjson nodes "$nodes_json" \
         '.balancer_groups = [.balancer_groups[]? | if .name == $name then .nodes = $nodes else . end]'
+}
+
+#═══════════════════════════════════════════════════════════════════════════════
+# 链式代理故障转移组（负载均衡组策略 failover）
+#═══════════════════════════════════════════════════════════════════════════════
+# 节点按优先级排列：第一优先可用就走它，否则依次走下一个可用节点，全部不可用时走直连；
+# 高优先级节点恢复后需连续 FAILOVER_RECOVER_CHECKS 次检测可用才切回，避免来回抖动。
+# 两个内核都没有原生的"按顺序故障转移"，由常驻服务 vless-failover 在运行时切换（不重启内核）：
+#   Xray     leastLoad 均衡器 + burstObservatory 健康检查 + fallbackTag=direct；
+#            监控读取 `xray api bi` 的可用节点，按优先级用 `xray api bo` 指定出口；
+#            全部不可用时撤销指定，由 fallbackTag 原生退回直连（监控服务停止时同样成立）。
+#   sing-box selector [节点..., direct]；监控经 Clash API 逐个测速后切换 selector。
+FAILOVER_CHECK_INTERVAL="${FAILOVER_CHECK_INTERVAL:-10}"
+FAILOVER_RECOVER_CHECKS="${FAILOVER_RECOVER_CHECKS:-3}"
+FAILOVER_XRAY_GRACE="${FAILOVER_XRAY_GRACE:-30}"   # Xray 启动后等待首轮健康检查的秒数
+FAILOVER_TEST_URL="https://www.gstatic.com/generate_204"
+
+_failover_state_file() { echo "$CFG/failover-state.json"; }
+_failover_log_file() { echo "$CFG/failover.log"; }
+_failover_clash_secret_file() { echo "$CFG/singbox-clash-api.secret"; }
+
+# 链式节点在均衡器中的出站 tag（与均衡器渲染保持一致，固定 prefer_ipv4）
+_failover_node_tag() { printf 'chain-%s-prefer-ipv4' "$1"; }
+_failover_tag_label() { local t="${1#chain-}"; t="${t%-prefer-ipv4}"; [[ "$1" == direct ]] && t="直连"; printf '%s' "$t"; }
+
+_failover_group_names() {
+    [[ -f "$DB_FILE" ]] || return 0
+    jq -r '.balancer_groups[]? | select(.strategy == "failover") | .name' "$DB_FILE" 2>/dev/null
+}
+
+_has_failover_groups() { [[ -n "$(_failover_group_names)" ]]; }
+
+_failover_log() {
+    local file
+    file=$(_failover_log_file)
+    # 日志自限 1 MiB，超过时保留一份旧日志
+    if [[ -f "$file" ]] && (( $(wc -c < "$file" 2>/dev/null || echo 0) > 1048576 )); then
+        mv -f "$file" "$file.1" 2>/dev/null || true
+    fi
+    (umask 077; printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$file") 2>/dev/null || true
+}
+
+# sing-box Clash API 密钥：首次使用时生成，仅 root 可读
+_failover_clash_secret() {
+    local file secret
+    file=$(_failover_clash_secret_file)
+    if [[ -s "$file" ]]; then
+        secret=$(cat "$file") || return 1
+    else
+        secret=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || return 1
+        [[ ${#secret} -eq 32 ]] || return 1
+        (umask 077; printf '%s\n' "$secret" > "$file") || return 1
+    fi
+    [[ "$secret" =~ ^[0-9a-f]{32}$ ]] || return 1
+    printf '%s' "$secret"
+}
+
+# 生成 Xray 均衡器对象；$2 为已生成出站的节点 tag 数组（JSON，按组内顺序）
+_xray_balancer_object() {
+    local group_json="$1" tags_json="$2"
+    jq -nc --argjson g "$group_json" --argjson tags "$tags_json" '
+        {tag: ("balancer-" + $g.name)} +
+        if ($tags | length) == 0 then
+            # 组内没有可用节点配置时整组走直连，避免引用不存在的出站
+            {selector: ["direct"], strategy: {type: "random"}}
+        elif $g.strategy == "failover" then
+            # expected 等于节点数时 bi 会列出全部可用节点，监控据此按优先级选择；
+            # tolerance 0.4：最近 2 次探测中失败 1 次即视为不可用
+            {selector: $tags, fallbackTag: "direct",
+             strategy: {type: "leastLoad", settings: {expected: ($tags | length), tolerance: 0.4}}}
+        else
+            {selector: $tags, strategy: {type: $g.strategy}}
+        end'
+}
+
+# 按配置中实际存在的均衡器生成健康检查：精确列出需要观测的节点 tag（不再按首个节点名前缀推断），
+# 并在存在故障转移组时开启 RoutingService 供监控服务读写均衡器。
+_xray_apply_balancer_observatory() {
+    local file="$1" failover_tags tmp
+    failover_tags=$(_failover_group_names | jq -R '"balancer-" + .' | jq -sc .) || return 1
+    tmp=$(mktemp "${file}.obs.XXXXXX") || return 1
+    if jq --argjson fo "${failover_tags:-[]}" --arg url "$FAILOVER_TEST_URL" '
+        ([.routing.balancers[]? | select(.strategy.type == "leastPing" or .strategy.type == "leastLoad")
+          | .selector[] | select(. != "direct")] | unique) as $subjects |
+        (if ($subjects | length) > 0 then
+            .burstObservatory = {subjectSelector: $subjects,
+                pingConfig: {destination: $url, interval: "10s", sampling: 2, timeout: "5s"}}
+         else del(.burstObservatory) end) |
+        (if any(.routing.balancers[]?; .tag as $t | $fo | index($t) != null) then
+            .api.services = ((.api.services // []) + ["RoutingService"] | unique)
+         else . end)
+    ' "$file" > "$tmp" && cat "$tmp" > "$file"; then
+        # 写回原文件而不是 mv，保留原文件权限（BusyBox chmod 不支持 --reference）
+        rm -f "$tmp"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+# 进程已运行秒数（未运行返回失败）。直接读 /proc，兼容 BusyBox（其 ps 不支持 -o etimes）
+_failover_proc_uptime() {
+    local name="$1" dir comm pid="" stat start ticks up
+    for dir in /proc/[0-9]*; do
+        IFS= read -r comm < "$dir/comm" 2>/dev/null || continue
+        [[ "$comm" == "$name" ]] && { pid="${dir#/proc/}"; break; }
+    done
+    [[ -n "$pid" ]] || return 1
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    stat="${stat##*) }"                          # 去掉 "pid (comm) "，原第 22 字段（启动时刻）变为第 20 个
+    start=$(awk '{print $20}' <<< "$stat")
+    ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
+    up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null); up="${up%.*}"
+    [[ "$start" =~ ^[0-9]+$ && "$ticks" =~ ^[0-9]+$ && "$up" =~ ^[0-9]+$ ]] || return 1
+    echo $(( up - start / ticks ))
+}
+
+# Xray：输出 "S<TAB>可用节点tag"（按 bi 顺序）与 "O<TAB>当前指定tag"
+_failover_xray_status() {
+    local out
+    out=$(xray api bi --server="127.0.0.1:${XRAY_API_PORT}" -t 3 "$1" 2>/dev/null) || return 1
+    awk '
+        /Selecting Override:/ {sec = "o"; next}
+        /Selects:/            {sec = "s"; next}
+        /^ *- /               {sec = ""; next}
+        sec != "" {
+            line = $0
+            sub(/^ *[0-9]+ */, "", line); sub(/ +$/, "", line)
+            if (line != "") print (sec == "o" ? "O" : "S") "\t" line
+        }' <<< "$out"
+}
+
+# Xray：$2 为节点 tag 时指定出口；为空时撤销指定（交给 fallbackTag 直连）
+_failover_xray_apply() {
+    if [[ -n "$2" ]]; then
+        xray api bo --server="127.0.0.1:${XRAY_API_PORT}" -t 3 -b "$1" "$2" >/dev/null 2>&1
+    else
+        xray api bo --server="127.0.0.1:${XRAY_API_PORT}" -t 3 -b "$1" -r >/dev/null 2>&1
+    fi
+}
+
+# sing-box Clash API 请求；密钥经 stdin 交给 curl，不出现在进程参数中
+_failover_clash_request() {
+    local method="$1" path="$2" body="${3:-}" secret
+    secret=$(cat "$(_failover_clash_secret_file)" 2>/dev/null) || return 1
+    [[ "$secret" =~ ^[0-9a-f]{32}$ ]] || return 1
+    local args=(-fsS --max-time 10 -X "$method")
+    [[ -z "$body" ]] || args+=(-H 'Content-Type: application/json' --data "$body")
+    curl "${args[@]}" --config - "http://127.0.0.1:${SINGBOX_CLASH_API_PORT}${path}" 2>/dev/null \
+        <<< "header = \"Authorization: Bearer ${secret}\""
+}
+
+_failover_uri() { jq -rn --arg s "$1" '$s | @uri'; }
+
+# sing-box：经 Clash API 测试单个出站是否可用
+_failover_singbox_alive() {
+    local resp
+    resp=$(_failover_clash_request GET "/proxies/$(_failover_uri "$1")/delay?url=$(_failover_uri "$FAILOVER_TEST_URL")&timeout=5000") || return 1
+    jq -e '(.delay // 0) > 0' <<< "$resp" >/dev/null 2>&1
+}
+
+_failover_singbox_now() {
+    _failover_clash_request GET "/proxies/$(_failover_uri "$1")" | jq -r '.now // empty'
+}
+
+_failover_singbox_apply() {
+    _failover_clash_request PUT "/proxies/$(_failover_uri "$1")" "$(jq -nc --arg n "$2" '{name: $n}')" >/dev/null
+}
+
+# 决策：按优先级选择目标出口
+# 参数: 上轮目标 待切回候选 候选计数 可用集合(每行一个 tag) 节点 tag...（按优先级）
+# 输出 4 行: 目标、候选、计数、原因（init / failover / recover / hold）。
+# 每个字段单独一行（用 mapfile 读取）：Tab 属于 IFS 空白，read 会把空字段两侧的 Tab 合并导致错位。
+_failover_decide() {
+    local current="$1" pending="$2" count="$3" alive=$'\n'"$4"$'\n'
+    shift 4
+    local best=direct t rank_best=$# rank_cur=$# i=0
+    for t in "$@"; do
+        [[ "$best" == direct && "$alive" == *$'\n'"$t"$'\n'* ]] && { best="$t"; rank_best=$i; }
+        [[ "$t" == "$current" ]] && rank_cur=$i
+        i=$((i + 1))
+    done
+    if [[ -z "$current" ]]; then
+        printf '%s\n\n0\ninit\n' "$best"; return
+    fi
+    # 当前出口不可用或已不在组内：立即切到最佳可用节点（全部不可用则直连）
+    if [[ "$current" != direct ]] && { (( rank_cur == $# )) || [[ "$alive" != *$'\n'"$current"$'\n'* ]]; }; then
+        printf '%s\n\n0\nfailover\n' "$best"; return
+    fi
+    # 当前出口可用（或仍为直连）：更高优先级的节点须连续可用才切回
+    if (( rank_best < rank_cur )); then
+        if [[ "$pending" == "$best" ]]; then count=$((count + 1)); else pending="$best"; count=1; fi
+        if (( count >= FAILOVER_RECOVER_CHECKS )); then
+            printf '%s\n\n0\nrecover\n' "$best"
+        else
+            printf '%s\n%s\n%s\nhold\n' "$current" "$pending" "$count"
+        fi
+        return
+    fi
+    printf '%s\n\n0\nhold\n' "$current"
+}
+
+_failover_notify() {
+    local core="$1" group="$2" from="$3" to="$4" reason="$5" core_name msg
+    [[ "$core" == xray ]] && core_name="Xray" || core_name="Sing-box"
+    if [[ "$to" == direct ]]; then
+        msg="⚠️ 链式代理故障转移｜${group}（${core_name}）"$'\n'"所有节点均不可用，已改为直连（原出口：$(_failover_tag_label "$from")）"
+    elif [[ "$reason" == recover ]]; then
+        msg="✅ 链式代理故障转移｜${group}（${core_name}）"$'\n'"$(_failover_tag_label "$to") 已稳定可用，已从 $(_failover_tag_label "$from") 切回"
+    else
+        msg="🔀 链式代理故障转移｜${group}（${core_name}）"$'\n'"$(_failover_tag_label "$from") 不可用，已切换到 $(_failover_tag_label "$to")"
+    fi
+    _failover_log "${group}/${core}: $(_failover_tag_label "$from") -> $(_failover_tag_label "$to") (${reason})"
+    tg_send_message "$msg" >/dev/null 2>&1 || _failover_log "TG 通知发送失败"
+}
+
+# 处理一个内核中的一个组；读入并输出完整状态 JSON
+_failover_step() {
+    local core="$1" group="$2" state="$3"
+    shift 3
+    local key="${core}|${group}" balancer="balancer-${group}" cfg_file tags=() t alive="" applied="" line
+    [[ "$core" == xray ]] && cfg_file="$CFG/config.json" || cfg_file="$CFG/singbox.json"
+    # 只考虑配置中实际生成了出站的节点，保持组内优先级顺序
+    for t in "$@"; do
+        t=$(_failover_node_tag "$t")
+        jq -e --arg t "$t" 'any(.outbounds[]?; .tag == $t)' "$cfg_file" >/dev/null 2>&1 && tags+=("$t")
+    done
+    if [[ "$core" == xray ]]; then
+        local up
+        up=$(_failover_proc_uptime xray) || { printf '%s' "$state"; return 0; }
+        (( up >= FAILOVER_XRAY_GRACE )) || { printf '%s' "$state"; return 0; }
+        local status
+        status=$(_failover_xray_status "$balancer") || { _failover_log "${group}/xray: 读取均衡器状态失败"; printf '%s' "$state"; return 0; }
+        while IFS=$'\t' read -r kind line; do
+            case "$kind" in S) alive+="${line}"$'\n' ;; O) applied="$line" ;; esac
+        done <<< "$status"
+    else
+        _failover_proc_uptime sing-box >/dev/null || { printf '%s' "$state"; return 0; }
+        applied=$(_failover_singbox_now "$balancer") || applied=""
+        [[ -n "$applied" ]] || { _failover_log "${group}/singbox: Clash API 不可用"; printf '%s' "$state"; return 0; }
+        for t in "${tags[@]}"; do
+            _failover_singbox_alive "$t" && alive+="${t}"$'\n'
+        done
+    fi
+    alive="${alive%$'\n'}"
+
+    local prev pending count decision target new_pending new_count reason want
+    prev=$(jq -r --arg k "$key" '.[$k].target // empty' <<< "$state")
+    pending=$(jq -r --arg k "$key" '.[$k].pending // empty' <<< "$state")
+    count=$(jq -r --arg k "$key" '.[$k].count // 0' <<< "$state")
+    local fields=()
+    mapfile -t fields < <(_failover_decide "$prev" "$pending" "$count" "$alive" "${tags[@]}")
+    target="${fields[0]:-}" new_pending="${fields[1]:-}" new_count="${fields[2]:-0}" reason="${fields[3]:-hold}"
+    [[ -n "$target" && "$new_count" =~ ^[0-9]+$ ]] || { _failover_log "${group}/${core}: 决策结果异常"; printf '%s' "$state"; return 0; }
+
+    # 与内核当前实际状态比较；内核重启会丢失指定，此时静默补上
+    if [[ "$core" == xray ]]; then
+        [[ "$target" == direct ]] && want="" || want="$target"
+        if [[ "$applied" != "$want" ]] && ! _failover_xray_apply "$balancer" "$want"; then
+            _failover_log "${group}/xray: 切换到 $(_failover_tag_label "$target") 失败，下轮重试"
+            printf '%s' "$state"; return 0
+        fi
+    else
+        if [[ "$applied" != "$target" ]] && ! _failover_singbox_apply "$balancer" "$target"; then
+            _failover_log "${group}/singbox: 切换到 $(_failover_tag_label "$target") 失败，下轮重试"
+            printf '%s' "$state"; return 0
+        fi
+    fi
+    [[ -n "$prev" && "$prev" != "$target" ]] && _failover_notify "$core" "$group" "$prev" "$target" "$reason"
+    [[ -z "$prev" ]] && _failover_log "${group}/${core}: 初始出口 $(_failover_tag_label "$target")"
+
+    jq -c --arg k "$key" --arg target "$target" --arg pending "$new_pending" --argjson count "${new_count:-0}" \
+        --arg alive "$alive" --arg at "$(date '+%Y-%m-%d %H:%M:%S')" \
+        '.[$k] = {target: $target, pending: $pending, count: $count,
+                  alive: ($alive | split("\n") | map(select(. != ""))), checked_at: $at}' <<< "$state"
+}
+
+# 执行一轮检查（持锁，避免常驻服务与手动执行同时改写状态）
+failover_check_once() {
+    if [[ "${TASK_FAILOVER_LOCK_OWNER:-}" != "$BASHPID" ]]; then
+        _with_named_lock failover failover_check_once "$@"; return $?
+    fi
+    local groups state_file state group nodes
+    [[ -f "$DB_FILE" ]] || return 0
+    groups=$(jq -c '[.balancer_groups[]? | select(.strategy == "failover")]' "$DB_FILE" 2>/dev/null) || return 1
+    state_file=$(_failover_state_file)
+    state=$(cat "$state_file" 2>/dev/null)
+    jq -e 'type == "object"' <<< "$state" >/dev/null 2>&1 || state='{}'
+    # 已删除的组不再保留状态
+    state=$(jq -c --argjson g "$groups" 'with_entries(select(.key | split("|")[1] as $n | any($g[]; .name == $n)))' <<< "$state")
+    while IFS= read -r group; do
+        [[ -n "$group" ]] || continue
+        local name
+        name=$(jq -r '.name' <<< "$group")
+        mapfile -t nodes < <(jq -r '.nodes[]?' <<< "$group")
+        if [[ -f "$CFG/config.json" ]] &&
+           jq -e --arg t "balancer-$name" 'any(.routing.balancers[]?; .tag == $t)' "$CFG/config.json" >/dev/null 2>&1; then
+            state=$(_failover_step xray "$name" "$state" "${nodes[@]}")
+        fi
+        if [[ -f "$CFG/singbox.json" ]] &&
+           jq -e --arg t "balancer-$name" 'any(.outbounds[]?; .tag == $t and .type == "selector")' "$CFG/singbox.json" >/dev/null 2>&1; then
+            state=$(_failover_step singbox "$name" "$state" "${nodes[@]}")
+        fi
+    done < <(jq -c '.[]' <<< "$groups")
+    local tmp
+    tmp=$(mktemp "${state_file}.XXXXXX") || return 1
+    if printf '%s\n' "$state" | jq . > "$tmp" 2>/dev/null; then
+        chmod 600 "$tmp" && mv -f "$tmp" "$state_file"
+    else
+        rm -f "$tmp"; return 1
+    fi
+}
+
+failover_monitor_run() {
+    _failover_log "监控服务启动（间隔 ${FAILOVER_CHECK_INTERVAL}s，切回需连续 ${FAILOVER_RECOVER_CHECKS} 次可用）"
+    trap '_failover_log "监控服务停止"; exit 0' TERM INT
+    while true; do
+        failover_check_once || _failover_log "本轮检查失败"
+        sleep "$FAILOVER_CHECK_INTERVAL" &
+        wait $!
+    done
+}
+
+# 打印各故障转移组当前状态（菜单与 --failover-status 共用）
+failover_print_status() {
+    local state_file state
+    state_file=$(_failover_state_file)
+    state=$(cat "$state_file" 2>/dev/null) || state='{}'
+    jq -e 'type == "object" and length > 0' <<< "$state" >/dev/null 2>&1 || { echo "  暂无检测结果（监控服务尚未运行或组未在分流规则中使用）"; return 0; }
+    # 字段用 \x1f、可用节点用 \x1e 分隔：都不是 IFS 空白字符，空字段不会被合并，节点名里的逗号也不受影响
+    jq -r 'to_entries[] | [(.key | split("|")[1]), (.key | split("|")[0]), .value.target,
+            (.value.alive | join("\u001e")), .value.pending, (.value.count | tostring), .value.checked_at] | join("\u001f")' <<< "$state" |
+    while IFS=$'\x1f' read -r group core target alive pending count at; do
+        local alive_labels="" t _alive_tags=()
+        IFS=$'\x1e' read -r -a _alive_tags <<< "$alive"
+        for t in "${_alive_tags[@]}"; do [[ -n "$t" ]] && alive_labels+="$(_failover_tag_label "$t") "; done
+        printf '  %s（%s）当前出口: %s\n' "$group" "$([[ "$core" == xray ]] && echo Xray || echo Sing-box)" "$(_failover_tag_label "$target")"
+        printf '    可用节点: %s\n' "${alive_labels:-无}"
+        [[ -z "$pending" ]] || printf '    待切回: %s（已连续可用 %s/%s 次）\n' "$(_failover_tag_label "$pending")" "$count" "$FAILOVER_RECOVER_CHECKS"
+        printf '    检测时间: %s\n' "$at"
+    done
+}
+
+# ── 常驻监控服务 vless-failover（systemd / OpenRC supervise-daemon）──
+_failover_service_manager() {
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then echo systemd
+    elif command -v rc-service >/dev/null 2>&1 && command -v supervise-daemon >/dev/null 2>&1; then echo openrc
+    else return 1; fi
+}
+
+_failover_service_file() {
+    if [[ "$1" == systemd ]]; then echo /etc/systemd/system/vless-failover.service
+    else echo /etc/init.d/vless-failover; fi
+}
+
+failover_service_action() {
+    local action="$1" manager
+    manager=$(_failover_service_manager) || return 1
+    if [[ "$manager" == systemd ]]; then
+        case "$action" in
+            active) systemctl is-active --quiet vless-failover ;;
+            enabled) systemctl is-enabled --quiet vless-failover ;;
+            reload) systemctl daemon-reload ;;
+            *) systemctl "$action" vless-failover ;;
+        esac
+    else
+        case "$action" in
+            active) rc-service vless-failover status ;;
+            enabled) [[ -e /etc/runlevels/default/vless-failover ]] ;;
+            enable) rc-update add vless-failover default ;;
+            disable) rc-update del vless-failover default ;;
+            reload) return 0 ;;
+            *) rc-service vless-failover "$action" ;;
+        esac
+    fi
+}
+
+_failover_write_service() {
+    local manager="$1" output="$2" script_path="$3" bash_path="$4"
+    # 服务使用固定安装路径；拒绝控制字符及服务管理器的命令转义语法
+    [[ "$script_path" =~ ^/[A-Za-z0-9_./-]+$ && "$bash_path" =~ ^/[A-Za-z0-9_./-]+$ ]] || return 1
+    if [[ "$manager" == systemd ]]; then
+        cat > "$output" <<EOF
+[Unit]
+Description=Surge chain proxy failover monitor
+After=network-online.target vless-reality.service vless-singbox.service
+Wants=network-online.target
+# Script version: $VERSION
+[Service]
+Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=$bash_path $script_path --failover-run
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+KillMode=control-group
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+EOF
+        chmod 600 "$output"
+    else
+        cat > "$output" <<EOF
+#!/sbin/openrc-run
+# Script version: $VERSION
+description="Surge chain proxy failover monitor"
+supervisor="supervise-daemon"
+command="$bash_path"
+command_args="$script_path --failover-run"
+pidfile="/run/vless-failover.pid"
+respawn_delay=5
+respawn_max=0
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+depend() { need net; }
+EOF
+        chmod 700 "$output" && sh -n "$output"
+    fi
+}
+
+setup_failover_service() {
+    local silent="${1:-false}" manager file staged changed=false
+    local script_path=/usr/local/bin/vless-server.sh bash_path
+    [[ -x "$script_path" ]] || script_path=$(readlink -f "$0")
+    bash_path=$(get_bash_interpreter)
+    [[ -x "$script_path" && -x "$bash_path" ]] || { _err "找不到脚本或 bash，无法启用故障转移监控"; return 1; }
+    manager=$(_failover_service_manager) || { _err "故障转移监控需要 systemd 或 OpenRC supervise-daemon"; return 1; }
+    file=$(_failover_service_file "$manager")
+    staged=$(mktemp "${file}.new.XXXXXX") || return 1
+    _failover_write_service "$manager" "$staged" "$script_path" "$bash_path" || { rm -f "$staged"; return 1; }
+    if cmp -s "$staged" "$file"; then
+        rm -f "$staged"
+    else
+        mv -f "$staged" "$file" || { rm -f "$staged"; return 1; }
+        changed=true
+        failover_service_action reload >/dev/null 2>&1 || true
+    fi
+    # 服务定义变化（含脚本版本更新）时重启，让常驻进程加载新代码
+    if [[ "$changed" == true ]] && failover_service_action active >/dev/null 2>&1; then
+        failover_service_action restart >/dev/null 2>&1 || { _err "故障转移监控服务重启失败"; return 1; }
+    fi
+    failover_service_action enable >/dev/null 2>&1 && failover_service_action start >/dev/null 2>&1 ||
+        { _err "故障转移监控服务启动失败"; return 1; }
+    sleep 0.3
+    failover_service_action active >/dev/null 2>&1 || { _err "故障转移监控服务未能保持运行，请查看 $(_failover_log_file)"; return 1; }
+    [[ "$silent" == true ]] || _ok "故障转移监控服务已启用 (vless-failover)"
+}
+
+stop_failover_service() {
+    local manager file
+    manager=$(_failover_service_manager) || return 0
+    file=$(_failover_service_file "$manager")
+    [[ -f "$file" ]] || return 0
+    failover_service_action stop >/dev/null 2>&1 || true
+    failover_service_action disable >/dev/null 2>&1 || true
+    rm -f "$file"
+    failover_service_action reload >/dev/null 2>&1 || true
+    if failover_service_action active >/dev/null 2>&1; then
+        _err "故障转移监控服务停止失败"
+        return 1
+    fi
+    return 0
+}
+
+# 有故障转移组时确保监控服务运行；没有时停止并移除
+failover_sync_service() {
+    if _has_failover_groups; then
+        setup_failover_service "${1:-false}"
+    else
+        stop_failover_service
+    fi
 }
 
 # 获取可用的出口列表
@@ -21328,11 +21788,12 @@ create_load_balance_group() {
     echo -e "  ${G}1.${NC} leastPing   ${D}(最低延迟 - 推荐)${NC}"
     echo -e "  ${G}2.${NC} random      ${D}(随机选择)${NC}"
     echo -e "  ${G}3.${NC} roundRobin  ${D}(轮询 - 流量均衡)${NC}"
+    echo -e "  ${G}4.${NC} failover    ${D}(主备故障转移 - 按优先级使用可用节点，全部不可用时直连)${NC}"
     echo -e "  ${G}0.${NC} 返回"
     _line
-    
+
     read -rp "  请选择策略: " strategy_choice
-    
+
     local strategy=""
     local strategy_name=""
     case "$strategy_choice" in
@@ -21348,6 +21809,13 @@ create_load_balance_group() {
             strategy="roundRobin"
             strategy_name="轮询"
             ;;
+        4)
+            strategy="failover"
+            strategy_name="主备故障转移"
+            echo ""
+            echo -e "  ${D}第一个节点优先使用；不可用时依次使用下一个可用节点，全部不可用时走直连。${NC}"
+            echo -e "  ${D}高优先级节点恢复后需连续 ${FAILOVER_RECOVER_CHECKS} 次检测可用才切回，由 vless-failover 服务自动切换。${NC}"
+            ;;
         0)
             return
             ;;
@@ -21360,8 +21828,13 @@ create_load_balance_group() {
     
     echo ""
     echo -e "  ${Y}选择节点:${NC}"
-    echo -e "  ${G}1.${NC} 使用所有节点 (推荐)"
-    echo -e "  ${G}2.${NC} 手动选择节点"
+    if [[ "$strategy" == "failover" ]]; then
+        echo -e "  ${G}1.${NC} 使用所有节点 ${D}(按节点列表顺序作为优先级)${NC}"
+        echo -e "  ${G}2.${NC} 手动选择节点并指定优先级 (推荐)"
+    else
+        echo -e "  ${G}1.${NC} 使用所有节点 (推荐)"
+        echo -e "  ${G}2.${NC} 手动选择节点"
+    fi
     echo -e "  ${G}0.${NC} 返回"
     _line
     
@@ -21384,22 +21857,26 @@ create_load_balance_group() {
             done
             
             echo ""
-            echo -e "  ${Y}输入节点编号 (多个用空格分隔，如: 1 3 5):${NC}"
+            if [[ "$strategy" == "failover" ]]; then
+                echo -e "  ${Y}按优先级顺序输入节点编号 (空格分隔，先写的优先，如: 3 1 2):${NC}"
+            else
+                echo -e "  ${Y}输入节点编号 (多个用空格分隔，如: 1 3 5):${NC}"
+            fi
             read -rp "  > " indices
-            
+
             if [[ -z "$indices" ]]; then
                 _err "未选择节点"
                 _pause
                 return
             fi
-            
-            # 解析选择的节点
+
+            # 解析选择的节点（保持输入顺序，重复编号只保留第一次）
             selected_nodes="[]"
             for idx in $indices; do
-                if [[ "$idx" =~ ^[0-9]+$ ]]; then
+                if [[ "$idx" =~ ^[0-9]+$ ]] && (( idx >= 1 )); then
                     local node_name=$(echo "$nodes" | jq -r ".[$((idx-1))].name // empty")
                     if [[ -n "$node_name" ]]; then
-                        selected_nodes=$(echo "$selected_nodes" | jq --arg n "$node_name" '. + [$n]')
+                        selected_nodes=$(echo "$selected_nodes" | jq --arg n "$node_name" 'if index($n) then . else . + [$n] end')
                     fi
                 fi
             done
@@ -21425,10 +21902,32 @@ create_load_balance_group() {
     echo -e "  ${G}✓${NC} 已选择 ${G}$selected_count${NC} 个节点"
     echo ""
     
+    if [[ "$strategy" == "failover" ]]; then
+        echo -e "  ${Y}优先级:${NC}"
+        local prio=1 pname
+        while IFS= read -r pname; do
+            echo -e "    ${C}${prio}.${NC} $pname"
+            prio=$((prio + 1))
+        done < <(echo "$selected_nodes" | jq -r '.[]')
+        echo -e "    ${C}${prio}.${NC} 直连 ${D}(以上节点均不可用时)${NC}"
+        echo ""
+    fi
+
     # 输入组名
     read -rp "  输入负载均衡组名称 (默认: ${strategy_name}组): " group_name
     [[ -z "$group_name" ]] && group_name="${strategy_name}组"
-    
+    # 组名用于生成出站 tag 和故障转移状态键，不能重名或包含分隔符
+    if [[ "$group_name" == *"|"* || "$group_name" =~ [[:cntrl:]] ]]; then
+        _err "组名不能包含 | 或控制字符"
+        _pause
+        return
+    fi
+    if db_balancer_group_exists "$group_name"; then
+        _err "已存在同名负载均衡组: $group_name"
+        _pause
+        return
+    fi
+
     # 创建负载均衡组配置
     local lb_config=$(jq -n \
         --arg name "$group_name" \
@@ -21458,6 +21957,11 @@ create_load_balance_group() {
         echo -e "  ${Y}下一步:${NC}"
         echo -e "  1. 在 ${G}配置分流规则${NC} 中使用该负载均衡组"
         echo -e "  2. 负载均衡组会自动管理节点切换"
+        if [[ "$strategy" == "failover" ]]; then
+            echo -e "  3. 运行状态: 链式代理 → 查看负载均衡组，或执行 ${C}vless --failover-status${NC}"
+            echo ""
+            failover_sync_service || _warn "监控服务未启用；分流规则仍可使用该组，但不会按优先级自动切换"
+        fi
     else
         _err "创建失败"
     fi
@@ -21567,17 +22071,32 @@ manage_chain_proxy() {
                         leastPing) strategy_name="最低延迟" ;;
                         random) strategy_name="随机选择" ;;
                         roundRobin) strategy_name="轮询" ;;
+                        failover) strategy_name="主备故障转移" ;;
                         *) strategy_name="$strategy" ;;
                     esac
-                    
+
                     echo -e "  ${G}━━━ $name ━━━${NC}"
                     echo -e "  策略: ${C}$strategy_name${NC}  节点数: ${C}$node_count${NC}"
-                    echo -e "  包含节点:"
-                    echo "$nodes" | jq -r '.[]' | while read -r node_name; do
-                        echo -e "    ${D}•${NC} $node_name"
-                    done
+                    if [[ "$strategy" == "failover" ]]; then
+                        echo -e "  优先级:"
+                        echo "$nodes" | jq -r 'to_entries[] | "\(.key + 1)|\(.value)"' | while IFS='|' read -r prio node_name; do
+                            echo -e "    ${C}${prio}.${NC} $node_name"
+                        done
+                        echo -e "    ${C}$((node_count + 1)).${NC} 直连 ${D}(以上均不可用时)${NC}"
+                    else
+                        echo -e "  包含节点:"
+                        echo "$nodes" | jq -r '.[]' | while read -r node_name; do
+                            echo -e "    ${D}•${NC} $node_name"
+                        done
+                    fi
                     echo ""
                 done
+                if _has_failover_groups; then
+                    local fo_svc="未运行"
+                    failover_service_action active >/dev/null 2>&1 && fo_svc="运行中"
+                    echo -e "  ${W}故障转移监控${NC} (vless-failover: ${C}${fo_svc}${NC})"
+                    failover_print_status
+                fi
                 _line
                 _pause
                 ;;
@@ -21701,9 +22220,10 @@ manage_chain_proxy() {
                         leastPing) strategy_name="最低延迟" ;;
                         random) strategy_name="随机选择" ;;
                         roundRobin) strategy_name="轮询" ;;
+                        failover) strategy_name="主备故障转移" ;;
                         *) strategy_name="$strategy" ;;
                     esac
-                    
+
                     echo -e "  ${C}$idx)${NC} ${G}$name${NC} ${D}($strategy_name, $nodes 节点)${NC}"
                     ((idx++))
                 done
@@ -21718,12 +22238,15 @@ manage_chain_proxy() {
                     _db_apply 'del(.balancer_groups)'
                     _ok "已删除所有负载均衡组"
                     _regenerate_proxy_configs
+                    failover_sync_service true || _warn "故障转移监控服务停止失败"
                 elif [[ -n "$del_idx" && "$del_idx" =~ ^[0-9]+$ ]]; then
                     local group_name=$(echo "$balancer_groups" | jq -r ".[$((del_idx-1))].name // empty")
                     if [[ -n "$group_name" ]]; then
                         _db_apply --arg name "$group_name" '.balancer_groups = [.balancer_groups[]? | select(.name != $name)]'
                         _ok "已删除: $group_name"
                         _regenerate_proxy_configs
+                        # 删除最后一个故障转移组时停止并移除监控服务
+                        failover_sync_service true || _warn "故障转移监控服务同步失败"
                     else
                         _err "无效的编号"
                     fi
@@ -23795,6 +24318,7 @@ do_uninstall() {
     force_cleanup
 
     # 清理脚本创建的定时任务，避免卸载后继续调用已删除的脚本。
+    stop_failover_service || _warn "故障转移监控服务停止失败，继续卸载"
     stop_tg_user_bot_service || { _err "用户机器人停止失败，请排查后再继续卸载"; return 1; }
     remove_cron_entry "sync-traffic"
     remove_cron_entry "check-expire"
@@ -33377,6 +33901,24 @@ case "${1:-}" in
         [[ -n "$changes" ]] && printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$changes"
         exit 0
         ;;
+    --failover-run)
+        # 链式代理故障转移常驻监控 (用于 vless-failover 服务)
+        check_root
+        failover_monitor_run
+        exit $?
+        ;;
+    --failover-check)
+        # 手动执行一轮故障转移检查并显示状态
+        check_root
+        failover_check_once || exit 1
+        failover_print_status
+        exit 0
+        ;;
+    --failover-status)
+        check_root
+        failover_print_status
+        exit 0
+        ;;
     --setup-expire-cron)
         # 安装过期检查定时任务
         check_root
@@ -33396,6 +33938,9 @@ case "${1:-}" in
         echo "  --check-expire       检查并禁用过期用户 (用于定时任务)"
         echo "  --setup-expire-cron  安装过期检查定时任务"
         echo "  --check-ip [on|off]  检测公网 IP 变化并刷新节点文件 (用于定时任务)；on/off 开关自动检测"
+        echo "  --failover-run       常驻运行链式代理故障转移监控 (用于服务)"
+        echo "  --failover-check     手动执行一轮故障转移检查并显示状态"
+        echo "  --failover-status    显示故障转移组当前出口与可用节点"
         echo "  --help, -h           显示帮助信息"
         echo ""
         echo "无参数时启动交互式菜单"

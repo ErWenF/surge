@@ -13310,8 +13310,10 @@ _singbox_append_balancer_outbounds() {
                     interrupt_exist_connections: true
                 }')
             ;;
-        leastPing)
-            # sing-box 使用 urltest 实现最低延迟选择
+        leastPing|random|roundRobin|*)
+            # sing-box 使用 urltest 实现最低延迟选择。
+            # sing-box 没有随机/轮询出站组（上游不计划支持），random/roundRobin 同样渲染为 urltest：
+            # 原先渲染成 selector 固定第一个节点，既不随机也不轮询，节点不可用时也不会切走。
             balancer_out=$(jq -n \
                 --arg tag "balancer-${group_name}" \
                 --argjson outbounds "$node_outbounds" \
@@ -13323,18 +13325,6 @@ _singbox_append_balancer_outbounds() {
                     interval: "10s",
                     tolerance: 50,
                     idle_timeout: "30m"
-                }')
-            ;;
-        random|roundRobin|*)
-            # sing-box 使用 selector 实现手动/随机选择
-            balancer_out=$(jq -n \
-                --arg tag "balancer-${group_name}" \
-                --argjson outbounds "$node_outbounds" \
-                '{
-                    type: "selector",
-                    tag: $tag,
-                    outbounds: $outbounds,
-                    default: ($outbounds[0] // "direct")
                 }')
             ;;
     esac
@@ -21751,10 +21741,11 @@ _create_alice_balancer_inline() {
     echo ""
     echo -e "  ${W}配置负载均衡策略:${NC}"
     echo -e "    ${C}1.${NC} leastPing   ${D}(最低延迟 - 推荐)${NC}"
-    echo -e "    ${C}2.${NC} random      ${D}(随机选择)${NC}"
-    echo -e "    ${C}3.${NC} roundRobin  ${D}(轮询 - 流量均衡)${NC}"
+    echo -e "    ${C}2.${NC} random      ${D}(随机选择；sing-box 协议按最低延迟)${NC}"
+    echo -e "    ${C}3.${NC} roundRobin  ${D}(轮询 - 流量均衡；sing-box 协议按最低延迟)${NC}"
     echo ""
     echo -e "  ${Y}说明:${NC} leastPing会自动选择延迟最低的节点"
+    echo -e "        ${D}sing-box 不支持随机/轮询，sing-box 协议使用 random/roundRobin 组时同样按最低延迟选择可用节点${NC}"
     echo ""
 
     local strategy_choice
@@ -21942,10 +21933,11 @@ _create_akile_balancer_inline() {
     echo ""
     echo -e "  ${W}配置负载均衡策略:${NC}"
     echo -e "    ${C}1.${NC} leastPing   ${D}(最低延迟 - 推荐)${NC}"
-    echo -e "    ${C}2.${NC} random      ${D}(随机选择)${NC}"
-    echo -e "    ${C}3.${NC} roundRobin  ${D}(轮询 - 流量均衡)${NC}"
+    echo -e "    ${C}2.${NC} random      ${D}(随机选择；sing-box 协议按最低延迟)${NC}"
+    echo -e "    ${C}3.${NC} roundRobin  ${D}(轮询 - 流量均衡；sing-box 协议按最低延迟)${NC}"
     echo ""
     echo -e "  ${Y}说明:${NC} leastPing会自动选择延迟最低的节点"
+    echo -e "        ${D}sing-box 不支持随机/轮询，sing-box 协议使用 random/roundRobin 组时同样按最低延迟选择可用节点${NC}"
     echo ""
 
     local strategy_choice
@@ -22003,8 +21995,8 @@ create_load_balance_group() {
     echo ""
     echo -e "  ${Y}负载均衡策略:${NC}"
     echo -e "  ${G}1.${NC} leastPing   ${D}(最低延迟 - 推荐)${NC}"
-    echo -e "  ${G}2.${NC} random      ${D}(随机选择)${NC}"
-    echo -e "  ${G}3.${NC} roundRobin  ${D}(轮询 - 流量均衡)${NC}"
+    echo -e "  ${G}2.${NC} random      ${D}(随机选择；sing-box 协议按最低延迟)${NC}"
+    echo -e "  ${G}3.${NC} roundRobin  ${D}(轮询 - 流量均衡；sing-box 协议按最低延迟)${NC}"
     echo -e "  ${G}4.${NC} failover    ${D}(主备故障转移 - 按优先级使用可用节点，全部不可用时直连)${NC}"
     echo -e "  ${G}0.${NC} 返回"
     _line
@@ -22042,7 +22034,11 @@ create_load_balance_group() {
             return
             ;;
     esac
-    
+    if [[ "$strategy" == "random" || "$strategy" == "roundRobin" ]]; then
+        echo ""
+        echo -e "  ${D}sing-box 不支持${strategy_name}：sing-box 协议使用该组时按最低延迟选择可用节点，Xray 协议不受影响。${NC}"
+    fi
+
     echo ""
     echo -e "  ${Y}选择节点:${NC}"
     if [[ "$strategy" == "failover" ]]; then
@@ -22295,6 +22291,9 @@ manage_chain_proxy() {
 
                     echo -e "  ${G}━━━ $name ━━━${NC}"
                     echo -e "  策略: ${C}$strategy_name${NC}  节点数: ${C}$node_count${NC}"
+                    if [[ "$strategy" == "random" || "$strategy" == "roundRobin" ]]; then
+                        echo -e "  ${D}sing-box 协议: 不支持${strategy_name}，按最低延迟选择可用节点${NC}"
+                    fi
                     if [[ "$strategy" == "failover" ]]; then
                         echo -e "  优先级:"
                         echo "$nodes" | jq -r 'to_entries[] | "\(.key + 1)|\(.value)"' | while IFS='|' read -r prio node_name; do

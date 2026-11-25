@@ -64,8 +64,8 @@ sing-box 协议用户的用户路由可以设为任意负载均衡组（`balance
 
 - 检测网址是全局设置，所有故障转移组共用。
 - 监控服务停止时：Xray 保持最后一次指定，sing-box 保持最后选中项；内核重启后 Xray 回到保底逻辑。
-- 原有 random / roundRobin 组在 sing-box 中实际固定使用第一个节点（原有问题，未在本次修改）。
-- 有全局分流规则时 sing-box 会生成所有组：节点全部无效的 leastPing / random / roundRobin 组即使没被引用，也会让整份 sing-box 配置被 `check` 拒绝（`missing tags`，原有问题，已用真实 sing-box 1.14.0 复现，未在本次修改）。
+- sing-box 下的 random / roundRobin 组原先实际固定使用第一个节点，分流规则引用组时出站名写错；两者已修复（random / roundRobin 改为按最低延迟的 urltest，sing-box 内核不支持按连接随机或轮询），见 [singbox-balancer-strategies.md](singbox-balancer-strategies.md)。
+- 有全局分流规则时 sing-box 会生成所有组：节点全部无效的 leastPing / random / roundRobin 组即使没被引用，也会让整份 sing-box 配置被 `check` 拒绝（`missing tags`，原有问题，已用真实 sing-box 1.14.0 复现，本版不修改）。
 
 ## 测试
 

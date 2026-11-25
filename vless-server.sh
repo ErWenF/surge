@@ -11524,6 +11524,8 @@ _xray_release_asset_sha256() {
 }
 
 # Xray 优先使用官方 .dgst；其他资产沿用 GitHub digest/checksum 校验。
+# 返回 0 校验通过；1 校验值不一致或无法计算本地摘要；2 取不到发布方校验值
+# （区分两类失败，安装入口只在"取不到"时提示 ALLOW_UNVERIFIED_DOWNLOADS）。
 _verify_github_release_asset() {
     local repo="$1" version="$2" asset_url="$3" file="$4"
     local asset_name="${asset_url%%\?*}"
@@ -11544,7 +11546,7 @@ _verify_github_release_asset() {
         release_json=$(curl -fsSL --connect-timeout 10 --max-time 30 \
             "https://api.github.com/repos/${repo}/releases/tags/${version}" 2>/dev/null) || {
             _GITHUB_ASSET_VERIFY_ERROR="无法取得官方校验值：GitHub API 请求失败（可能限流或网络异常）"
-            return 1
+            return 2
         }
 
         digest=$(printf '%s' "$release_json" | jq -r --arg n "$asset_name" \
@@ -11555,11 +11557,11 @@ _verify_github_release_asset() {
             checksum_url=$(printf '%s' "$release_json" | jq -r '
                 [.assets[]? | select(.name | test("sha256|checksums?"; "i")) | .browser_download_url][0] // empty
             ' 2>/dev/null)
-            [[ -n "$checksum_url" ]] || return 1
+            [[ -n "$checksum_url" ]] || return 2
             checksum_file=$(mktemp "${TMPDIR:-/tmp}/vless-checksum.XXXXXX") || return 1
             if ! curl -fsSL --connect-timeout 10 --max-time 30 -o "$checksum_file" "$checksum_url"; then
                 rm -f "$checksum_file"
-                return 1
+                return 2
             fi
             expected=$(awk -v name="$asset_name" '
                 function record(file, value) {
@@ -11594,7 +11596,8 @@ _verify_github_release_asset() {
         fi
     fi
 
-    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+    # 没有发布方校验值，或校验文件无法唯一解析出本资产的 SHA-256
+    [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || return 2
     actual=$(_sha256_file "$file")
     actual=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
     expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
@@ -11813,12 +11816,21 @@ _install_binary() {
         return 1
     fi
 
-    if ! _verify_github_release_asset "$repo" "$version" "$url" "$tmp/pkg"; then
+    local verify_rc=0
+    _verify_github_release_asset "$repo" "$version" "$url" "$tmp/pkg" || verify_rc=$?
+    if [[ "$verify_rc" != 0 ]]; then
         if [[ "${ALLOW_UNVERIFIED_DOWNLOADS:-0}" != "1" ]]; then
             rm -rf "$tmp"
             _err "$name 下载包无法通过发布方 SHA-256 校验，已拒绝安装"
             _err "版本 v$version：${_GITHUB_ASSET_VERIFY_ERROR:-未知校验错误}"
-            _warn "仅在你已自行核验来源时，才可临时设置 ALLOW_UNVERIFIED_DOWNLOADS=1"
+            if [[ "$verify_rc" == 2 ]]; then
+                # 取不到校验值多为 API 限流/网络问题，可重试；确有把握时才允许显式跳过。
+                _warn "可能是 GitHub API 限流（未登录每小时 60 次）或无法访问 GitHub，请稍后重试"
+                _warn "仅在你已自行核验来源时，才可临时设置 ALLOW_UNVERIFIED_DOWNLOADS=1"
+            elif [[ "$_GITHUB_ASSET_VERIFY_ERROR" == *不匹配* ]]; then
+                # 校验值不一致可能是下载损坏或被篡改，不引导用户跳过校验。
+                _warn "可能是下载不完整或被篡改，请重试；仍不一致时不要跳过校验"
+            fi
             return 1
         fi
         _warn "已按显式设置跳过 $name 的完整性校验"

@@ -2,7 +2,7 @@ name: Node script regression
 on:
   push:
     branches: ['codex/**']
-    paths: ['vless-server.sh', 'tests/**', '.github/workflows/script-tests.yml']
+    paths: ['vless-server.sh', 'scripts/**', 'tests/**', '.github/workflows/script-tests.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -49,6 +49,8 @@ jobs:
           tar -xzf mita.tar.gz
           tar -xzf mieru.tar.gz
       - run: bash --version | head -1 && bash -n vless-server.sh
+      # reality-target.sh 模拟脚本真实的 443 探测；runner 为非 root 用户，放开特权端口限制
+      - run: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
       - name: Run every script test
         env:
           SINGBOX_TEST_BIN: ${{ runner.temp }}/core/sing-box
@@ -58,9 +60,15 @@ jobs:
         run: |
           failed=()
           for t in tests/*.sh; do
+            # 跳过规则与 tests/run.sh 一致：入口脚本与 worker 不是独立测试；未提供 Xray 时跳过 SS2022 实核测试
+            case "${t##*/}" in
+              run.sh|core-native-worker.sh|optional-native-worker.sh) continue ;;
+              ss2022-config.sh) [[ -n "${XRAY_BIN:-}" ]] || { echo "SKIP $t (XRAY_BIN unset)"; continue; } ;;
+            esac
             echo "::group::$t"
             if bash "$t"; then echo "OK $t"; else failed+=("$t"); echo "FAILED $t"; fi
             echo "::endgroup::"
           done
+          if node tests/po0-modules.js; then echo "OK tests/po0-modules.js"; else failed+=("tests/po0-modules.js"); fi
           if ((${#failed[@]})); then printf 'FAILED %s\n' "${failed[@]}"; exit 1; fi
       - run: git diff --check

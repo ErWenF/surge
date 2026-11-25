@@ -22,7 +22,7 @@
 
 ## 本 Fork 新功能：链式代理主备故障转移
 
-负载均衡组新增"主备故障转移"策略。节点按优先级使用：第一优先可用就走它，否则用下一个可用节点，全部不可用时走直连；高优先级节点恢复后，连续 3 次检测可用才切回。可在分流规则与 Xray 用户路由中使用。
+负载均衡组新增"主备故障转移"策略。节点按优先级使用：第一优先可用就走它，否则用下一个可用节点，全部不可用时走直连；高优先级节点恢复后，连续 3 次检测可用才切回。可在分流规则与用户路由（Xray、sing-box 协议的用户）中使用。
 
 切换由常驻服务 `vless-failover` 在运行时完成，不重启内核。经每个节点访问全部检测网址（默认 gstatic + Cloudflare，可修改）都收到响应才算节点可用，能识别"能上 Google、上不了 Cloudflare"这类半故障节点。
 
@@ -31,6 +31,13 @@
 - 均衡组不再引用已删除的节点。
 - 创建均衡组时拒绝重名。
 - sing-box 分流规则指向均衡组时，出口名原先写错（`balancer:组名`，实际 tag 是 `balancer-组名`），运行时命中规则的连接会失败。所有策略都受影响，main 上同样存在，现已修正。
+
+## sing-box 负载均衡组的另两处改进
+
+- **用户路由支持负载均衡组**（含故障转移组）：sing-box 协议的用户可以把路由设为某个组。原先这类设置会被静默忽略，用户实际走默认路由。
+- **random / roundRobin 改为按最低延迟选择**：原先在 sing-box 中渲染成 selector，固定使用第一个节点，既不随机也不轮询，节点不可用时也不会切走。sing-box 内核没有随机或轮询出站组，上游明确不计划支持，所以现在和 leastPing 一样渲染为 urltest：跳过不可用节点，选延迟最低的。菜单中已注明。
+
+详见 [singbox-balancer-strategies.md](singbox-balancer-strategies.md)。
 
 ## 本 Fork 修复（真机验证中发现）
 
@@ -55,6 +62,8 @@
 - 已导出的 REALITY 分享链接仍然可用；重新导出后带 ML-KEM 参数。
 - 已有的 leastPing 负载均衡组：Xray 健康检查现在覆盖组内全部节点，下次重建配置后选择结果可能与之前不同（之前名字不同的节点从未被探测，等于被排除）。
 - 不创建故障转移组时，不会启动 `vless-failover` 服务，也不会在 Xray 配置中开启 RoutingService 或探测入口。
+- 已有的 sing-box random / roundRobin 组：下次重建配置后从"固定第一个节点"变为"可用节点中延迟最低的"。已有的 sing-box 用户若之前设过负载均衡组路由（原先被忽略），重建配置后开始生效。
+- 已知限制：有全局分流规则时，sing-box 会生成所有负载均衡组；某个 leastPing / random / roundRobin 组的节点全部被删除时，即使该组没被使用，整份 sing-box 配置也会被拒绝。这是原有问题，本版不修改。
 
 ## 测试结果
 
@@ -62,6 +71,7 @@
 
 | | 通过 | 失败 | 跳过 |
 |---|---|---|---|
+| 预览分支 `3314b58`（含故障转移与 sing-box 均衡组改进） | 61 | 3 | 6 |
 | 预览分支 `6afd2c8`（含故障转移） | 59 | 3 | 6 |
 | 预览分支 `68b4107`（仅同步上游） | 57 | 3 | 6 |
 | 基线 main `5158655` | 46 | 3 | 5 |
@@ -70,9 +80,11 @@
 - `reality-target.sh`：测试要模拟脚本真实的 443 探测，非 root 无法绑定特权端口。
 - `core-native.py` / `ss2022-native.py`：Xray 26.11.9 的 freedom 出站默认拦截回环目标（日志 `target blocked by a finalrule: tcp:127.0.0.1`），测试流量全部发往 127.0.0.1。换成测试针对的 Xray 26.3.27 后，`ss2022-native.py` 在分支和 main 上都通过；`core-native.py` 的 Xray 部分通过，在 sing-box 统计查询处失败，原因是本机没有 grpcurl（两边相同）。
 
-相对 main 多出的 13 项通过就是这次新增的测试：
+相对 main 多出的 15 项通过就是这次新增的测试：
 - 上游的 mieru-install、hy2-udp-port、hy2-salamander（含真实 sing-box 校验混淆配置）、public-ip-change、xray-user-regenerate、surge-vless-reality-config、mihomo-reality-mlkem、watchdog-xray-filter、singbox-reality-handshake、singbox-stats-no-config；
-- 本 Fork 新增的 release-verify-rc、cron-systemd-cron、chain-failover。
+- 本 Fork 新增的 release-verify-rc、cron-systemd-cron、chain-failover、singbox-balancer-strategies（含真实 sing-box 运行）、singbox-user-balancer。
+
+另用真实 sing-box 1.14.0 做了两条链路的运行时验证：分流规则 → 故障转移组 → 链式节点，用户路由 → 故障转移组 → 链式节点（未设路由的对照用户走直连）。两条链路的流量都实际到达了落地节点。
 
 另用真实内核专门验证了"用户全部停用"的配置：sing-box 的 VLESS / Trojan / HY2 / TUIC / AnyTLS 生成空 `users`，Xray 的 VLESS / Trojan 生成空 `clients`，都能通过 `sing-box check` / `xray run -test`，不会退回默认凭据。
 

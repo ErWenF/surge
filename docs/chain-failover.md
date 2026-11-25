@@ -54,7 +54,7 @@
 - sing-box 的用户路由仍不支持任何负载均衡组（原有限制），sing-box 协议请在分流规则中使用。
 - 检测网址是全局设置，所有故障转移组共用。
 - 监控服务停止时：Xray 保持最后一次指定，sing-box 保持最后选中项；内核重启后 Xray 回到保底逻辑。
-- 原有 random / roundRobin 组在 sing-box 中实际固定使用第一个节点（原有问题，未在本次修改）。
+- 原有 random / roundRobin 组在 sing-box 中实际固定使用第一个节点；sing-box 分流规则引用组时写错出站名，命中规则的连接在运行时失败。两者已另行修复，见 [singbox-balancer-strategies.md](singbox-balancer-strategies.md)。
 
 ## 测试
 

@@ -80,9 +80,12 @@
 
 多出的一项通过是新测试。失败和跳过项和基线逐项相同，都是环境原因（`reality-target.sh`、`core-native.py`、`ss2022-native.py`，见 [upstream-sync-v3.7.20-preview.md](upstream-sync-v3.7.20-preview.md)）。只在第一个修复提交（`7a2f66a`）上单独跑 `singbox-balancer-strategies.sh` 和 `chain-failover.sh`，也都通过。
 
-## 已知限制（未在本次修改）
+## 空组行为（v3.7.21）
 
-- 组内节点全部不存在时，组出站的候选为空，`sing-box check` 报 `missing tags`，整份配置被拒绝。leastPing 原本就有这个问题，Xray 侧会把整组改为直连。
+没有有效节点的 leastPing、random 和 roundRobin 组会被省略。全局分流规则指向空组或已删除的组时，保留匹配条件和顺序，命中该规则的连接会被拒绝。恢复有效节点并重建配置后，原规则会重新使用该组。
+
+## 已知限制
+
 - Xray 的 random / roundRobin 只有配置了 `fallbackTag` 才跳过不可用节点（源码 `app/router/strategy_random.go`、`balancing.go`），当前渲染没有设置，所以 Xray 侧遇到不可用节点也照样会选中它。
 - sing-box 下 random / roundRobin 不分摊流量，同一时间只用一个节点。
 

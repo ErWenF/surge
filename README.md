@@ -2,7 +2,11 @@
   
 [![Telegram](https://img.shields.io/badge/Telegram-@vless__vaio-26A5E4?logo=telegram&logoColor=white)](https://t.me/vless_vaio)  
 
-vless脚本使用方法（以 root 在 Alpine、Debian、Ubuntu 或 CentOS 上运行）：
+**已有安装升级到 v3.7.21**。运行 `VLESS_SCRIPT_SOURCE_REF=main vless`，选择「检查脚本更新」→「1 检查并更新脚本」，确认更新后重新运行 `vless`。3.7.19 正式版和 3.7.20 预览版均可使用这个入口，更新会备份旧脚本。
+
+本版新增链式代理主备故障转移、Mieru、HY2 Salamander 和公网 IP 变化检测。sing-box 全局分流规则引用空负载均衡组时，仅拒绝命中该规则的流量。详见[主备故障转移](docs/chain-failover.md)和[负载均衡组行为](docs/singbox-balancer-strategies.md)。
+
+首次安装请在 Alpine、Debian、Ubuntu 或 CentOS 上以 root 运行以下命令。
 
 ```sh
 sh -c '

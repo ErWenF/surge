@@ -54,7 +54,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.7.20"
+readonly VERSION="3.7.21"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/ErWenF/surge"
 readonly SCRIPT_REPO="ErWenF/surge"
@@ -13317,6 +13317,10 @@ _singbox_append_balancer_outbounds() {
                 }')
             ;;
         leastPing|random|roundRobin|*)
+            if [[ "$node_outbounds" == "[]" ]]; then
+                printf '%s\n' "$outbounds"
+                return 0
+            fi
             # sing-box 使用 urltest 实现最低延迟选择。
             # sing-box 没有随机/轮询出站组（上游不计划支持），random/roundRobin 同样渲染为 urltest：
             # 原先渲染成 selector 固定第一个节点，既不随机也不轮询，节点不可用时也不会切走。
@@ -13554,7 +13558,9 @@ _render_singbox_config() {
             done < <(echo "$balancer_groups" | jq -c '.[]')
         fi
 
-        routing_rules=$(gen_singbox_routing_rules)
+        local balancer_tags
+        balancer_tags=$(jq -c '[.[] | select(.type == "urltest" or .type == "selector") | .tag]' <<< "$outbounds") || return 1
+        routing_rules=$(gen_singbox_routing_rules "$balancer_tags")
         if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
             if [[ "$warp_has_endpoint" == "true" ]]; then
                 routing_rules=$(echo "$routing_rules" | jq 'map(if ((.outbound // "") | startswith("warp")) then .outbound = "warp" else . end)')
@@ -18817,6 +18823,7 @@ gen_xray_routing_rules() {
 
 # 生成 Sing-box 分流路由配置 (支持多出口)
 gen_singbox_routing_rules() {
+    local balancer_tags="${1:-[]}"
     local rules=$(db_get_routing_rules)
     [[ -z "$rules" || "$rules" == "[]" ]] && return
     
@@ -18867,6 +18874,10 @@ gen_singbox_routing_rules() {
             # 组出站的 tag 是 balancer-组名（与 Xray 一致）。原先 "balancer:组名" 原样写入：
             # sing-box check 不校验规则引用的出站，运行时命中规则的连接报 outbound not found 而失败。
             tag="balancer-${outbound#balancer:}"
+            if ! jq -e --arg tag "$tag" 'index($tag) != null' <<< "$balancer_tags" >/dev/null; then
+                _warn "Sing-box 分流规则引用的组 ${outbound#balancer:} 没有可用节点，将拒绝命中该规则的流量"
+                tag="block"
+            fi
         fi
         
         if [[ "$rule_type" == "all" ]]; then

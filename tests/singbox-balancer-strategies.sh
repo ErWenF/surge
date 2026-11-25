@@ -35,8 +35,11 @@ jq -n --argjson pa "$PA" --argjson pb "$PB" --argjson pc "$PC" '
                          {name:"C",type:"socks",server:"127.0.0.1",port:$pc}]},
      balancer_groups:[{name:"RND",strategy:"random",nodes:["B","A","Missing"]},
                       {name:"RR",strategy:"roundRobin",nodes:["C","A"]},
-                      {name:"LP",strategy:"leastPing",nodes:["A","C"]}],
-     routing_rules:[{id:"custom_1",type:"custom",outbound:"balancer:RND",domains:"127.0.0.1/32"},
+                      {name:"LP",strategy:"leastPing",nodes:["A","C"]},
+                      {name:"Empty",strategy:"leastPing",nodes:["Removed"]},
+                      {name:"Unused",strategy:"leastPing",nodes:[]}],
+     routing_rules:[{id:"empty",type:"custom",outbound:"balancer:Empty",domains:"localhost"},
+                    {id:"custom_1",type:"custom",outbound:"balancer:RND",domains:"127.0.0.1/32"},
                     {id:"custom_2",type:"custom",outbound:"balancer:RR",domains:"rr.example"},
                     {id:"custom_3",type:"custom",outbound:"balancer:LP",domains:"lp.example"}],
      meta:{}}' > "$DB_FILE"
@@ -54,6 +57,8 @@ jq -e --arg A "$A" --arg B "$B" --arg C "$C" '
     group("balancer-RND") == [urltest("balancer-RND"; [$B, $A])] and
     group("balancer-RR") == [urltest("balancer-RR"; [$C, $A])] and
     group("balancer-LP") == [urltest("balancer-LP"; [$A, $C])] and
+    group("balancer-Empty") == [] and group("balancer-Unused") == [] and
+    .route.rules[0] == {domain_suffix:["localhost"], outbound:"block"} and
     ([.outbounds[] | select(.type == "selector")] | length) == 0 and
     .experimental.clash_api == null and
     any(.route.rules[]; .ip_cidr == ["127.0.0.1/32"] and .outbound == "balancer-RND") and
@@ -107,7 +112,13 @@ else
     retry 50 grep -q 'sing-box started' "$fixture/run.log" || fail "sing-box 未能启动: $(show_log)"
     # 等首轮检测判定 A 可用；没有这条日志（如组不是 urltest）时最多等 5 秒，照常发请求，由请求结果判定
     retry 25 grep -q "balancer-RND\].*outbound $A available" "$fixture/run.log" || true
-    body=$(curl -fsS --max-time 8 -x "socks5h://127.0.0.1:$PM" "http://127.0.0.1:$PH/ok.txt" </dev/null 2>&1) ||
+    if curl -fsS --noproxy '' --max-time 5 -x "socks5h://127.0.0.1:$PM" "http://localhost:$PH/ok.txt" >/dev/null 2>&1; then
+        fail "空组规则放行了应拒绝的请求"
+    fi
+    clean_log
+    grep -qE 'router: match\[[0-9]+\].*localhost.*route\(block\)' "$fixture/run.clean" ||
+        fail "请求未命中空组的拒绝规则: $(show_log)"
+    body=$(curl -fsS --noproxy '' --max-time 8 -x "socks5h://127.0.0.1:$PM" "http://127.0.0.1:$PH/ok.txt" </dev/null 2>&1) ||
         fail "经 random 组访问失败（规则未进入组或固定走了不可用节点）: $body | $(show_log)"
     [[ "$body" == via-node-A ]] || fail "响应内容不符: $body"
     sleep 0.3
@@ -123,8 +134,18 @@ else
     grep -qE "\[$cid [^]]*\] outbound/socks\[$A\]: outbound connection to 127\.0\.0\.1:$PH" "$fixture/run.clean" ||
         fail "测试请求未经节点 A 送达: $(show_log)"
     ! grep -qE "\[$cid [^]]*\] outbound/direct" "$fixture/run.clean" || fail "测试请求走了直连: $(show_log)"
-    echo 'PASS sing-box run: routing rule reaches the random group, dead first node skipped, request served via node A'
+    echo 'PASS sing-box run: empty group blocks the matching request, healthy route reaches node A'
 fi
+
+# 恢复有效节点后，同一份分流规则重新指向该组。
+jq '(.balancer_groups[] | select(.name == "Empty") | .nodes) = ["A"]' "$DB_FILE" > "$fixture/restored-db"
+mv "$fixture/restored-db" "$DB_FILE"
+SINGBOX_CONFIG_OUTPUT="$fixture/restored.json" _render_singbox_config >/dev/null 2>"$fixture/restored.err" ||
+    fail "恢复节点后重新渲染失败: $(cat "$fixture/restored.err")"
+jq -e --arg node "$A" '
+    .route.rules[0] == {domain_suffix:["localhost"], outbound:"balancer-Empty"} and
+    any(.outbounds[]; .tag == "balancer-Empty" and .outbounds == [$node])' "$fixture/restored.json" >/dev/null ||
+    fail "恢复节点后，原拒绝规则没有重新使用该组"
 
 # ── 3. 菜单：创建时与查看时如实说明 sing-box 下按最低延迟 ──
 _header() { :; }

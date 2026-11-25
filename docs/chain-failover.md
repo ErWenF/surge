@@ -55,7 +55,7 @@ sing-box 协议用户的用户路由可以设为任意负载均衡组（`balance
 - 组出站和节点出站由分流规则与用户路由共用的 `_singbox_append_balancer_outbounds` 生成，两处结果一致：节点 tag 固定为 `chain-节点-prefer-ipv4`。监控服务直接读取组出站的候选列表。有全局分流规则时复用已生成的组；没有时只为用户路由引用到的组补生成，不会重复生成出站。
 - 只被用户路由引用的故障转移组同样写入 Clash API，监控服务按 `singbox.json` 中的 selector 识别并切换。
 - 用户路由指向已删除的组，或是 sing-box 不支持的路由类型时，渲染会给出提示（同时写入日志），该用户按全局规则走，不再静默忽略。
-- 组内节点全部无效的 leastPing / random / roundRobin 组候选为空，sing-box 会拒绝整份配置；用户路由遇到这种组同样提示并让该用户按全局规则走，不会因为一个用户卡住所有配置变更。故障转移组的候选总带 `direct`，不受影响。
+- 自 v3.7.21 起，sing-box 在 leastPing、random 或 roundRobin 组没有有效节点时省略该组出站。用户路由引用这种组时会提示，该用户继续按全局规则处理。全局分流规则明确指向空组时，命中该规则的流量会被拒绝。故障转移组仍保留 `direct` 作为最后一个候选。
 
 ## 顺带修复（同一处代码）
 
@@ -69,7 +69,6 @@ sing-box 协议用户的用户路由可以设为任意负载均衡组（`balance
 - 检测网址是全局设置，所有故障转移组共用。
 - 监控服务停止时：Xray 保持最后一次指定，sing-box 保持最后选中项；内核重启后 Xray 回到保底逻辑。
 - sing-box 下的 random / roundRobin 组原先实际固定使用第一个节点，分流规则引用组时出站名写错；两者已修复（random / roundRobin 改为按最低延迟的 urltest，sing-box 内核不支持按连接随机或轮询），见 [singbox-balancer-strategies.md](singbox-balancer-strategies.md)。
-- 有全局分流规则时 sing-box 会生成所有组：节点全部无效的 leastPing / random / roundRobin 组即使没被引用，也会让整份 sing-box 配置被 `check` 拒绝（`missing tags`，原有问题，已用真实 sing-box 1.14.0 复现，本版不修改）。
 
 ## 测试
 

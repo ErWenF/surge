@@ -1,0 +1,79 @@
+# v3.7.20 预览版：同步上游 mozisen/surge v3.7.7
+
+本 Fork 与上游 [mozisen/surge](https://github.com/mozisen/surge) 自 v3.7.2（`12e9714`，2026-09-26）分叉，各自开发约两个月。上游 74 个提交逐项审阅后，按功能移植到本 Fork，最后用 `git merge -s ours` 记录同步到上游 `dbc16e0`（v3.7.7）。之后再同步上游，只会看到 `dbc16e0` 之后的新提交。
+
+两边版本号各自独立：上游的 v3.7.3～v3.7.7 与本 Fork 同号版本内容不同。本 Fork 继续沿用自己的版本线。
+
+## 新增与修复（来自上游）
+
+- **Mieru 协议**（安装菜单 16）：安装 mita 服务端，生成 mihomo / Clash Meta 分享链接与订阅；二进制同样走发布方 SHA-256 校验。
+- **Hysteria2 Salamander 混淆**（可选）：安装 HY2 时询问是否启用；sing-box 入站、分享链接、Surge/Loon/Clash 配置和订阅都带混淆参数。Surge 需 Mac 6.4.3+。
+- **Hysteria2 与纯 TCP 协议共用端口号**：HY2 使用 UDP，可与只占 TCP 的协议使用同一端口号。
+- **公网 IP 变化检测**：每 30 分钟检测一次；两个探测站结果一致，或连续两次得到同一新地址才确认，然后更新数据库、JOIN 文件和订阅文件，下次打开菜单时提示一次。出口 IP 不等于入口 IP 的机器，可用 `vless --check-ip off` 关闭，`vless --check-ip on` 重新开启。
+- **REALITY 链接带 `support-x25519mlkem768=true`**：mihomo v1.19.31+ 直接导入即可连接 Xray 26.9.9+ 的 REALITY 服务端；其他客户端会忽略该参数。
+- **Surge VLESS 节点行**：节点信息和 Surge 订阅增加 VLESS REALITY / XHTTP / XHTTP-CDN（Surge iOS 6.0.0+ / Mac 6.12.0+）。
+- **真实证书模式下 sing-box 接管 VLESS REALITY**：握手目标改为本机 Nginx 8443，与 Xray 的 dest 一致。之前切换到 sing-box 后会连不上。
+- **watchdog 只监管有核心协议的内核**：Snell 等独立协议不会再让 watchdog 反复拉起无配置的核心。升级后首次打开菜单会自动重写一次 watchdog 脚本。
+- **统计核心更新**：卸载最后一个 Sing-box 协议后，也能只替换统计核心（带备份），不启动服务。
+- **下载校验提示**：区分"校验值不一致"和"取不到校验值"。取不到时提示可能是 API 限流；不一致时警告可能被篡改，不再提示用 `ALLOW_UNVERIFIED_DOWNLOADS` 跳过。
+- **po0fw Surge 模块**：指定代理 HEAD 连通性检测与失败重试、日志分级、写入 Logbook；面板支持固定槽 / FIFO 命名和「← 当前」标记。链接仍指向本 Fork，命中判断仍用 /24 匹配。说明见 [po0fw-proxy-check.md](../scripts/po0fw-proxy-check.md)。
+
+## 本 Fork 已有、未重复移植
+
+- 配额执行、超额恢复、月度重置（上游 v3.7.3）：本 Fork 已有自己的实现与测试（独立 30 天周期、策略执行、事务回滚）。这次另外用真实内核验证了"用户全部停用"时的配置：Xray 生成空 `clients`、sing-box 生成空 `users`，都能通过校验，不会退回默认凭据。
+- Xray 用户变更改写其他 VLESS 入站：本 Fork 已改为完整重建配置，只引入了上游的回归测试。
+- Bash 5 严格模式自增中断：本 Fork 已修复。
+- TG 用户机器人的 cron 准备：本 Fork 已改为常驻服务。
+
+## 暂不移植
+
+- **普通 Shadowsocks（ss-legacy）多用户独立密码**（上游 `7dc30bf`）：本 Fork 目前明确禁止给 ss-legacy 添加用户，不会产生无效链接。要支持多用户，需要在本 Fork 的用户体系（按端口用户、流量检查点、配额与重置）中重新实现，作为后续单独任务。
+- 上游的版本号、预览记录、发布说明和根目录临时说明文件；`scripts/backups/` 手工备份。
+
+## 升级注意
+
+- 已有安装打开菜单后，会自动添加公网 IP 检测定时任务（每 30 分钟）。cron 守护进程不存在时不会自动安装软件包，只记录警告。
+- 已有 HY2 节点不受影响，只有新安装时才询问是否启用混淆。
+- 已导出的 REALITY 分享链接仍然可用；重新导出后带 ML-KEM 参数。
+
+## 测试结果
+
+2026-11-25，WSL Ubuntu 24.04（Bash 5.2，非 root），逐个运行 `tests/*.sh` 加 `tests/po0-modules.js`。使用真实内核：Xray 26.11.9（官方 Release，`.dgst` 校验）、sing-box 1.14.0 统计版（本 Fork `singbox-stats-binaries` 分支，按 manifest 校验）。
+
+| | 通过 | 失败 | 跳过 |
+|---|---|---|---|
+| 预览分支 `68b4107` | 57 | 3 | 6 |
+| 基线 main `5158655` | 46 | 3 | 5 |
+
+两边失败的是同样 3 项，都由环境造成，与本次改动无关：
+- `reality-target.sh`：测试要模拟脚本真实的 443 探测，非 root 无法绑定特权端口。
+- `core-native.py` / `ss2022-native.py`：Xray 26.11.9 的 freedom 出站默认拦截回环目标（日志 `target blocked by a finalrule: tcp:127.0.0.1`），测试流量全部发往 127.0.0.1。换成测试针对的 Xray 26.3.27 后，`ss2022-native.py` 在分支和 main 上都通过；`core-native.py` 的 Xray 部分通过，在 sing-box 统计查询处失败，原因是本机没有 grpcurl（两边相同）。
+
+分支多出的 11 项通过就是这次新增的测试：上游的 mieru-install、hy2-udp-port、hy2-salamander（含真实 sing-box 校验混淆配置）、public-ip-change、xray-user-regenerate、surge-vless-reality-config、mihomo-reality-mlkem、watchdog-xray-filter、singbox-reality-handshake、singbox-stats-no-config，以及本 Fork 新增的 release-verify-rc。
+
+另用真实内核专门验证了"用户全部停用"的配置：sing-box 的 VLESS / Trojan / HY2 / TUIC / AnyTLS 生成空 `users`，Xray 的 VLESS / Trojan 生成空 `clients`，都能通过 `sing-box check` / `xray run -test`，不会退回默认凭据。
+
+已知不稳定：`flock-compat.sh` 要求 30 秒锁超时的实测耗时在 29～31 秒之间，WSL 负载高时 main 上也出现过 32 秒的失败。本轮两边都通过。
+
+**未验证**：
+- 6 项因缺少运行条件而跳过：mieru-live（无 mita/mieru）、nft-native、server-ipv6-native、singbox-stats-live（无 grpcurl）、snell-edit-native（无 Snell）、tg-bot-native。
+- 没有在真实 VPS 上安装，也没有用真实客户端连接 Mieru、Salamander、Surge VLESS 节点。
+- 公网 IP 变化检测只做了模拟测试，没有真实换 IP。
+- po0fw 模块只跑了 Node 回归，没有在 Surge 里运行。
+
+## 预览版安装
+
+预览分支：[codex/upstream-sync-v3.7.20](https://github.com/ErWenF/surge/tree/codex/upstream-sync-v3.7.20)。按项目约定，预览版不创建 GitHub Release，也不标记为最新正式版。以 root 执行以下命令，已安装的节点和用户数据会保留：
+
+```sh
+wget -O vless-server-preview.sh https://raw.githubusercontent.com/ErWenF/surge/codex/upstream-sync-v3.7.20/vless-server.sh && VLESS_SCRIPT_SOURCE_REF=codex/upstream-sync-v3.7.20 sh vless-server-preview.sh
+```
+
+以预览分支运行时，"检查并更新"会从预览分支取脚本。预览分支的版本号就是正式版号 3.7.20（脚本自更新只接受纯数字版本），预览身份由分支名标明。
+
+建议在测试机上依次验证：
+1. 安装 Mieru（菜单 16），用 mihomo 导入链接实际连接；
+2. 新装一个启用 Salamander 的 HY2，用 Surge / mihomo 实际连接；
+3. 已有 REALITY 节点重新导出链接，mihomo 导入后能连接；
+4. 打开菜单后确认 `crontab -l` 中出现 `# check-ip` 条目；需要关闭时执行 `vless --check-ip off`；
+5. 若有真实证书 + sing-box 接管 VLESS REALITY 的组合，确认切换后客户端能连接。

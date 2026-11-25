@@ -20,7 +20,8 @@ jobs:
           cache: false
       - name: Fetch verified statistics core and grpcurl
         env:
-          CORE_VERSION: '1.14.4'
+          # 本 Fork 的 singbox-stats-binaries 分支目前只发布了 v1.14.0 预编译统计核心
+          CORE_VERSION: '1.14.0'
         run: |
           set -euo pipefail
           base="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/singbox-stats-binaries/v$CORE_VERSION/linux-amd64-glibc"

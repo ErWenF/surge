@@ -11,6 +11,7 @@ crontab() {
         sleep 0.1
     else
         cat > "$fixture/cron"
+        echo write >> "$fixture/writes"
     fi
 }
 install_cron_entry first '* * * * * echo first # first'
@@ -34,7 +35,19 @@ if remove_cron_entry first; then exit 1; fi
 cmp "$fixture/cron" "$fixture/before"
 echo 'PASS cron concurrent updates, exact tag deletion and failed-read preservation'
 
-rm "$fixture/fail-read"
+# 内容未变化时不重写 crontab（systemd-cron 每次写入都会 daemon-reload）
+rm -f "$fixture/fail-read"
+install_cron_entry dup '* * * * * true # dup'
+writes=$(wc -l < "$fixture/writes")
+install_cron_entry dup '* * * * * true # dup'
+remove_cron_entry not-there
+[[ $(wc -l < "$fixture/writes") == "$writes" ]] || { echo 'FAIL: 内容未变化时不应重写 crontab'; exit 1; }
+install_cron_entry dup '*/2 * * * * true # dup'
+[[ $(wc -l < "$fixture/writes") == $((writes + 1)) ]] && grep -q '^\*/2 .*# dup$' "$fixture/cron" || { echo 'FAIL: 内容变化时应写入'; exit 1; }
+remove_cron_entry dup
+echo 'PASS cron skips rewriting unchanged content'
+
+rm -f "$fixture/fail-read"
 command() {
     [[ "$1" != -v || "$2" != flock ]] || return 1
     builtin command "$@"

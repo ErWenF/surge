@@ -4070,6 +4070,12 @@ _change_cron_entry() {
     # 只处理本脚本明确的行尾标记，不匹配命令/备注中的同名子串。
     printf '%s\n' "$current" | awk -v tag="$tag" '$0 !~ ("#[[:space:]]*" tag "[[:space:]]*$")' > "$staged" || { rm -f "$staged"; return 1; }
     [[ -z "$cron_cmd" ]] || printf '%s\n' "$cron_cmd" >> "$staged"
+    # 内容未变化时不重写：菜单每次启动都会修复定时任务，重复写入在 systemd-cron 上
+    # 会触发 cron-update.path 执行 daemon-reload 并重启 cron.target
+    if [[ "$(awk 'NF' "$staged")" == "$(printf '%s\n' "$current" | awk 'NF')" ]]; then
+        rm -f "$staged"
+        return 0
+    fi
     if ! awk 'NF' "$staged" | crontab -; then rm -f "$staged"; return 1; fi
     rm -f "$staged"
 }
@@ -17696,6 +17702,12 @@ _xray_balancer_object() {
         end'
 }
 
+# 输出非 Xray 进程正在监听的 TCP 端口（每行一个）；没有 ss 时不输出
+_failover_foreign_listen_ports() {
+    command -v ss >/dev/null 2>&1 || return 0
+    ss -tlnp 2>/dev/null | awk 'NR > 1 && $0 !~ /"xray"/ { n = split($4, a, ":"); if (a[n] ~ /^[0-9]+$/) print a[n] }' | sort -un
+}
+
 # 按配置中实际存在的均衡器生成健康检查：精确列出需要观测的节点 tag（不再按首个节点名前缀推断）。
 # 存在故障转移组时：开启 RoutingService 供监控服务指定出口，并为组内每个节点加一个只监听本机、
 # 带随机密码的 SOCKS 探测入口（路由只走该节点），监控经它用全部检测网址判断节点是否可用。
@@ -17713,7 +17725,10 @@ _xray_apply_balancer_observatory() {
         local used t port=$FAILOVER_PROBE_PORT_BASE
         used=" $(jq -r '[.. | objects | .port? | (numbers, (strings | select(test("^[0-9]+$")) | tonumber))]
                         | unique | map(tostring) | join(" ")' "$DB_FILE" 2>/dev/null)"
-        used+=" $(jq -r '[.inbounds[]?.port | numbers] | map(tostring) | join(" ")' "$file") "
+        used+=" $(jq -r '[.inbounds[]?.port | numbers] | map(tostring) | join(" ")' "$file")"
+        # 同时避开其他进程正在监听的 TCP 端口（端口被占会导致 Xray 起不来、整次配置变更回滚）。
+        # Xray 自己占用的端口不算：探测端口每次重新分配，排除它们会让端口逐次漂移
+        used+=" $(_failover_foreign_listen_ports | tr '\n' ' ') "
         for t in "${probe_tags[@]}"; do
             while [[ "$used" == *" $port "* ]]; do port=$((port + 1)); done
             probes=$(jq -c --arg t "$t" --argjson p "$port" '. + [{tag: $t, port: $p}]' <<< "$probes")
@@ -17750,28 +17765,23 @@ _xray_apply_balancer_observatory() {
     fi
 }
 
-# Xray：输出 "S<TAB>可用节点tag"（按 bi 顺序）与 "O<TAB>当前指定tag"
-_failover_xray_status() {
+# Xray：输出均衡器当前指定的出口 tag（没有指定时输出为空）；API 不可达时返回非 0
+_failover_xray_override() {
     local out
     out=$(xray api bi --server="127.0.0.1:${XRAY_API_PORT}" -t 3 "$1" 2>/dev/null) || return 1
     awk '
-        /Selecting Override:/ {sec = "o"; next}
-        /Selects:/            {sec = "s"; next}
-        /^ *- /               {sec = ""; next}
-        sec != "" {
+        /Selecting Override:/ {sec = 1; next}
+        /^ *- /               {sec = 0; next}
+        sec {
             line = $0
             sub(/^ *[0-9]+ */, "", line); sub(/ +$/, "", line)
-            if (line != "") print (sec == "o" ? "O" : "S") "\t" line
+            if (line != "") { print line; exit }
         }' <<< "$out"
 }
 
-# Xray：$2 为节点 tag 时指定出口；为空时撤销指定（交给 fallbackTag 直连）
+# Xray：把均衡器出口指定为 $2（节点 tag 或 direct）
 _failover_xray_apply() {
-    if [[ -n "$2" ]]; then
-        xray api bo --server="127.0.0.1:${XRAY_API_PORT}" -t 3 -b "$1" "$2" >/dev/null 2>&1
-    else
-        xray api bo --server="127.0.0.1:${XRAY_API_PORT}" -t 3 -b "$1" -r >/dev/null 2>&1
-    fi
+    xray api bo --server="127.0.0.1:${XRAY_API_PORT}" -t 3 -b "$1" "$2" >/dev/null 2>&1
 }
 
 # sing-box Clash API 请求；密钥经 stdin 交给 curl，不出现在进程参数中
@@ -17817,12 +17827,20 @@ _failover_singbox_probe() {
 # 并行探测组内全部节点；输出每行 "tag<TAB>结果"，顺序与参数一致
 _failover_probe_all() {
     local core="$1" cfg="$2" dir t i=0 port secret=""
+    local -A probe_ports=()
     shift 2
     dir=$(mktemp -d) || return 1
-    [[ "$core" == xray ]] && secret=$(cat "$(_failover_probe_secret_file)" 2>/dev/null)
+    if [[ "$core" == xray ]]; then
+        secret=$(cat "$(_failover_probe_secret_file)" 2>/dev/null)
+        # 一次读出全部探测入口端口（每行 "节点tag<US>端口"），不再每个节点调用一次 jq
+        while IFS=$'\x1f' read -r t port; do
+            [[ -n "$t" ]] && probe_ports["$t"]="$port"
+        done < <(jq -r '.inbounds[]? | select((.tag // "") | startswith("fo-probe-"))
+                        | [(.tag | ltrimstr("fo-probe-")), (.port | tostring)] | join("\u001f")' "$cfg" 2>/dev/null)
+    fi
     for t in "$@"; do
         if [[ "$core" == xray ]]; then
-            port=$(jq -r --arg t "fo-probe-$t" '.inbounds[]? | select(.tag == $t) | .port' "$cfg" 2>/dev/null)
+            port="${probe_ports[$t]:-}"
             if [[ "$port" =~ ^[0-9]+$ && "$secret" =~ ^[0-9a-f]{32}$ ]]; then
                 _failover_xray_probe "$port" "$secret" > "$dir/$i" &
             else
@@ -17903,65 +17921,80 @@ _failover_json_object() {
     [[ -n "$1" ]] && jq -e 'type == "object"' <<< "$1" >/dev/null 2>&1
 }
 
-# 处理一个内核中的一个组；读入并输出完整状态 JSON（任何异常都原样返回输入状态）
+# 本轮跳过某组：输出带 note 的状态（其余字段不变）。同一异常持续时只在首次写日志，
+# 避免每 10 秒重复一行；异常内容变化或恢复后再出现时照常记录
+_failover_step_skip() {
+    local state="$1" key="$2" note="$3" out
+    [[ "$(jq -r --arg k "$key" '.[$k].note // empty' <<< "$state" 2>/dev/null)" == "$note" ]] || _failover_log "$note"
+    out=$(jq -c --arg k "$key" --arg n "$note" '.[$k] = ((.[$k] // {}) + {note: $n})' <<< "$state" 2>/dev/null)
+    if _failover_json_object "$out"; then printf '%s' "$out"; else printf '%s' "$state"; fi
+}
+
+# 处理一个内核中的一个组；读入并输出完整状态 JSON（任何异常都返回输入状态，只附加 note）
 _failover_step() {
     local core="$1" group="$2" state="$3"
     shift 3
     _failover_json_object "$state" || state='{}'
-    local key="${core}|${group}" balancer="balancer-${group}" cfg_file tags=() t alive="" applied="" line
+    local key="${core}|${group}" balancer="balancer-${group}" cfg_file tags=() t alive="" applied="" outbound_tags
     [[ "$core" == xray ]] && cfg_file="$CFG/config.json" || cfg_file="$CFG/singbox.json"
-    # 只考虑配置中实际生成了出站的节点，保持组内优先级顺序
+    # 只考虑配置中实际生成了出站的节点，保持组内优先级顺序（一次读出全部出站 tag）
+    outbound_tags=$'\n'"$(jq -r '.outbounds[]?.tag // empty' "$cfg_file" 2>/dev/null)"$'\n'
     for t in "$@"; do
         t=$(_failover_node_tag "$t")
-        jq -e --arg t "$t" 'any(.outbounds[]?; .tag == $t)' "$cfg_file" >/dev/null 2>&1 && tags+=("$t")
+        [[ "$outbound_tags" == *$'\n'"$t"$'\n'* ]] && tags+=("$t")
     done
     # 读取内核当前实际选择（Xray 的指定 / sing-box selector 的当前项）；读不到说明内核未运行或 API 未开启
     if [[ "$core" == xray ]]; then
-        local status
-        status=$(_failover_xray_status "$balancer") || { _failover_log "${group}/xray: 读取均衡器状态失败（Xray 未运行或未开启 RoutingService）"; printf '%s' "$state"; return 0; }
-        applied=$(awk -F'\t' '$1 == "O" {print $2; exit}' <<< "$status")
+        applied=$(_failover_xray_override "$balancer") ||
+            { _failover_step_skip "$state" "$key" "${group}/xray: 读取均衡器状态失败（Xray 未运行或未开启 RoutingService）"; return 0; }
     else
         applied=$(_failover_singbox_now "$balancer") || applied=""
-        [[ -n "$applied" ]] || { _failover_log "${group}/singbox: Clash API 不可用"; printf '%s' "$state"; return 0; }
+        [[ -n "$applied" ]] || { _failover_step_skip "$state" "$key" "${group}/singbox: Clash API 不可用"; return 0; }
     fi
     # 用全部检测网址判断各节点；任何节点结果未知时整组跳过本轮，避免内核重启期间误判为全部不可用
     local results res unknown=false
-    results=$(_failover_probe_all "$core" "$cfg_file" "${tags[@]}") || { printf '%s' "$state"; return 0; }
+    results=$(_failover_probe_all "$core" "$cfg_file" "${tags[@]}") ||
+        { _failover_step_skip "$state" "$key" "${group}/${core}: 探测失败，本轮跳过"; return 0; }
     while IFS=$'\t' read -r t res; do
         [[ -n "$t" ]] || continue
         case "$res" in ok) alive+="${t}"$'\n' ;; unknown) unknown=true ;; esac
     done <<< "$results"
     if [[ "$unknown" == true ]]; then
-        _failover_log "${group}/${core}: 探测入口未就绪，本轮跳过"
-        printf '%s' "$state"; return 0
+        _failover_step_skip "$state" "$key" "${group}/${core}: 探测入口未就绪，本轮跳过"; return 0
     fi
     alive="${alive%$'\n'}"
 
-    local prev pending count decision target new_pending new_count reason want
+    local prev pending count target new_pending new_count reason
     prev=$(jq -r --arg k "$key" '.[$k].target // empty' <<< "$state")
     pending=$(jq -r --arg k "$key" '.[$k].pending // empty' <<< "$state")
     count=$(jq -r --arg k "$key" '.[$k].count // 0' <<< "$state")
+    # 上轮出口已不在组内（节点被改名、删除或移出组）：属于用户主动修改，按首次检查静默重新选择，
+    # 不发"节点不可用"的通知
+    if [[ -n "$prev" && "$prev" != direct && " ${tags[*]} " != *" $prev "* ]]; then
+        _failover_log "${group}/${core}: 原出口 $(_failover_tag_label "$prev") 已不在组内，重新选择"
+        prev="" pending="" count=0
+    fi
     local fields=()
     mapfile -t fields < <(_failover_decide "$prev" "$pending" "$count" "$alive" "${tags[@]}")
     target="${fields[0]:-}" new_pending="${fields[1]:-}" new_count="${fields[2]:-0}" reason="${fields[3]:-hold}"
-    [[ -n "$target" && "$new_count" =~ ^[0-9]+$ ]] || { _failover_log "${group}/${core}: 决策结果异常"; printf '%s' "$state"; return 0; }
+    [[ -n "$target" && "$new_count" =~ ^[0-9]+$ ]] ||
+        { _failover_step_skip "$state" "$key" "${group}/${core}: 决策结果异常"; return 0; }
 
-    # 与内核当前实际状态比较；内核重启会丢失指定，此时静默补上
-    if [[ "$core" == xray ]]; then
-        # 全部不可用时显式指定 direct：均衡器自身的健康检查只测一个网址，交给 fallbackTag 可能仍选中半故障节点
-        want="$target"
-        if [[ "$applied" != "$want" ]] && ! _failover_xray_apply "$balancer" "$want"; then
-            _failover_log "${group}/xray: 切换到 $(_failover_tag_label "$target") 失败，下轮重试"
-            printf '%s' "$state"; return 0
+    # 与内核当前实际状态比较；内核重启会丢失指定，此时静默补上。
+    # Xray 全部不可用时也显式指定 direct：均衡器自身的健康检查只测一个网址，交给 fallbackTag 可能仍选中半故障节点
+    if [[ "$applied" != "$target" ]]; then
+        local apply_ok=true
+        if [[ "$core" == xray ]]; then
+            _failover_xray_apply "$balancer" "$target" || apply_ok=false
+        else
+            _failover_singbox_apply "$balancer" "$target" || apply_ok=false
         fi
-    else
-        if [[ "$applied" != "$target" ]] && ! _failover_singbox_apply "$balancer" "$target"; then
-            _failover_log "${group}/singbox: 切换到 $(_failover_tag_label "$target") 失败，下轮重试"
-            printf '%s' "$state"; return 0
-        fi
+        [[ "$apply_ok" == true ]] ||
+            { _failover_step_skip "$state" "$key" "${group}/${core}: 切换到 $(_failover_tag_label "$target") 失败，下轮重试"; return 0; }
     fi
     [[ -n "$prev" && "$prev" != "$target" ]] && _failover_notify "$core" "$group" "$prev" "$target" "$reason"
     [[ -z "$prev" ]] && _failover_log "${group}/${core}: 初始出口 $(_failover_tag_label "$target")"
+    [[ -z "$(jq -r --arg k "$key" '.[$k].note // empty' <<< "$state")" ]] || _failover_log "${group}/${core}: 检测恢复正常"
 
     local updated
     updated=$(jq -c --arg k "$key" --arg target "$target" --arg pending "$new_pending" --argjson count "${new_count:-0}" \
@@ -17987,9 +18020,7 @@ failover_check_once() {
     state_file=$(_failover_state_file)
     state=$(cat "$state_file" 2>/dev/null)
     _failover_json_object "$state" || state='{}'
-    # 已删除的组不再保留状态
-    state=$(jq -c --argjson g "$groups" 'with_entries(select(.key | split("|")[1] as $n | any($g[]; .name == $n)))' <<< "$state")
-    _failover_json_object "$state" || state='{}'
+    local processed=()
     while IFS= read -r group; do
         [[ -n "$group" ]] || continue
         local name
@@ -17998,12 +18029,18 @@ failover_check_once() {
         if [[ -f "$CFG/config.json" ]] &&
            jq -e --arg t "balancer-$name" 'any(.routing.balancers[]?; .tag == $t)' "$CFG/config.json" >/dev/null 2>&1; then
             state=$(_failover_step xray "$name" "$state" "${nodes[@]}")
+            processed+=("xray|$name")
         fi
         if [[ -f "$CFG/singbox.json" ]] &&
            jq -e --arg t "balancer-$name" 'any(.outbounds[]?; .tag == $t and .type == "selector")' "$CFG/singbox.json" >/dev/null 2>&1; then
             state=$(_failover_step singbox "$name" "$state" "${nodes[@]}")
+            processed+=("singbox|$name")
         fi
     done < <(jq -c '.[]' <<< "$groups")
+    # 只保留本轮实际处理的组：组被删除、或不再被分流规则/用户路由引用（配置中已无该均衡器）时清掉旧状态，
+    # 避免状态页一直显示过期结果、以后重新引用时沿用过期的出口
+    state=$(printf '%s\n' "${processed[@]}" | jq -c --argjson s "$state" -R -s \
+        'split("\n") as $k | $s | with_entries(select(.key as $x | $k | index($x)))' 2>/dev/null)
     # 写入前校验：空串经 jq 会得到空文件而不报错，绝不能覆盖已有状态
     _failover_json_object "$state" || { _failover_log "状态异常，本轮未写入"; return 1; }
     local tmp
@@ -18036,16 +18073,20 @@ failover_print_status() {
         echo "  暂无检测结果（监控服务尚未运行或组未在分流规则中使用）"; return 0
     fi
     # 字段用 \x1f、可用节点用 \x1e 分隔：都不是 IFS 空白字符，空字段不会被合并，节点名里的逗号也不受影响
-    jq -r 'to_entries[] | [(.key | split("|")[1]), (.key | split("|")[0]), .value.target,
-            (.value.alive | join("\u001e")), .value.pending, (.value.count | tostring), .value.checked_at] | join("\u001f")' <<< "$state" |
-    while IFS=$'\x1f' read -r group core target alive pending count at; do
+    # 只有 note 的条目（首次检查就遇到异常）没有其余字段，均给默认值
+    jq -r 'to_entries[] | [(.key | split("|")[1]), (.key | split("|")[0]), (.value.target // ""),
+            ((.value.alive // []) | join("\u001e")), (.value.pending // ""), ((.value.count // 0) | tostring),
+            (.value.checked_at // ""), (.value.note // "")] | join("\u001f")' <<< "$state" |
+    while IFS=$'\x1f' read -r group core target alive pending count at note; do
         local alive_labels="" t _alive_tags=()
         IFS=$'\x1e' read -r -a _alive_tags <<< "$alive"
         for t in "${_alive_tags[@]}"; do [[ -n "$t" ]] && alive_labels+="$(_failover_tag_label "$t") "; done
-        printf '  %s（%s）当前出口: %s\n' "$group" "$([[ "$core" == xray ]] && echo Xray || echo Sing-box)" "$(_failover_tag_label "$target")"
+        printf '  %s（%s）当前出口: %s\n' "$group" "$([[ "$core" == xray ]] && echo Xray || echo Sing-box)" \
+            "$([[ -n "$target" ]] && _failover_tag_label "$target" || echo 尚未确定)"
         printf '    可用节点: %s\n' "${alive_labels:-无}"
         [[ -z "$pending" ]] || printf '    待切回: %s（已连续可用 %s/%s 次）\n' "$(_failover_tag_label "$pending")" "$count" "$FAILOVER_RECOVER_CHECKS"
-        printf '    检测时间: %s\n' "$at"
+        [[ -z "$at" ]] || printf '    检测时间: %s\n' "$at"
+        [[ -z "$note" ]] || printf '    最近异常: %s\n' "${note#*: }"
     done
 }
 

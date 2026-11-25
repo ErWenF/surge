@@ -66,7 +66,18 @@ jq -e '[.outbounds[].tag] as $o | [.routing.balancers[]?.tag] as $b |
                               ((.fallbackTag // null) as $f | $f == null or ($o | index($f) != null)))' "$fixture/x1.json" >/dev/null ||
     fail "Xray 规则或均衡器引用了不存在的对象"
 native_xray "$fixture/x1.json"
-echo 'PASS Xray global routing: failover balancer keeps priority order, skips missing nodes, loopback probe inbounds per node, exact health checks'
+# 探测端口避开其他进程正在监听的端口；Xray 自己占用的（上一版探测入口）可以复用
+ss() {
+    printf '%s\n' 'State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process' \
+        'LISTEN 0      4096   0.0.0.0:61800      0.0.0.0:*         users:(("nginx",pid=11,fd=6))' \
+        'LISTEN 0      4096   127.0.0.1:61801    0.0.0.0:*         users:(("xray",pid=12,fd=9))' \
+        'LISTEN 0      4096   [::]:61802         [::]:*            users:(("sshd",pid=13,fd=4))'
+}
+XRAY_CONFIG_OUTPUT="$fixture/x1-ports.json" _render_xray_config >/dev/null || fail "Xray 渲染失败（端口占用）"
+unset -f ss
+[[ "$(jq -c '[.inbounds[] | select(.tag | startswith("fo-probe-")) | .port]' "$fixture/x1-ports.json")" == '[61801,61803]' ]] ||
+    fail "探测端口应避开其他进程监听的端口: $(jq -c '[.inbounds[] | select(.tag | startswith("fo-probe-")) | .port]' "$fixture/x1-ports.json")"
+echo 'PASS Xray global routing: failover balancer keeps priority order, skips missing nodes, loopback probe inbounds per node, exact health checks, avoids ports held by other processes'
 
 # ── 2. Xray：只有用户路由（原先该路径完全不生成健康检查）──
 base_db '[]' "balancer:LP"
@@ -194,12 +205,27 @@ cycle "$A";     [[ $(target) == "$A" ]] || fail "下一轮应重试成功"
 probe_infra_down=true
 cycle "";       [[ $(target) == "$A" && ! -s "$fixture/xray-calls" ]] || fail "探测入口未就绪（如 Xray 重启中）时不应判为全部不可用"
 grep -q '探测入口未就绪' "$CFG/failover.log" || fail "未就绪应记录日志"
+cycle ""; cycle ""
+[[ $(grep -c '探测入口未就绪' "$CFG/failover.log") == 1 ]] || fail "同一异常持续时只应记录一次日志"
+grep -q '最近异常: 探测入口未就绪' <<< "$(failover_print_status)" || fail "状态页应显示最近异常"
 probe_infra_down=false
+cycle "$A"
+grep -q 'FO/xray: 检测恢复正常' "$CFG/failover.log" || fail "异常恢复后应记录日志"
+[[ $(jq -r '."xray|FO".note // empty' "$CFG/failover-state.json") == "" ]] || fail "恢复后应清除 note"
 status_out=$(failover_print_status)
 grep -q 'FO（Xray）当前出口: A' <<< "$status_out" && grep -q 'cp.cloudflare.com/generate_204' <<< "$status_out" ||
     fail "状态展示不符: $status_out"
+# 上轮出口已不在组内（如节点改名）：静默重新选择，不发"不可用"通知；
+# 不再出现在配置中的组（如 singbox|FO、已删除的组）不保留状态
+notices=$(grep -c '^---$' "$fixture/tg")
+jq '."xray|FO".target = "chain-Renamed-prefer-ipv4" | ."singbox|FO" = {target: "x"} | ."xray|Gone" = {target: "y"}' \
+    "$CFG/failover-state.json" > "$fixture/st" && cat "$fixture/st" > "$CFG/failover-state.json"
+cycle "$A"; [[ $(target) == "$A" ]] || fail "原出口不在组内时应重新选择"
+[[ $(grep -c '^---$' "$fixture/tg") == "$notices" ]] || fail "原出口不在组内时不应发送通知"
+grep -q 'Renamed 已不在组内' "$CFG/failover.log" || fail "原出口不在组内应记录日志"
+[[ $(jq -c 'keys' "$CFG/failover-state.json") == '["xray|FO"]' ]] || fail "应清除未处理组的状态: $(jq -c keys "$CFG/failover-state.json")"
 unset -f curl
-echo 'PASS Xray monitor: all test URLs per node via probe inbounds, half-broken node rejected, explicit direct, stable recovery, re-apply after restart, retry, not-ready skip'
+echo 'PASS Xray monitor: all test URLs per node via probe inbounds, half-broken node rejected, explicit direct, stable recovery, re-apply after restart, retry, not-ready skip, log dedup, rename re-init, stale state cleanup'
 
 # ── 6. 监控服务（sing-box）：Clash API 对每个网址测速，密钥只经 stdin ──
 rm -f "$CFG/failover-state.json" "$CFG/config.json" "$fixture/tg"

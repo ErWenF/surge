@@ -1,4 +1,6 @@
-# v3.7.20 预览版：同步上游 mozisen/surge v3.7.7
+# v3.7.20 预览版：同步上游 mozisen/surge v3.7.7 + 链式代理主备故障转移
+
+本版包含两部分：同步上游 v3.7.7 的改动，以及本 Fork 新增的[链式代理主备故障转移](chain-failover.md)。
 
 本 Fork 与上游 [mozisen/surge](https://github.com/mozisen/surge) 自 v3.7.2（`12e9714`，2026-09-26）分叉，各自开发约两个月。上游 74 个提交逐项审阅后，按功能移植到本 Fork，最后用 `git merge -s ours` 记录同步到上游 `dbc16e0`（v3.7.7）。之后再同步上游，只会看到 `dbc16e0` 之后的新提交。
 
@@ -17,6 +19,17 @@
 - **统计核心更新**：卸载最后一个 Sing-box 协议后，也能只替换统计核心（带备份），不启动服务。
 - **下载校验提示**：区分"校验值不一致"和"取不到校验值"。取不到时提示可能是 API 限流；不一致时警告可能被篡改，不再提示用 `ALLOW_UNVERIFIED_DOWNLOADS` 跳过。
 - **po0fw Surge 模块**：指定代理 HEAD 连通性检测与失败重试、日志分级、写入 Logbook；面板支持固定槽 / FIFO 命名和「← 当前」标记。链接仍指向本 Fork，命中判断仍用 /24 匹配。说明见 [po0fw-proxy-check.md](../scripts/po0fw-proxy-check.md)。
+
+## 本 Fork 新功能：链式代理主备故障转移
+
+负载均衡组新增"主备故障转移"策略。节点按优先级使用：第一优先可用就走它，否则用下一个可用节点，全部不可用时走直连；高优先级节点恢复后，连续 3 次检测可用才切回。可在分流规则与 Xray 用户路由中使用。
+
+切换由常驻服务 `vless-failover` 在运行时完成，不重启内核。经每个节点访问全部检测网址（默认 gstatic + Cloudflare，可修改）都收到响应才算节点可用，能识别"能上 Google、上不了 Cloudflare"这类半故障节点。
+
+用法、原理、限制和测试见 [chain-failover.md](chain-failover.md)。同一处代码顺带修复：
+- Xray 均衡组健康检查改为覆盖组内全部节点。原先只覆盖与第一个节点名前缀相同的节点；只有用户路由时完全不生成健康检查。
+- 均衡组不再引用已删除的节点。
+- 创建均衡组时拒绝重名。
 
 ## 本 Fork 修复（真机验证中发现）
 
@@ -39,6 +52,8 @@
 - 已有安装打开菜单后，会自动添加公网 IP 检测定时任务（每 30 分钟）。cron 守护进程不存在时不会自动安装软件包，只记录警告。
 - 已有 HY2 节点不受影响，只有新安装时才询问是否启用混淆。
 - 已导出的 REALITY 分享链接仍然可用；重新导出后带 ML-KEM 参数。
+- 已有的 leastPing 负载均衡组：Xray 健康检查现在覆盖组内全部节点，下次重建配置后选择结果可能与之前不同（之前名字不同的节点从未被探测，等于被排除）。
+- 不创建故障转移组时，不会启动 `vless-failover` 服务，也不会在 Xray 配置中开启 RoutingService 或探测入口。
 
 ## 测试结果
 
@@ -46,14 +61,17 @@
 
 | | 通过 | 失败 | 跳过 |
 |---|---|---|---|
-| 预览分支 `68b4107` | 57 | 3 | 6 |
+| 预览分支 `6afd2c8`（含故障转移） | 59 | 3 | 6 |
+| 预览分支 `68b4107`（仅同步上游） | 57 | 3 | 6 |
 | 基线 main `5158655` | 46 | 3 | 5 |
 
 两边失败的是同样 3 项，都由环境造成，与本次改动无关：
 - `reality-target.sh`：测试要模拟脚本真实的 443 探测，非 root 无法绑定特权端口。
 - `core-native.py` / `ss2022-native.py`：Xray 26.11.9 的 freedom 出站默认拦截回环目标（日志 `target blocked by a finalrule: tcp:127.0.0.1`），测试流量全部发往 127.0.0.1。换成测试针对的 Xray 26.3.27 后，`ss2022-native.py` 在分支和 main 上都通过；`core-native.py` 的 Xray 部分通过，在 sing-box 统计查询处失败，原因是本机没有 grpcurl（两边相同）。
 
-分支多出的 11 项通过就是这次新增的测试：上游的 mieru-install、hy2-udp-port、hy2-salamander（含真实 sing-box 校验混淆配置）、public-ip-change、xray-user-regenerate、surge-vless-reality-config、mihomo-reality-mlkem、watchdog-xray-filter、singbox-reality-handshake、singbox-stats-no-config，以及本 Fork 新增的 release-verify-rc。
+相对 main 多出的 13 项通过就是这次新增的测试：
+- 上游的 mieru-install、hy2-udp-port、hy2-salamander（含真实 sing-box 校验混淆配置）、public-ip-change、xray-user-regenerate、surge-vless-reality-config、mihomo-reality-mlkem、watchdog-xray-filter、singbox-reality-handshake、singbox-stats-no-config；
+- 本 Fork 新增的 release-verify-rc、cron-systemd-cron、chain-failover。
 
 另用真实内核专门验证了"用户全部停用"的配置：sing-box 的 VLESS / Trojan / HY2 / TUIC / AnyTLS 生成空 `users`，Xray 的 VLESS / Trojan 生成空 `clients`，都能通过 `sing-box check` / `xray run -test`，不会退回默认凭据。
 
@@ -71,6 +89,13 @@
 - **REALITY 链接**带 `support-x25519mlkem768=true`；Surge 订阅新增 VLESS REALITY 行，HY2 行带 `salamander-password`；Clash 订阅带 ML-KEM 开关。
 - **原有 VLESS REALITY 节点**在全过程后实际连接正常。
 - **卸载**两个临时协议后，`db.json`、Xray `config.json`、nginx 配置与测试前完全一致。
+- **链式代理故障转移**：用测试用户和真实节点 LC-KDDI、LC-GLBB-Mini 做端到端验证，未改动原有分流规则。
+  - 第一优先节点故障后 16 秒切换，并跳过半故障的 LC-KDDI，客户端出口变为 GLBB 的地址；
+  - 全部不可用的组改走直连；
+  - 节点恢复后连续 3 轮可用才切回；
+  - 测试后配置与测试前一致。
+  - 真机上发现并修复了 jq 1.6 兼容、单网址误判、删除组被配置事务拒绝三个问题。
+  - 详见 [chain-failover.md](chain-failover.md#真机debian-12jq-16xray-26327)。
 
 真机上观察到的原有行为（非本次改动引入）：
 - 安装协议时的"安装依赖"步骤会把 openssl、libssl3、jq、dnsutils 升级到最新安全更新。
@@ -98,4 +123,5 @@ wget -O vless-server-preview.sh https://raw.githubusercontent.com/ErWenF/surge/c
 2. 新装一个启用 Salamander 的 HY2，用 Surge / mihomo 实际连接；
 3. 已有 REALITY 节点重新导出链接，mihomo 导入后能连接；
 4. 打开菜单后确认 `crontab -l` 中出现 `# check-ip` 条目；需要关闭时执行 `vless --check-ip off`；
-5. 若有真实证书 + sing-box 接管 VLESS REALITY 的组合，确认切换后客户端能连接。
+5. 若有真实证书 + sing-box 接管 VLESS REALITY 的组合，确认切换后客户端能连接；
+6. 建一个故障转移组并在分流规则中使用：确认 `vless --failover-status` 显示当前出口，节点故障时切换并收到 TG 通知（TG 通知与 sing-box 故障转移尚未真机验证）。
